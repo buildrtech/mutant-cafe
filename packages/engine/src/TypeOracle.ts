@@ -1,4 +1,4 @@
-import type { Mutant, RunConfig, Viability } from "@mutant-cafe/core";
+import type { Mutant, NotMutated, RunConfig, Viability } from "@mutant-cafe/core";
 
 export interface Value {
   readonly text: string;
@@ -12,7 +12,7 @@ export interface TaggedValue extends Value {
 export type ReturnShape =
   | { readonly kind: "Effect" | "Stream"; readonly values: ReadonlyArray<Value>; readonly errors: ReadonlyArray<TaggedValue> }
   | { readonly kind: "Option"; readonly values: ReadonlyArray<Value> }
-  | { readonly kind: "Layer"; readonly errors: ReadonlyArray<TaggedValue>; readonly service: string | undefined }
+  | { readonly kind: "Layer"; readonly errors: ReadonlyArray<TaggedValue> }
   | { readonly kind: "Boolean" | "Literal" | "Void" | "Value"; readonly values: ReadonlyArray<Value> };
 
 export interface MutableFunction {
@@ -21,6 +21,7 @@ export interface MutableFunction {
   readonly returnType: string;
   readonly displayReturnType: string;
   readonly equivalentValues: ReadonlyArray<string>;
+  readonly skipReason?: string;
   readonly span: Mutant["span"];
   readonly startOffset: number;
   readonly endOffset: number;
@@ -29,12 +30,21 @@ export interface MutableFunction {
   readonly block: boolean;
   readonly generator: boolean;
   readonly shape: ReturnShape;
-  /** Resolve an API to an existing value import; mutations never add imports. */
+  readonly identityFile?: string;
+  readonly identityOrdinal?: number;
+  readonly logicalSpan?: { readonly offset: number; readonly length: number };
+  readonly importInsertionOffset?: number;
+  readonly sourcePrefix?: string;
+  readonly extraImports?: ReadonlyArray<{ readonly namespace: string; readonly statement: string }>;
+  /** Resolve an API to an existing import or a collision-free mutation import. */
   readonly api: (module: "Effect" | "Option" | "Stream" | "Layer", member: string) => string | undefined;
 }
 
 /** Compiler-specific state stays behind this port. A future adapter can use tsgo. */
 export interface TypeOracle {
-  readonly discover: (config: RunConfig) => Iterable<MutableFunction>;
+  readonly discover: (config: RunConfig) => {
+    readonly functions: ReadonlyArray<MutableFunction>;
+    readonly notMutated: ReadonlyArray<NotMutated>;
+  };
   readonly checkViable: (mutant: Mutant) => Viability;
 }

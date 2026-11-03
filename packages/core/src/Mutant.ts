@@ -13,6 +13,7 @@ export const Genre = Schema.Literals([
   "StreamOne",
   "StreamFail",
   "LayerFail",
+  "LayerDie",
   "SchemaAcceptAnything",
   "BooleanFlip",
   "LiteralCycle",
@@ -47,7 +48,7 @@ export const Mutant = Schema.Struct({
 });
 export type Mutant = typeof Mutant.Type;
 
-export const Outcome = Schema.Literals(["caught", "missed", "unviable", "timeout", "untested"]);
+export const Outcome = Schema.Literals(["caught", "missed", "unviable", "timeout", "untested", "unreliable"]);
 export type Outcome = typeof Outcome.Type;
 
 export const MutantResult = Schema.Struct({
@@ -60,18 +61,35 @@ export const MutantResult = Schema.Struct({
 });
 export type MutantResult = typeof MutantResult.Type;
 
+export const SelectionIssue = Schema.Union([
+  Schema.Struct({ kind: Schema.Literal("runner"), reason: Schema.String }),
+  Schema.Struct({ kind: Schema.Literal("warning"), reason: Schema.String }),
+  Schema.Struct({ kind: Schema.Literal("target"), file: Schema.String, reason: Schema.String }),
+  Schema.Struct({ kind: Schema.Literal("built"), files: Schema.optional(Schema.Array(Schema.String)), testFiles: Schema.Array(Schema.String), reason: Schema.String }),
+]);
+export type SelectionIssue = typeof SelectionIssue.Type;
+
 export const Baseline = Schema.Struct({
   durationMs: Schema.Int,
   testCommand: Schema.Array(Schema.String),
+  unreliable: Schema.optional(Schema.Array(SelectionIssue)),
 });
 export type Baseline = typeof Baseline.Type;
 
+export const NotMutated = Schema.Struct({
+  file: Schema.String,
+  functionName: Schema.String,
+  reason: Schema.String,
+});
+export type NotMutated = typeof NotMutated.Type;
+
 export const RunReport = Schema.Struct({
-  schemaVersion: Schema.Literal(1),
+  schemaVersion: Schema.Literal(2),
   tool: Schema.Literal("mutant.cafe"),
   root: Schema.String,
   baseline: Baseline,
   timeoutMs: Schema.Int,
   results: Schema.Array(MutantResult),
+  failure: Schema.optional(Schema.String),
 });
 export type RunReport = typeof RunReport.Type;

@@ -55,6 +55,113 @@ function loadMutation<A = AccountModule>(mutant: Mutant) {
 }
 
 describe("checker-directed mutation", () => {
+  it.effect("keeps skips local to discovery and excludes local helpers from exported binding paths", () => Effect.gen(function* () {
+    const oracle = makeTypeScriptOracle();
+    const input = config("packages/engine/test/fixtures/coverage/tsconfig.json");
+    const first = oracle.discover({ ...input, exportedOnly: true });
+    const snapshot = [...first.notMutated];
+    const second = oracle.discover(input);
+    expect(first.notMutated).toEqual(snapshot);
+    expect(first.notMutated).not.toBe(second.notMutated);
+    for (const name of ["helperOwner.localDeclaration", "helperOwner.localArrow"]) {
+      expect(second.functions.some(fn => fn.name === name), name).toBe(true);
+      expect(first.functions.some(fn => fn.name === name), name).toBe(false);
+      expect(first.notMutated.find(item => item.functionName === name)?.reason).toContain("--exported-only");
+    }
+    for (const name of ["Greeter.layer.greet", "Greeter.layer.send", "parenthesized.<inner>", "blocked.<inner>", "curriedEffect.<inner>"]) expect(first.functions.some(fn => fn.name === name), name).toBe(true);
+    for (const name of ["callbacks", "argument"]) expect(second.notMutated.find(item => item.functionName === name)?.reason).toContain("unsupported function position");
+    const service = makeMutantSource(oracle);
+    const curried = yield* collect(service, { ...input, functionFilter: ["parenthesized.<inner>", "blocked.<inner>", "curriedEffect.<inner>"] });
+    expect(curried.length).toBeGreaterThan(6);
+    for (const mutant of curried) expect((yield* service.checkViable(mutant)).diagnostics, mutant.description).toEqual([]);
+    const narrow = service.generate({ ...input, functionFilter: ["generic"] });
+    yield* collect(service, input);
+    expect(yield* Stream.runCollect(narrow)).toEqual([]);
+    expect((yield* service.notMutated({ ...input, functionFilter: ["generic"] })).some(item => item.functionName === "generic")).toBe(true);
+  }), 30_000);
+
+  it.effect("follows exported object aliases and named exports without promoting called helpers", () => Effect.gen(function* () {
+    const directory = yield* Effect.acquireRelease(
+      Effect.promise(() => mkdtemp(resolve(root, "packages/engine/test/aliases-"))),
+      directory => Effect.promise(() => rm(directory, { recursive: true, force: true })),
+    );
+    yield* Effect.promise(() => writeFile(resolve(directory, "tsconfig.json"), JSON.stringify({ extends: resolve(root, "tsconfig.base.json"), compilerOptions: { erasableSyntaxOnly: false }, include: ["input.ts"] })));
+    yield* Effect.promise(() => writeFile(resolve(directory, "input.ts"), `
+import { Context, Effect, Layer } from "effect";
+namespace PrivateSpace { export const hidden = (n: number): boolean => n > 0; }
+export namespace PublicSpace { const hidden = (n: number): boolean => n > 0; export const visible = (n: number): boolean => n > 0; }
+const aliased = (n: number): boolean => n > 0;
+const internalObject = { aliased };
+export const api = { nested: internalObject };
+const listed = (n: number): boolean => n > 0;
+export { listed };
+const called = (n: number): boolean => n > 0;
+export const caller = (n: number): boolean => called(n);
+const serviceFn = (n: number): Effect.Effect<number> => Effect.succeed(n);
+class Service extends Context.Service<Service, { readonly run: (n: number) => Effect.Effect<number>; readonly inline: (n: number) => Effect.Effect<number> }>()("Service") {}
+export const serviceFactory = () => {
+  const factoryLocal = (n: number) => Effect.succeed(n);
+  return Layer.effect(Service, Effect.gen(function* () {
+    return Service.of({ run: serviceFn, inline: (n: number) => factoryLocal(n) });
+  }));
+};
+`));
+    const source = makeSource();
+    const mutants = yield* collect(source, config(resolve(directory, "tsconfig.json"), { exportedOnly: true }));
+    for (const name of ["aliased", "listed", "caller", "serviceFn", "serviceFactory.inline", "PublicSpace.visible"]) expect(mutants.some(item => item.functionName === name), name).toBe(true);
+    expect(mutants.some(item => item.functionName === "called")).toBe(false);
+    for (const name of ["PrivateSpace.hidden", "PublicSpace.hidden"]) expect(mutants.some(item => item.functionName === name)).toBe(false);
+    expect(mutants.some(item => item.functionName === "serviceFactory.factoryLocal")).toBe(false);
+    for (const mutant of mutants) expect((yield* source.checkViable(mutant)).diagnostics).toEqual([]);
+  }).pipe(Effect.scoped), 30_000);
+
+  it.effect("keeps logical ids across prefix edits and inserts mutation imports after shebangs and directives", () => Effect.gen(function* () {
+    const directory = yield* Effect.acquireRelease(
+      Effect.promise(() => mkdtemp(resolve(root, "packages/engine/test/prologue-"))),
+      directory => Effect.promise(() => rm(directory, { recursive: true, force: true })),
+    );
+    const file = resolve(directory, "input.ts");
+    yield* Effect.promise(() => writeFile(resolve(directory, "tsconfig.json"), JSON.stringify({ extends: resolve(root, "tsconfig.base.json"), include: ["input.ts"] })));
+    const original = '#!/usr/bin/env node\n"use client";\n"use strict";\nimport { Context, Layer } from "effect";\nclass Key extends Context.Service<Key, { readonly n: number }>()("Key") {}\nexport const live = Layer.succeed(Key, { n: 1 });\n';
+    yield* Effect.promise(() => writeFile(file, original));
+    const input = config(resolve(directory, "tsconfig.json"), { functionFilter: ["live"] });
+    const source = makeSource();
+    const first = (yield* collect(source, input))[0]!;
+    expect(first.replacement.startOffset).toBe(0);
+    expect((yield* source.checkViable(first)).diagnostics).toEqual([]);
+    const mutated = first.replacement.text + original.slice(first.replacement.endOffset);
+    expect(mutated.startsWith("#!/usr/bin/env node\n")).toBe(true);
+    expect(mutated.indexOf("import * as __mutantCafeEffect")).toBeGreaterThan(mutated.indexOf('"use strict"'));
+    const changed = original.replace("export const live", "// documentation above the binding\nexport const live");
+    yield* Effect.promise(() => writeFile(file, changed));
+    const next = (yield* collect(makeSource(), input))[0]!;
+    expect(next.span.start.line).toBe(first.span.start.line + 1);
+    expect(next.id).toBe(first.id);
+  }).pipe(Effect.scoped), 30_000);
+
+  it.effect("covers internal, nested and value shapes without generating ill-typed generic or pipeable mutants", () => Effect.gen(function* () {
+    const source = makeSource();
+    const input = config("packages/engine/test/fixtures/coverage/tsconfig.json");
+    const mutants = yield* collect(source, input);
+    for (const name of ["layerOnly", "idleOnly", "live", "idle", "StaticService.layer", "internal", "internalEffect", "untraced", "Greeter.layer.greet", "Greeter.layer.send", "policy.canEdit", "machine.guards.allowed", "guardFor.<inner>", "brand", "set", "map", "object", "identityCandidate", "identityGeneric", "report", "scoped", "mapped"]) {
+      const items = mutants.filter(m => m.functionName === name);
+      expect(items.length, name).toBeGreaterThan(0);
+      for (const mutant of items) expect((yield* source.checkViable(mutant)).diagnostics, mutant.description).toEqual([]);
+    }
+    expect(mutants.some(m => m.functionName === "identityCandidate" && m.replacement.text.includes("=> (n)"))).toBe(true);
+    expect(mutants.some(m => m.functionName === "generic")).toBe(false);
+    const skipped = yield* source.notMutated(input);
+    expect(skipped.find(s => s.functionName === "generic")?.reason).toContain("generic");
+    expect(skipped.find(s => s.functionName === "opaque")?.reason).toContain("field call");
+    expect(skipped.some(s => s.functionName === "genericElement")).toBe(true);
+    expect(skipped.find(s => s.functionName === "reader.get")?.reason).toContain("generic");
+    const restricted = yield* collect(source, { ...input, exportedOnly: true });
+    expect(restricted.some(m => ["internal", "internalEffect", "untraced", "machine.guards.allowed"].includes(m.functionName))).toBe(false);
+    expect((yield* source.notMutated({ ...input, exportedOnly: true })).find(s => s.functionName === "internal")?.reason).toContain("--exported-only");
+    const repeated = yield* collect(makeSource(), input);
+    expect(repeated.map(m => m.id)).toEqual(mutants.map(m => m.id));
+  }), 30_000);
+
   for (const name of ["twice", "find"]) {
     it.effect(`preserves scoped return types and callers for ${name} (B1/B2)`, () => Effect.gen(function* () {
       const source = makeSource();
@@ -104,10 +211,8 @@ describe("checker-directed mutation", () => {
   it.effect("keeps a failing multi-service layer viable", () => Effect.gen(function* () {
     const source = makeSource();
     const mutants = yield* collect(source, config("packages/engine/test/fixtures/viability/tsconfig.json", { functionFilter: ["services"] }));
-    expect(mutants).toHaveLength(1);
-    const mutant = mutants[0]!;
-    expect(mutant.genre).toBe("LayerFail");
-    expect((yield* source.checkViable(mutant)).diagnostics).toEqual([]);
+    expect(mutants.map(m => m.genre).sort()).toEqual(["LayerDie", "LayerFail"]);
+    for (const mutant of mutants) expect((yield* source.checkViable(mutant)).diagnostics).toEqual([]);
   }));
 
   it.effect("gives every generated mutant a distinct description within its function", () => Effect.gen(function* () {
@@ -165,8 +270,9 @@ describe("checker-directed mutation", () => {
     const names = new Set(mutants.map((m) => m.functionName));
     expect(names.has("skipped")).toBe(false);
     expect(names.has("skippedArrow")).toBe(false);
-    expect(names.has("privateFunction")).toBe(false);
+    expect(names.has("privateFunction")).toBe(true);
     expect(names.has("mapped")).toBe(false);
+    expect(mutants.filter(m => m.functionName === "generated" && m.genre === "EffectDie")).toHaveLength(1);
     for (const name of ["bool", "literal", "numeric", "words", "array", "nothing", "option", "stream", "layer", "generated", "named", "program", "maybe", "nested", "synthetic", "Counter.value"]) expect(names.has(name), name).toBe(true);
     expect(mutants.some((m) => m.functionName === "synthetic" && m.genre === "EffectFail" && m.synthetic)).toBe(true);
     expect(mutants.some((m) => m.functionName === "nested" && m.genre === "EffectSucceed")).toBe(true);

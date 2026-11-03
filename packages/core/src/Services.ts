@@ -11,7 +11,7 @@ import type {
   ScratchError,
   TestSpawnError,
 } from "./Errors.ts";
-import type { Baseline, Mutant, MutantResult, RunReport } from "./Mutant.ts";
+import type { Baseline, Mutant, MutantResult, NotMutated, RunReport } from "./Mutant.ts";
 
 export interface Viability {
   readonly viable: boolean;
@@ -21,6 +21,7 @@ export interface Viability {
 export class MutantSource extends Context.Service<
   MutantSource,
   {
+    readonly notMutated: (config: RunConfig) => Effect.Effect<ReadonlyArray<NotMutated>, ProgramLoadError>;
     readonly generate: (config: RunConfig) => Stream.Stream<Mutant, ProgramLoadError>;
     readonly checkViable: (mutant: Mutant) => Effect.Effect<Viability, ProgramLoadError>;
   }
@@ -47,12 +48,13 @@ export interface TestRun {
   readonly command: ReadonlyArray<string>;
   readonly output: string;
   readonly testsCollected?: boolean;
+  readonly testFiles?: ReadonlyArray<string>;
 }
 
 export class TestRunner extends Context.Service<
   TestRunner,
   {
-    readonly baseline: (dir: ScratchDir) => Effect.Effect<Baseline, BaselineFailed | TestSpawnError>;
+    readonly baseline: (dir: ScratchDir, tsconfig?: string) => Effect.Effect<Baseline, BaselineFailed | TestSpawnError>;
     readonly runRelated: (
       dir: ScratchDir,
       file: string,

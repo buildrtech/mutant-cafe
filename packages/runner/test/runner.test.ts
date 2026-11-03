@@ -10,6 +10,7 @@ import * as Fiber from "effect/Fiber";
 import * as ChildProcess from "effect/process/ChildProcess";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 
+import { preflight } from "../src/Preflight.ts";
 import { runMutants, ScratchLive, TestRunnerLive } from "../src/index.ts";
 
 const root = decodeURIComponent(new URL("../../../fixtures/tagged-errors/", import.meta.url).pathname).replace(/\/$/, "");
@@ -28,7 +29,7 @@ const mutation = (original: string, id: string, text: string, genre: Mutant["gen
     replacement: { startOffset, endOffset, text }, synthetic: false
   };
 };
-const source = MutantSource.of({ generate: () => Stream.empty, checkViable: () => Effect.succeed({ viable: true, diagnostics: [] }) });
+const source = MutantSource.of({ notMutated: () => Effect.succeed([]), generate: () => Stream.empty, checkViable: () => Effect.succeed({ viable: true, diagnostics: [] }) });
 const withPorts = <A, E, R>(effect: Effect.Effect<A, E, R>, reports: Array<RunReport>, mutantSource = source) => effect.pipe(
   Effect.provideService(MutantSource, mutantSource),
   Effect.provideService(Reporter, { progress: () => Effect.void, write: (report) => Effect.sync(() => { reports.push(report); }) })
@@ -46,6 +47,192 @@ const selectionFixture = Effect.gen(function* () {
 });
 
 describe("real vitest mutation runs", () => {
+  for (const script of ["pnpm exec vitest", "npx vitest", "cross-env MODE=test vitest run", "vitest run && tsc --noEmit", "vitest --project unit"]) {
+    it.live(`recognizes the Vitest wrapper ${script}`, () => Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const dir = yield* selectionFixture;
+      yield* fs.writeFileString(`${dir.path}/package.json`, JSON.stringify({ type: "module", scripts: { test: script } }));
+      yield* fs.writeFileString(`${dir.path}/src/value.ts`, "export const value = true;");
+      yield* fs.writeFileString(`${dir.path}/test/value.test.ts`, 'import { it, expect } from "vitest"; import { value } from "../src/value.ts"; it("value", () => expect(value).toBe(true));');
+      expect(yield* preflight(dir.path)).toEqual([]);
+    }).pipe(Effect.scoped, Effect.provide(live)), 20_000);
+  }
+  for (const script of ["turbo run test", "pnpm -r test", "custom-test-wrapper"]) {
+    it.live(`reports delegated selection as unverified for ${script}`, () => Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const dir = yield* selectionFixture;
+      yield* fs.writeFileString(`${dir.path}/package.json`, JSON.stringify({ type: "module", scripts: { test: script } }));
+      const issues = yield* preflight(dir.path);
+      expect(issues[0]?.kind).toBe("warning");
+      expect(issues[0]?.reason).toContain(script === "custom-test-wrapper" ? "unknown test wrapper" : "delegated test runner");
+      expect(issues[0]?.reason).toContain("unverified");
+      expect(issues[0]?.reason).not.toContain("only runs Vitest");
+      yield* fs.writeFileString(`${dir.path}/test/visible.test.ts`, 'import { it, expect } from "vitest"; it("baseline executes", () => expect(1).toBe(1));');
+      const tests = yield* TestRunner;
+      const baseline = yield* tests.baseline(dir);
+      expect(baseline.durationMs).toBeGreaterThan(0);
+      expect(baseline.testCommand).toContain("--reporter=default");
+    }).pipe(Effect.scoped, Effect.provide(live)), 20_000);
+  }
+  for (const name of ["unit.spec.ts", "__tests__/unit.ts", "unit.test.mts"]) {
+    it.live(`respects Vitest resolved inclusion for ${name}`, () => Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const dir = yield* selectionFixture;
+      yield* fs.makeDirectory(`${dir.path}/__tests__`);
+      yield* fs.writeFileString(`${dir.path}/vitest.config.ts`, JSON.stringify({ test: { include: [name] } }).replace(/^/, "export default "));
+      yield* fs.writeFileString(`${dir.path}/src/value.ts`, "export const value = true;");
+      yield* fs.writeFileString(`${dir.path}/${name}`, `import { it, expect } from "vitest"; import { value } from "${name.includes("/") ? "../" : "./"}src/value.ts"; it("value", () => expect(value).toBe(true));`);
+      expect(yield* preflight(dir.path)).toEqual([]);
+    }).pipe(Effect.scoped, Effect.provide(live)), 20_000);
+  }
+  for (const output of ["dist", "compiled"]) {
+    it.live(`marks package self-imports of ${output} output unreliable`, () => Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const dir = yield* selectionFixture;
+      yield* fs.makeDirectory(`${dir.path}/${output}`);
+      yield* fs.writeFileString(`${dir.path}/package.json`, JSON.stringify({ name: "self-built-fixture", type: "module", exports: { ".": { import: `./${output}/index.js` } }, scripts: { test: "vitest run" } }));
+      const original = "export const value = () => true;";
+      yield* fs.writeFileString(`${dir.path}/src/value.ts`, original);
+      yield* fs.writeFileString(`${dir.path}/${output}/index.js`, original);
+      yield* fs.writeFileString(`${dir.path}/test/value.test.ts`, 'import { it, expect } from "vitest"; import { value } from "self-built-fixture"; it("checks the build", () => expect(value()).toBe(true));');
+      const startOffset = original.indexOf("true");
+      const item = { ...mutation(original, "built-self", ""), file: "src/value.ts", replacement: { startOffset, endOffset: startOffset + 4, text: "false" } };
+      const report = yield* withPorts(runMutants(config(dir.path), Stream.make(item)), []);
+      expect(report.results[0]?.outcome).toBe("unreliable");
+      expect(report.baseline.durationMs).toBeGreaterThan(0);
+      expect(report.results[0]?.diagnostics.join("\n")).toContain(`${output}/index.js`);
+      expect(report.results[0]?.diagnostics.join("\n")).toContain("built output");
+      expect(yield* fs.readFileString(`${dir.path}/src/value.ts`)).toBe(original);
+    }).pipe(Effect.scoped, Effect.provide(live)), 20_000);
+  }
+
+  for (const mapping of ["types", "tsconfig", "unmapped"]) {
+    it.live(`scopes a built subpath by source closure and actual selected tests (${mapping})`, () => Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const dir = yield* selectionFixture;
+      yield* fs.makeDirectory(`${dir.path}/dist`);
+      yield* fs.writeFileString(`${dir.path}/package.json`, JSON.stringify({ name: "built-subpath-fixture", type: "module", exports: { "./sub": { types: mapping === "types" ? "./src/sub.ts" : "./dist/sub.d.ts", import: "./dist/sub.js" } }, scripts: { test: "vitest run" } }));
+      if (mapping === "tsconfig") {
+        yield* fs.makeDirectory(`${dir.path}/config`);
+        yield* fs.writeFileString(`${dir.path}/config/base.json`, '{ // build mapping\n "note": "// preserve quoted text", "compilerOptions": { "rootDir": "../unused", "outDir": "../dist", }, }');
+        yield* fs.writeFileString(`${dir.path}/build.json`, '{ "extends": ["./config/base.json"], "compilerOptions": { "rootDir": "src" }, "include": ["src"] }');
+      }
+      const sub = 'import { ready } from "./dependency.ts"; export const sub = () => ready();';
+      const dependency = 'export const ready = () => true;';
+      const other = 'export const other = (n: number): number => n + 1;';
+      yield* fs.writeFileString(`${dir.path}/src/sub.ts`, sub);
+      yield* fs.writeFileString(`${dir.path}/src/dependency.ts`, dependency);
+      yield* fs.writeFileString(`${dir.path}/src/other.ts`, other);
+      yield* fs.writeFileString(`${dir.path}/src/orphan.ts`, dependency);
+      yield* fs.writeFileString(`${dir.path}/dist/sub.js`, 'export const sub = () => true;');
+      yield* fs.writeFileString(`${dir.path}/test/built.test.ts`, 'import { it, expect } from "vitest"; import { sub } from "built-subpath-fixture/sub"; it("built subpath", () => expect(sub()).toBe(true));');
+      const directTest = 'import { it, expect } from "vitest"; import { other } from "../src/other.ts"; it("source", () => expect(other(1)).toBe(2));';
+      yield* fs.writeFileString(`${dir.path}/test/source.test.ts`, directTest);
+      const item = (file: string, original: string, expression: string, text: string, id: string): Mutant => ({ ...mutation(original, id, ""), file, replacement: { startOffset: original.indexOf(expression), endOffset: original.indexOf(expression) + expression.length, text } });
+      const subMutant = item("src/sub.ts", sub, "ready()", "false", "sub");
+      const depMutant = item("src/dependency.ts", dependency, "true", "false", "dependency");
+      const runConfig = { ...config(dir.path), tsconfig: mapping === "tsconfig" ? `${dir.path}/build.json` : "tsconfig.json" };
+      const first = yield* withPorts(runMutants(runConfig, Stream.fromIterable([subMutant, depMutant,
+        item("src/other.ts", other, "n + 1", "0", "caught"), item("src/other.ts", other, "n + 1", "2", "missed"), item("src/orphan.ts", dependency, "true", "false", "orphan") ])), []);
+      expect(first.baseline.durationMs).toBeGreaterThan(0);
+      expect(first.baseline.testCommand).toContain("--reporter=default");
+      expect(first.results.map(result => result.outcome)).toEqual(["unreliable", "unreliable", "caught", "missed", mapping === "unmapped" ? "unreliable" : "untested"]);
+      const issue = first.baseline.unreliable?.find(issue => issue.kind === "built");
+      expect(issue?.kind).toBe("built");
+      if (issue?.kind === "built") {
+        expect(issue.testFiles).toEqual(["test/built.test.ts"]);
+        expect(issue.files).toEqual(mapping === "unmapped" ? undefined : ["src/sub.ts", "src/dependency.ts"]);
+      }
+      // Both tests remain selected by Vitest globally. Related selection now
+      // reaches source directly, excludes the dist test, and must catch normally.
+      yield* fs.writeFileString(`${dir.path}/test/source.test.ts`, directTest + '\nimport { sub } from "../src/sub.ts"; it("direct sub", () => expect(sub()).toBe(true));');
+      const second = yield* withPorts(runMutants(runConfig, Stream.fromIterable([subMutant, depMutant])), []);
+      expect(second.results.map(result => result.outcome)).toEqual(["caught", "caught"]);
+      expect(yield* fs.readFileString(`${dir.path}/src/sub.ts`)).toBe(sub);
+      expect(yield* fs.readFileString(`${dir.path}/src/dependency.ts`)).toBe(dependency);
+    }).pipe(Effect.scoped, Effect.provide(live)), 40_000);
+  }
+
+  it.live("does not turn a selection probe failure into an unverified runner", () => Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const dir = yield* selectionFixture;
+    yield* fs.writeFileString(`${dir.path}/vitest.config.ts`, 'throw new Error("broken fixture config"); export default {};');
+    const issues = yield* preflight(dir.path);
+    expect(issues.some(issue => issue.kind === "warning")).toBe(true);
+    expect(issues.some(issue => issue.kind === "runner")).toBe(false);
+    const tests = yield* TestRunner;
+    const baseline = yield* tests.baseline(dir).pipe(Effect.result);
+    expect(baseline._tag).toBe("Failure");
+    if (baseline._tag === "Failure") {
+      expect(baseline.failure._tag).toBe("BaselineFailed");
+      if (baseline.failure._tag === "BaselineFailed") {
+        expect(baseline.failure.command).toContain("--reporter=default");
+        expect(baseline.failure.output).toContain("broken fixture config");
+      }
+    }
+  }).pipe(Effect.scoped, Effect.provide(live)), 20_000);
+
+  it.live("marks non-Vitest scripts and excluded importing tests unreliable before baseline", () => Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const dir = yield* selectionFixture;
+    const original = "export const value = () => true;";
+    yield* fs.writeFileString(`${dir.path}/src/target.ts`, original);
+    const startOffset = original.indexOf("true");
+    const item = { ...mutation(original, "hidden", ""), file: "src/target.ts", replacement: { startOffset, endOffset: startOffset + 4, text: "false" } };
+    yield* fs.writeFileString(`${dir.path}/package.json`, JSON.stringify({ type: "module", scripts: { test: "node --test test/*.test.ts" } }));
+    let report = yield* withPorts(runMutants(config(dir.path), Stream.make(item)), []);
+    expect(report.results[0]?.outcome).toBe("unreliable");
+    expect(report.results[0]?.diagnostics.join("\n")).toContain("node --test");
+    yield* fs.writeFileString(`${dir.path}/package.json`, JSON.stringify({ type: "module", scripts: { test: "vitest run" } }));
+    yield* fs.makeDirectory(`${dir.path}/ignored`);
+    yield* fs.writeFileString(`${dir.path}/ignored/hidden.test.ts`, 'import { it, expect } from "vitest"; import { value } from "../src/target.ts"; it("checks target", () => expect(value()).toBe(true));');
+    yield* fs.writeFileString(`${dir.path}/test/visible.test.ts`, 'import { it, expect } from "vitest"; it("unrelated", () => expect(1).toBe(1));');
+    report = yield* withPorts(runMutants(config(dir.path), Stream.make(item)), []);
+    expect(report.results[0]?.outcome).toBe("unreliable");
+    expect(report.results[0]?.diagnostics.join("\n")).toContain("ignored/hidden.test.ts");
+  }).pipe(Effect.scoped, Effect.provide(live)), 20_000);
+
+  it.live("does not call three unreachable double mutants missed when the fallback suite passes", () => Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const dir = yield* selectionFixture;
+    const original = "export const double = (n: number): number => n * 2;";
+    yield* fs.writeFileString(`${dir.path}/src/double.ts`, original);
+    yield* fs.writeFileString(`${dir.path}/test/unrelated.test.ts`, 'import { it, expect } from "vitest"; it("unrelated", () => expect(1).toBe(1));');
+    const startOffset = original.indexOf("n * 2");
+    const items = ["0", "1", "-1"].map(text => ({ ...mutation(original, `double-${text}`, ""), file: "src/double.ts", replacement: { startOffset, endOffset: startOffset + 5, text } }));
+    const report = yield* withPorts(runMutants(config(dir.path), Stream.fromIterable(items)), []);
+    expect(report.results.map(r => r.outcome)).toEqual(["untested", "untested", "untested"]);
+  }).pipe(Effect.scoped, Effect.provide(live)), 20_000);
+
+  it.live("repoints a workspace self-link so package-name imports catch the scratch mutation", () => Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const dir = yield* selectionFixture;
+    yield* fs.remove(`${dir.path}/node_modules`);
+    yield* fs.makeDirectory(`${dir.path}/node_modules`);
+    for (const name of ["vitest", "effect"]) yield* fs.symlink(yield* fs.realPath(`${root}/node_modules/${name}`), `${dir.path}/node_modules/${name}`);
+    yield* fs.symlink(dir.path, `${dir.path}/node_modules/self-fixture`);
+    yield* fs.writeFileString(`${dir.path}/package.json`, JSON.stringify({ name: "self-fixture", type: "module", main: "./src/self.ts", scripts: { test: "vitest run" } }));
+    const original = "export const value = () => true;";
+    yield* fs.writeFileString(`${dir.path}/src/self.ts`, original);
+    yield* fs.writeFileString(`${dir.path}/test/self.test.ts`, 'import { it, expect } from "vitest"; import { value } from "self-fixture"; it("reads its own package", () => expect(value()).toBe(true));');
+    const startOffset = original.indexOf("true");
+    const item = { ...mutation(original, "self", ""), file: "src/self.ts", replacement: { startOffset, endOffset: startOffset + 4, text: "false" } };
+    const scratch = yield* Scratch;
+    const oldCopy = yield* scratch.acquire(dir.path);
+    yield* oldCopy.apply(item);
+    // Recreate the old linked-node_modules behavior only in this disposable copy.
+    yield* fs.remove(`${oldCopy.path}/node_modules/self-fixture`);
+    yield* fs.symlink(dir.path, `${oldCopy.path}/node_modules/self-fixture`);
+    const tests = yield* TestRunner;
+    const escaped = yield* tests.runRelated(oldCopy, item.file, 5000);
+    expect(escaped.status, escaped.output).toBe("untested");
+    expect(escaped.output).toContain("1 passed");
+    const report = yield* withPorts(runMutants(config(dir.path), Stream.make(item)), []);
+    expect(report.results[0]?.outcome, report.results[0]?.output).toBe("caught");
+    expect(yield* fs.readFileString(`${dir.path}/src/self.ts`)).toBe(original);
+    expect(yield* fs.realPath(`${dir.path}/node_modules/self-fixture`)).toBe(dir.path);
+  }).pipe(Effect.scoped, Effect.provide(live)), 20_000);
+
   it.live("falls back from no related files to the full suite, and distinguishes zero tests (B5)", () => Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem;
     const dir = yield* selectionFixture;
@@ -170,11 +357,16 @@ describe("real vitest mutation runs", () => {
       const original = yield* fs.readFileString(`${root}/${file}`);
       yield* dir.apply(mutation(original, "broken", "  return Effect.succeed({ id: 'wrong', balance: 0, frozen: false });"));
       let generated = false;
-      const result = yield* withPorts(runMutants(config(dir.path)), [], {
+      const reports: RunReport[] = [];
+      const result = yield* withPorts(runMutants(config(dir.path)), reports, {
         ...source, generate: () => Stream.fromEffect(Effect.sync(() => { generated = true; return mutation(original, "unused", ""); }))
       }).pipe(Effect.flip);
       expect(result._tag).toBe("BaselineFailed");
       expect(generated).toBe(false);
+      expect(reports).toHaveLength(1);
+      expect(reports[0]?.failure).toContain("BaselineFailed");
+      expect(reports[0]?.failure).toContain("vitest run");
+      expect(reports[0]?.failure).toContain("expected");
     }).pipe(Effect.scoped, Effect.provide(live)), 30_000);
 
   it.live("isolates concurrent workers and skips tests for an unviable mutant", () =>

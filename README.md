@@ -15,7 +15,7 @@ Other mutants, all chosen from the checker's view of the return type:
 - `Effect.succeed(value)` for plausible values of `A`, `Effect.fail` of each tag, `Effect.die`, and `Effect.never` behind a measured timeout
 - `Option.none()` and `Option.some(value)`
 - `Stream.empty`, a one-element stream, and a failing stream
-- a `Layer` that fails at build
+- a `Layer` that dies at build, even when its error type is `never`, plus one failing build per error tag
 - flipped booleans and cycled literal unions
 
 ## Use it
@@ -28,11 +28,16 @@ npx mutant-cafe --list      # preview the mutants
 npx mutant-cafe --jobs 4    # test them
 ```
 
+It mutates internal functions by default, including `Effect.fn` and `Effect.fnUntraced`, object-literal arrows, service methods inside Layers, and the inner function of a curried export. Layer values and static Layer properties are targets too. Names follow their path, such as `Greeter.layer.greet`, `policy.canEdit`, and `guardFor.<inner>`. With `--exported-only`, targets must be reachable through an exported binding path: exported top-level functions, methods and functions in exported values, returned curried functions, and exported Layers with their returned service methods. Local declarations and arrows inside other function bodies are internal, even if their owner is exported. This keeps local helpers out without dropping exported object or service APIs.
+
+Value synthesis includes branded strings and numbers, empty sets and maps, anonymous objects with cycled literal fields, and same-typed parameters as identity replacements. Naked type-parameter returns get no fabricated values, but a same-typed parameter can still supply an identity mutant. Context-only generic types that cannot be named in the body are skipped with a reason. Literal leaves keep their type without making mutable arrays readonly. Generator mutants use the body's type before `Effect.fn` pipeables such as `Effect.scoped` or `Effect.map`.
+
 Run it from the package whose tests you want to check. In a monorepo that resolves workspace packages through built output, build the package's dependencies first.
 
 | Flag | Meaning |
 | --- | --- |
-| `--list` | print the mutants, per-file counts and a total, then exit |
+| `--list` | print mutants, per-file counts, the total and the not-mutated count, then exit |
+| `--exported-only` | only exported binding paths, curried returns and Layer service methods; exclude local helpers |
 | `--in-diff <file>` | only mutants on lines a unified diff adds or changes |
 | `--file <glob>`, `--exclude <glob>` | choose source files (repeatable) |
 | `--jobs <n>` | scratch copies tested in parallel |
@@ -41,11 +46,29 @@ Run it from the package whose tests you want to check. In a monorepo that resolv
 | `--output <dir>` | results directory, default `mutants.out` |
 | `--tsconfig <path>` | default `tsconfig.json` |
 
-Results land in `mutants.out/`: `missed.txt`, `caught.txt`, `timeout.txt`, `unviable.txt`, `untested.txt`, a context diff and a log per mutant, and `outcomes.json`. Every result line includes the mutant id used by `diff/<id>.diff` and `logs/<id>.log`. Lines show the declared return type when available, or an abbreviated inferred type; JSON keeps full types. Add `mutants.out*` to `.gitignore`. Your source tree is never edited: each mutant runs in a scratch copy.
+## Outputs
+
+Mutant ids are stable within a version and may change between versions before 1.0. An import-adding mutant hashes its logical edit, not the retained file prefix, so edits above its binding do not change its id.
+
+Results land in `mutants.out/`: `missed.txt`, `caught.txt`, `timeout.txt`, `unviable.txt`, `untested.txt`, `unreliable.txt`, `not-mutated.txt`, a context diff and a log per mutant, and `outcomes.json`. Every result line includes the mutant id used by `diff/<id>.diff` and `logs/<id>.log`. Lines show the declared return type when available, or an abbreviated inferred type; JSON keeps full types and uses report `schemaVersion: 2`. Add `mutants.out*` to `.gitignore`. Your source tree is never edited: each mutant runs in a scratch copy. Workspace dependency links back into the copied source tree, including package self-links, point at the scratch packages rather than the originals. Mutation imports are added when the file has no usable value import for an Effect API.
+
+`not-mutated.txt` lists considered functions with no mutants and their reasons: unsupported return values or required fields, generic returns, and explicit exclusions. The summary includes that count. With `--in-diff`, only skips from files touched by the diff are reported. The baseline command prints before execution. A failed baseline still writes `outcomes.json`, including its command and output tail; TypeScript load errors print the tsconfig path and diagnostics.
 
 An include glob that matches no source file is a usage error, including a path outside the package root. Diff paths resolve from the Git toplevel, with support for `git diff --relative`; outside Git they resolve from the working directory.
 
-Exit codes: 0 no missed, untested or timed-out mutants, 1 usage error, 2 some mutants were missed or untested, 3 some timed out with none missed or untested, 4 the baseline tests fail, 5 the `--in-diff` diff doesn't match the tree, 6 the diff can't be parsed, 70 internal error. **Missed or untested takes precedence over timeout:** a run with both exits 2.
+| Exit code | Meaning |
+| --- | --- |
+| 0 | no missed, unreliable, untested or timed-out mutants |
+| 1 | usage, source or tsconfig error |
+| 2 | some mutants were missed, or untested with no unreliable results |
+| 3 | some timed out, with no missed, unreliable or untested results |
+| 4 | baseline tests fail |
+| 5 | the `--in-diff` diff does not match the tree |
+| 6 | the diff cannot be parsed |
+| 7 | some results are unreliable, with none missed |
+| 70 | internal error |
+
+Precedence is **missed (2), unreliable (7), untested (2), then timeout (3)**. A real miss wins over unreliable results; unreliable wins over an empty selection or timeout.
 
 ## Outcomes
 
@@ -55,9 +78,20 @@ Exit codes: 0 no missed, untested or timed-out mutants, 1 usage error, 2 some mu
 | missed | the selected tests passed |
 | unviable | the mutant does not type-check |
 | timeout | the tests ran past the per-mutant budget without a reported failure or evidence of a caught `Effect.never` |
-| untested | neither related selection nor the package's full suite found any test files |
+| untested | related selection found no test files and the full-suite fallback did not fail |
+| unreliable | an unsupported runner, an omitted importing test, or a selected test reading a built self-entry instead of the affected source |
 
-Vitest first runs tests related to the mutated file. When that selects no test files, mutant.cafe reruns the package's full suite within the remaining budget. Selection and partial failures come from Vitest's reporter hooks, not its human-readable messages. A reported failure still counts as caught if another test file hangs.
+Vitest first runs tests related to the mutated file. When that selects no test files, mutant.cafe reruns the package's full suite within the remaining budget. A failing fallback counts as caught, including dynamic-import consumers. A passing fallback is untested, not missed: unrelated passing tests do not prove they reached the mutant.
+
+Before the baseline, mutant.cafe checks `package.json`'s test script and asks the installed Vitest for its resolved test files. It warns when another runner owns the test script or a test importing a target is omitted. Test support imported by selected tests is not an omitted suite. Affected viable mutants are unreliable and are not scored as missed; their diagnostics name the script or omitted test. Common wrappers (`pnpm exec vitest`, `npx vitest`, `cross-env … vitest`, chained commands and `vitest --project`) count as Vitest scripts. Delegated scripts such as `turbo run test` or `pnpm -r test` are unverified, not declared non-Vitest.
+
+Only an explicit non-Vitest runner skips the baseline and makes all results unreliable. Delegated or unknown scripts and failed selection probes warn but do not disable the Vitest baseline.
+
+Self-imports that resolve to built JavaScript are scoped: the export's `types` condition or explicit tsconfig `rootDir`/`outDir` maps the entry back to source and its import closure. A mutant in that closure is unreliable only if its actual selected tests include a test that imports the built entry. If mapping is unavailable, only that selected-test condition applies. Selection comes from the running Vitest reporter, including a full-suite fallback. Other mutants run normally; a built self-import never disables the baseline. Remapping a package link cannot rebuild its output.
+
+This does not add `node:test` support. Literal relative imports are traced transitively; computed imports remain subject to the full-suite fallback.
+
+Selection and partial failures come from Vitest's reporter hooks, not its human-readable messages. A reported failure still counts as caught if another test file hangs.
 
 Ordinary mutants use the configured timeout. For `Effect.never`, mutant.cafe measures the unmutated related run once per file, including any full-suite fallback. Its budget is that duration × the timeout multiplier, with a 1 s floor. Slow tests that never call the function can finish normally; a process killed before test collection is not credited as caught. Each mutant run also sets Vitest's per-test timeout to half its budget, overriding a package's `testTimeout: 0`, and stops after the first reported failure.
 

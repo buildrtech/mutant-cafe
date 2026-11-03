@@ -7,6 +7,7 @@ export const RunConfig = Schema.Struct({
   exclude: Schema.Array(Schema.String),
   functionFilter: Schema.Array(Schema.String),
   inDiff: Schema.optional(Schema.String),
+  exportedOnly: Schema.optional(Schema.Boolean),
   jobs: Schema.Int,
   timeoutMs: Schema.optional(Schema.Int),
   timeoutMultiplier: Schema.Finite,

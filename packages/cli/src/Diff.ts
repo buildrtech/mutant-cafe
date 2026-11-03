@@ -1,4 +1,4 @@
-import { DiffParseError, type Mutant } from "@mutant-cafe/core";
+import { DiffParseError, type Mutant, type NotMutated } from "@mutant-cafe/core";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
@@ -86,10 +86,11 @@ export const parseDiff = (text: string, path: string) => Effect.try({
   catch: (error) => Schema.is(DiffParseError)(error) ? error : new DiffParseError({ path, message: String(error) }),
 });
 
-export const selectInDiff = Effect.fn("selectInDiff")(function*(options: {
+export const selectDiffScope = Effect.fn("selectDiffScope")(function*(options: {
   readonly root: string;
   readonly diffPath: string;
   readonly mutants: ReadonlyArray<Mutant>;
+  readonly notMutated: ReadonlyArray<NotMutated>;
 }) {
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
@@ -131,9 +132,18 @@ export const selectInDiff = Effect.fn("selectInDiff")(function*(options: {
     for (const line of patch.lines) if (line.added) added.add(line.number);
     changed.set(absolute, added);
   }
-  return options.mutants.filter((mutant) => {
-    const added = changed.get(path.resolve(options.root, mutant.file));
-    const end = mutant.span.end.line - (mutant.span.end.column === 1 ? 1 : 0);
-    return added !== undefined && [...added].some((line) => line >= mutant.span.start.line && line <= end);
-  });
+  return {
+    mutants: options.mutants.filter((mutant) => {
+      const added = changed.get(path.resolve(options.root, mutant.file));
+      const end = mutant.span.end.line - (mutant.span.end.column === 1 ? 1 : 0);
+      return added !== undefined && [...added].some((line) => line >= mutant.span.start.line && line <= end);
+    }),
+    notMutated: options.notMutated.filter(item => changed.has(path.resolve(options.root, item.file))),
+  };
 });
+
+export const selectInDiff = (options: {
+  readonly root: string;
+  readonly diffPath: string;
+  readonly mutants: ReadonlyArray<Mutant>;
+}) => selectDiffScope({ ...options, notMutated: [] }).pipe(Effect.map(result => result.mutants));
