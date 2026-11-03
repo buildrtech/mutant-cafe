@@ -32,6 +32,12 @@ const report = (root: string, mutants: ReadonlyArray<Mutant>): RunReport => ({
 it("includes actual host restarts and pool resets in the summary", () => {
   expect(countsLine({ ...report("/fixture", []), hostRestarts: 2, poolResets: 7 }, 0)).toContain("2 host restarts, 7 pool resets");
 });
+it("reports measured per-mutant backstop percentiles without inventing missing samples", () => {
+  const base = report("/fixture", [mutant(), mutant(), mutant(), mutant()]);
+  const measured = { ...base, results: base.results.map((result, index) => index === 3 ? result : { ...result, backstopMs: [1, 2, 9][index]! }) };
+  expect(countsLine(measured, 0)).toContain("backstop per mutant p50 2.0 ms, p90 9.0 ms (3 measured)");
+  expect(countsLine(base, 0)).not.toContain("backstop per mutant");
+});
 const missedRun: Run = (config, mutants) => Effect.gen(function*() {
   const reporter = yield* Reporter;
   const output = report(config.root, mutants);

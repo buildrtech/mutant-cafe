@@ -47,6 +47,7 @@ export interface TestRun {
   readonly durationMs: number;
   readonly command: ReadonlyArray<string>;
   readonly output: string;
+  readonly backstopMs?: number | undefined;
   readonly telemetryWarnings?: ReadonlyArray<string> | undefined;
   readonly testsCollected?: boolean;
   readonly testFiles?: ReadonlyArray<string>;

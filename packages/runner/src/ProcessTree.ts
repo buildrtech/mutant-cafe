@@ -2,6 +2,7 @@ import { TestSpawnError } from "@mutant-cafe/core";
 import { createEffectActor, createEffectLogic, join, send, setupEffect } from "@xstate/effect";
 import { types } from "xstate";
 import * as Console from "effect/Console";
+import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -18,6 +19,9 @@ import { randomUUID } from "node:crypto";
 import { pathToFileURL } from "node:url";
 
 const execute = promisify(execFile);
+// Warning-only recognition spans selectors and execution sessions. These paths
+// never authorize a signal: discover() still uses only its own ledger.
+const liveLedgers = new Set<string>();
 export const ProcessInspector = Context.Reference<{
   readonly inspect: (args: ReadonlyArray<string>) => Effect.Effect<{ readonly stdout: string }, TestSpawnError>;
 }>("mutant.cafe/ProcessInspector", { defaultValue: () => ({ inspect: args => Effect.tryPromise({
@@ -100,7 +104,7 @@ interface CleanupState {
   readonly failure: string | undefined;
 }
 
-export const acquireProcessTree = Effect.fn("ProcessTree.acquire")(function* (scratch?: string) {
+export const acquireProcessTree = Effect.fn("ProcessTree.acquire")(function* (scratch?: string, onBackstop?: (durationMs: number) => void) {
   const fs = yield* FileSystem.FileSystem;
   const directory = yield* fs.makeTempDirectory({ prefix: "mutant-processes-" });
   const ledger = `${directory}/pids.jsonl`;
@@ -109,6 +113,7 @@ export const acquireProcessTree = Effect.fn("ProcessTree.acquire")(function* (sc
   const url = pathToFileURL(script).href;
   yield* fs.writeFileString(ledger, "");
   yield* fs.writeFileString(script, preloadSource);
+  liveLedgers.add(ledger);
   const roots = new Set<number>();
   const command = ["vitest", "process-cleanup"];
   // Never include inspector output: it can contain environment values.
@@ -194,11 +199,11 @@ export const acquireProcessTree = Effect.fn("ProcessTree.acquire")(function* (sc
     }
   });
   // A scratch-path match nominates a survivor for warning, never for killing.
-  const warnUnowned = Effect.gen(function* () {
+  const inspectUnowned = Effect.gen(function* () {
     if (!scratch) return;
     const table = yield* snapshot;
-    const registered = yield* fs.readFileString(ledger);
-    const known = new Set(registered.split("\n").flatMap(line => {
+    const registered = yield* Effect.forEach([...liveLedgers], path => fs.readFileString(path).pipe(Effect.catch(() => Effect.succeed(""))));
+    const known = new Set(registered.join("\n").split("\n").flatMap(line => {
       const parsed = Schema.decodeOption(Schema.fromJsonString(Record))(line);
       return parsed._tag === "Some" && table.get(parsed.value.pid)?.birth === parsed.value.birth ? [parsed.value.pid] : [];
     }));
@@ -221,6 +226,12 @@ export const acquireProcessTree = Effect.fn("ProcessTree.acquire")(function* (sc
     const survivors = [...candidates].filter(pid => table.has(pid) && !known.has(pid));
     if (survivors.length) yield* Console.warn(`Warning: unowned scratch-related process PIDs ${survivors.join(", ")} survived; not signalled because ownership is unproven`);
   }).pipe(Effect.catch(() => Console.warn("Warning: cannot inspect unowned scratch-related survivors; no unverified PID was signalled")));
+  const warnUnowned = Effect.gen(function* () {
+    const started = yield* Clock.currentTimeMillis;
+    yield* inspectUnowned;
+    const elapsed = Math.max(0, (yield* Clock.currentTimeMillis) - started);
+    yield* Effect.sync(() => onBackstop?.(elapsed));
+  });
   const semaphore = yield* Semaphore.make(1);
   type Outcome = "clean" | "warning";
   let closed: Outcome | undefined;
@@ -272,7 +283,7 @@ export const acquireProcessTree = Effect.fn("ProcessTree.acquire")(function* (sc
     yield* cleanup;
     if (closed === "clean") yield* fs.remove(directory, { recursive: true }).pipe(
       Effect.catch(error => Console.warn(`Warning: cannot remove process ledger directory: ${error.message}`)));
-  }));
+  }).pipe(Effect.ensuring(Effect.sync(() => { liveLedgers.delete(ledger); }))));
   const existing = process.env.NODE_OPTIONS ?? "";
   return {
     env: { ...process.env, MUTANT_CAFE_PROCESS_PHASE: undefined, [tokenKey]: token, [ledgerKey]: ledger, [preloadKey]: url, NODE_OPTIONS: `${existing} --import=${url}`.trim() },

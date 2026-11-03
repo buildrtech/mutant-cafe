@@ -10,6 +10,8 @@ const validators: Readonly<Record<string, (value: unknown) => boolean>> = {
   testWorkers: telemetryInteger, testConcurrency: telemetryInteger, hostPid: telemetryInteger, testableMutants: telemetryInteger,
   hostRestarts: telemetryInteger, poolResets: telemetryInteger, firstTestStart: finite, hangBudgetBaseMs: finite,
   testDurations: numericRecord, testTimeouts: numericRecord, testFileDurations: numericRecord, testTimeoutDetails: numericRecord, calibration,
+  backstopMs: finite,
+  runnerModeReason: value => typeof value === "string",
   runnerMode: value => value === "cold" || value === "warm",
   telemetryWarnings: value => Array.isArray(value) && value.every(item => typeof item === "string")
 };

@@ -225,6 +225,7 @@ export const runMutants = Effect.fn("Runner.runMutants")(function* (
           timeoutMs: testTimeoutMs ?? timeoutMs,
           outerTimeoutMs: timeoutMs,
           ...(testTimeoutMs === undefined ? {} : { hangBudgetBaseMs: neverBases.get(mutant.file) }),
+          backstopMs: run.backstopMs,
           telemetryWarnings: run.telemetryWarnings,
           testWorkers: run.testWorkers,
           testConcurrency: run.testConcurrency,

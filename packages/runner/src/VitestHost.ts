@@ -204,6 +204,10 @@ process.on("message", async request => {
       return;
     }
     if (request.type !== "run") return;
+    if (process.argv[3] === "select") {
+      process.send({ type: "protocolError", message: "Selection-only host cannot execute tests" });
+      return;
+    }
     reporter = new Reporter(request.probe?.token ?? null, request.probe?.setupFile ?? null);
     reporter.onInit(ctx);
     ctx.reporters = [...defaultReporters, reporter];

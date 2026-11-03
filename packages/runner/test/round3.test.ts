@@ -94,10 +94,13 @@ describe("round three regression proof", () => {
     const original = yield* Console.Console;
     const report = yield* run(config(root, true), [replace(value, "Effect.succeed(1)", "Effect.succeed(2)", "wrong"),
       replace(second, "true", "false", "second", "src/second.ts", "BooleanFlip"), replace(third, "true", "false", "third", "src/third.ts", "BooleanFlip")]).pipe(
-      Effect.provide(TestRunnerLive), Effect.provideService(FileSystem.FileSystem, tracked),
+      // The outer live layer already memoized TestRunnerLive with the real FS.
+      // Build a fresh layer so the host counter observes its scoped allocations.
+      Effect.provide(Layer.fresh(TestRunnerLive)), Effect.provideService(FileSystem.FileSystem, tracked),
       Effect.provideService(Console.Console, { ...original, warn: (...args: ReadonlyArray<unknown>) => { warnings.push(args.join(" ")); } }));
     expect(report.results.map(result => result.outcome)).toEqual(["caught", "caught", "caught"]);
     expect(report.reachabilityProbes).toEqual([]);
+    expect(report.baseline.probeSupported).toBe(true);
     expect(hosts).toBe(1);
     expect(warnings.some(message => message.includes("warm Vitest unavailable"))).toBe(false);
   }).pipe(Effect.scoped, Effect.provide(live)), 30_000);
@@ -115,7 +118,7 @@ describe("round three regression proof", () => {
     expect(warm.results.map(result => result.outcome)).toEqual(["caught", "missed"]);
     expect(cold.baseline.testConcurrency).toBeGreaterThan(1);
     expect(warm.baseline.testConcurrency).toBeGreaterThan(1);
-    expect(warm.baseline.testConcurrency).toBe(cold.baseline.testConcurrency);
+    expect(warm.baseline.testWorkers).toBe(cold.baseline.testWorkers);
   }).pipe(Effect.scoped, Effect.provide(live)), 40_000);
 
   it.live("uses cold execution for global setup services", () => Effect.gen(function* () {

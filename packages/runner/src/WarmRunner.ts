@@ -42,7 +42,12 @@ export function decodeWarmMessage(value: unknown): Message {
       Reflect.set(cleaned.value, "telemetryWarnings", [...(Array.isArray(previous) ? previous : []), ...cleaned.warnings]);
     }
     return Schema.decodeUnknownSync(Message)(cleaned.value);
-  } catch (error) { throw new ReporterMessageError(`Internal warm reporter protocol error: ${String(error)}`); }
+  } catch (error) {
+    // SchemaError.toString omits the actual value. This is a protocol frame,
+    // not captured test stdout; keep a bounded diagnostic alongside the issue.
+    const actual = (() => { try { return JSON.stringify(value)?.slice(0, 4096) ?? String(value); } catch { return "[unserializable frame]"; } })();
+    throw new ReporterMessageError(`Internal warm reporter protocol error: ${String(error)}; received ${actual}`);
+  }
 }
 
 // One pending request per scratch copy. IPC carries only parsed reporter data;
@@ -156,7 +161,7 @@ const lifecycle = setupEffect({ schemas: { events: {
   }
 });
 
-export const openWarmRunner = Effect.fn("TestRunner.openWarm")(function* (dir: ScratchDir, onFallback: () => void, options: { readonly quiet?: boolean; readonly onRestart?: () => void; readonly onPoolReset?: () => void; readonly warn?: (message: string) => Effect.Effect<void>; readonly decodeMessage?: typeof decodeWarmMessage } = {}) {
+export const openWarmRunner = Effect.fn("TestRunner.openWarm")(function* (dir: ScratchDir, onFallback: (reason: string) => void, options: { readonly selectionOnly?: boolean; readonly quiet?: boolean; readonly onRestart?: () => void; readonly onPoolReset?: () => void; readonly onBackstop?: (durationMs: number) => void; readonly warn?: (message: string) => Effect.Effect<void>; readonly decodeMessage?: typeof decodeWarmMessage } = {}) {
   const fs = yield* FileSystem.FileSystem;
   const parentScope = yield* Scope.Scope;
   const temp = yield* fs.makeTempDirectoryScoped({ prefix: "mutant-warm-" });
@@ -169,20 +174,27 @@ export const openWarmRunner = Effect.fn("TestRunner.openWarm")(function* (dir: S
   const attempt = <A>(fn: () => Promise<A>) => Effect.tryPromise({ try: fn,
     catch: error => new TestSpawnError({ command: ["vitest", "warm"], message: String(error), ...(error instanceof ReporterMessageError ? { kind: "reporter" as const } : {}) }) });
   const close = () => host === undefined ? Effect.void : host.close();
+  const abortHost = (error: TestSpawnError) => Effect.gen(function* () {
+    yield* send(actor, { type: "FAIL" });
+    yield* close();
+    return yield* error;
+  });
   yield* Effect.addFinalizer(() => close().pipe(Effect.orDie));
   const start = Effect.gen(function* () {
     const scope = yield* Scope.make();
     yield* Effect.addFinalizer(() => Scope.close(scope, Exit.succeed(undefined))).pipe(Effect.provideService(Scope.Scope, parentScope));
-    const tree = yield* acquireProcessTree(dir.path).pipe(Effect.provideService(Scope.Scope, scope), Effect.provideService(FileSystem.FileSystem, fs),
+    const tree = yield* acquireProcessTree(dir.path, options.onBackstop).pipe(Effect.provideService(Scope.Scope, scope), Effect.provideService(FileSystem.FileSystem, fs),
       Effect.mapError(error => new TestSpawnError({ command: ["vitest", "warm"], message: String(error) })));
-    const active = new Host(dir.path, script, reporter, tree, scope, options.quiet === true, options.decodeMessage);
+    const active = new Host(dir.path, script, reporter, tree, scope, options.selectionOnly === true, options.decodeMessage);
     host = active;
     yield* Effect.addFinalizer(() => active.grace()).pipe(Effect.provideService(Scope.Scope, scope));
-    const ready = yield* attempt(() => host!.ready()).pipe(Effect.timeout(30_000),
-      Effect.mapError(error => new TestSpawnError({ command: ["vitest", "warm"], message: String(error) })));
+    const initialized = yield* attempt(() => host!.ready()).pipe(Effect.timeout(30_000),
+      Effect.mapError(error => error._tag === "TestSpawnError" ? error : new TestSpawnError({ command: ["vitest", "warm"], message: String(error) })), Effect.result);
+    if (initialized._tag === "Failure") return yield* abortHost(initialized.failure);
+    const ready = initialized.success;
     if (ready.type !== "ready") {
       if (!options.quiet) yield* (options.warn ?? Console.warn)(`Warning: warm Vitest unavailable; using cold mode: ${"message" in ready ? ready.message : ready.type}`);
-      yield* Effect.sync(onFallback);
+      yield* Effect.sync(() => onFallback("message" in ready ? ready.message : `Unexpected startup frame: ${ready.type}`));
       yield* send(actor, { type: "FALLBACK" });
       yield* close();
     }
@@ -210,6 +222,7 @@ export const openWarmRunner = Effect.fn("TestRunner.openWarm")(function* (dir: S
       return;
     }
     const result = yield* attempt(() => host!.request({ type: "invalidate", file })).pipe(Effect.timeout(1_000), Effect.result);
+    if (result._tag === "Failure" && result.failure._tag === "TestSpawnError" && result.failure.kind === "reporter") return yield* abortHost(result.failure);
     // A fresh host has no stale transforms. Never return a dirty graph to the pool.
     if (result._tag === "Failure") yield* restart;
   });
@@ -224,6 +237,7 @@ export const openWarmRunner = Effect.fn("TestRunner.openWarm")(function* (dir: S
   });
   const run = Effect.fn("Warm.run")(function* (file: string | undefined, timeoutMs?: number, testTimeout?: number, probe?: ProbeOptions): Effect.fn.Return<TestRun | undefined, TestSpawnError> {
     if (isCold()) return undefined;
+    if (options.selectionOnly) return yield* abortHost(new TestSpawnError({ command: ["vitest", "select"], kind: "reporter", message: "Selection-only host cannot execute tests" }));
     const command = ["vitest", ...(file ? ["related", file, "--run"] : ["run"]), "--reporter=default"];
     for (let crash = 0; crash < 2; crash++) {
       yield* send(actor, { type: "RUN" });
@@ -254,7 +268,7 @@ export const openWarmRunner = Effect.fn("TestRunner.openWarm")(function* (dir: S
         return { status: failedAtDeadline ? "failed" : "timedOut", command, output: active.output, durationMs: (yield* Clock.currentTimeMillis) - started,
           ...(active.child.pid === undefined ? {} : { hostPid: active.child.pid }), testsCollected: active.collected, testFiles: active.testFiles };
       }
-      if (result._tag === "Failure" && result.failure._tag === "TestSpawnError" && result.failure.kind === "reporter") return yield* result.failure;
+      if (result._tag === "Failure" && result.failure._tag === "TestSpawnError" && result.failure.kind === "reporter") return yield* abortHost(result.failure);
       yield* Effect.sync(() => options.onPoolReset?.());
       if (crash === 0) {
         yield* Console.warn(`Warning: Vitest pool crashed; restarting once: ${result._tag === "Failure" ? String(result.failure) : "message" in result.success ? result.success.message : result.success.type}`);
@@ -265,7 +279,7 @@ export const openWarmRunner = Effect.fn("TestRunner.openWarm")(function* (dir: S
         yield* send(actor, { type: "FAIL" });
         yield* close();
         yield* Console.warn("Warning: Vitest pool crashed twice for one mutant; using cold mode for the rest of this run");
-        yield* Effect.sync(onFallback);
+        yield* Effect.sync(() => onFallback("Vitest pool crashed twice for one mutant"));
         yield* send(actor, { type: "FALLBACK" });
       }
       if (isCold()) return undefined;
@@ -288,6 +302,7 @@ export const openWarmRunner = Effect.fn("TestRunner.openWarm")(function* (dir: S
     if (isCold()) return undefined;
     const result = yield* attempt(() => host!.request({ type: "select", file })).pipe(Effect.timeout(30_000), Effect.result);
     if (result._tag === "Success" && result.success.type === "selection") return result.success.files;
+    if (result._tag === "Failure" && result.failure._tag === "TestSpawnError" && result.failure.kind === "reporter") return yield* abortHost(result.failure);
     yield* restart;
     return undefined;
   });

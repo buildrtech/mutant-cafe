@@ -24,9 +24,12 @@ export const TestRunnerLive = Layer.effect(TestRunner, Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   let warmDisabled = false;
+  let modeReason: string | undefined;
   const sessions = new Map<string, Effect.Success<ReturnType<typeof openWarmRunner>>>();
   const auto = new Map<string, { readonly startupMs: number; readonly mutants: number }>();
   const primers = new Map<string, TestRun>();
+  const backstopTotals = new Map<string, number>();
+  const onBackstop = (dir: string) => (ms: number) => { backstopTotals.set(dir, (backstopTotals.get(dir) ?? 0) + ms); };
   const scopes = new Map<string, Scope.Scope>();
   const selectors = new Map<string, Effect.Success<ReturnType<typeof openWarmRunner>>>();
   let automaticMode: "pending" | "cold" | "warm" = "pending";
@@ -36,11 +39,13 @@ export const TestRunnerLive = Layer.effect(TestRunner, Effect.gen(function* () {
   const warn = (message: string) => Effect.suspend(() => { if (warned) return Effect.void; warned = true; return Console.warn(message); });
   const sessionOptions = { onRestart: () => { hostRestarts++; }, onPoolReset: () => { poolResets++; } };
   const execute = Effect.fn("TestRunner.execute")(function* (dir: ScratchDir, args: ReadonlyArray<string>, timeoutMs?: number, testTimeoutMs?: number, forceCold = false, probe?: ProbeOptions) {
+    const beforeBackstop = backstopTotals.get(dir.path) ?? 0;
+    const backstopMs = () => Math.max(0, (backstopTotals.get(dir.path) ?? 0) - beforeBackstop);
     const session = sessions.get(dir.path);
     if (session !== undefined && !warmDisabled && !auto.has(dir.path) && !forceCold) {
       if (timeoutMs === undefined) yield* Console.error(`Baseline command: vitest run --reporter=default (warm Node API, cwd: ${dir.path})`);
       const run = yield* session.run(args[0] === "related" ? args[1] : undefined, timeoutMs, testTimeoutMs ?? (timeoutMs === undefined ? undefined : Math.max(1, Math.floor(timeoutMs / 2))), probe);
-      if (run !== undefined) return { ...run, exitCode: run.status === "passed" || run.status === "untested" ? 0 : 1 };
+      if (run !== undefined) return { ...run, backstopMs: backstopMs(), exitCode: run.status === "passed" || run.status === "untested" ? 0 : 1 };
     }
     // Dependency directories are linked to the source checkout. Disable both
     // result and transform caches so Vitest cannot write through those links.
@@ -59,7 +64,7 @@ export const TestRunnerLive = Layer.effect(TestRunner, Effect.gen(function* () {
     // Keep diagnostics off stdout so GitHub output is a Markdown document.
     if (timeoutMs === undefined) yield* Console.error(`Baseline command: ${command.join(" ")} (cwd: ${dir.path})`);
     const started = yield* Clock.currentTimeMillis;
-    const owned = yield* acquireProcessTree(dir.path).pipe(Effect.provideService(FileSystem.FileSystem, fs),
+    const owned = yield* acquireProcessTree(dir.path, onBackstop(dir.path)).pipe(Effect.provideService(FileSystem.FileSystem, fs),
       Effect.mapError(error => new TestSpawnError({ command, message: String(error) })));
     const chunks: Array<string> = [];
     let exitCode = 1;
@@ -130,21 +135,23 @@ export const TestRunnerLive = Layer.effect(TestRunner, Effect.gen(function* () {
       testConcurrency: Math.max(0, ...output.split(marker + "concurrency:").slice(1).map(part => Number(part.split("\n")[0]))),
     };
     const cleaned = cleanTelemetry(run, "cold run");
-    return { ...cleaned.value, telemetryWarnings: [...telemetryWarnings, ...cleaned.warnings], exitCode };
+    return { ...cleaned.value, backstopMs: backstopMs(), telemetryWarnings: [...telemetryWarnings, ...cleaned.warnings], exitCode };
   }, Effect.scoped);
   return TestRunner.of({
     stats: Effect.sync(() => ({ hostRestarts, poolResets })),
     open: Effect.fn("TestRunner.open")(function* (dir: ScratchDir, cold: boolean, warm = false, mutants = 1) {
       scopes.set(dir.path, yield* Scope.Scope);
       yield* Effect.addFinalizer(() => Effect.sync(() => {
-        sessions.delete(dir.path); selectors.delete(dir.path); auto.delete(dir.path); primers.delete(dir.path); scopes.delete(dir.path);
-        if (scopes.size === 0) { warmDisabled = false; automaticMode = "pending"; hostRestarts = 0; poolResets = 0; warned = false; }
+        sessions.delete(dir.path); selectors.delete(dir.path); auto.delete(dir.path); primers.delete(dir.path); scopes.delete(dir.path); backstopTotals.delete(dir.path);
+        if (scopes.size === 0) { warmDisabled = false; automaticMode = "pending"; hostRestarts = 0; poolResets = 0; warned = false; modeReason = undefined; }
       }));
+      if (cold) modeReason = "Explicit --cold";
       if (cold || warmDisabled || (!warm && automaticMode === "cold")) return;
       const started = yield* Clock.currentTimeMillis;
-      const session = yield* openWarmRunner(dir, () => { warmDisabled = true; }, { ...sessionOptions, quiet: !warm, warn }).pipe(Effect.provideService(FileSystem.FileSystem, fs), Effect.mapError(error => new TestSpawnError({ command: ["vitest", "warm"], message: String(error) })));
+      const session = yield* openWarmRunner(dir, reason => { warmDisabled = true; modeReason = reason; }, { ...sessionOptions, quiet: !warm, warn, onBackstop: onBackstop(dir.path) }).pipe(Effect.provideService(FileSystem.FileSystem, fs), Effect.mapError(error => error._tag === "TestSpawnError" ? error : new TestSpawnError({ command: ["vitest", "warm"], message: String(error) })));
       sessions.set(dir.path, session);
       if (warmDisabled || (!warm && automaticMode === "cold")) { yield* session.disable; return; }
+      if (warm) modeReason = "Explicit --warm; supported configuration";
       if (!warm && automaticMode === "pending") auto.set(dir.path, { startupMs: (yield* Clock.currentTimeMillis) - started, mutants });
 
     }),
@@ -156,8 +163,8 @@ export const TestRunnerLive = Layer.effect(TestRunner, Effect.gen(function* () {
       if (!selector) {
         const scope = scopes.get(dir.path);
         if (!scope) return undefined;
-        selector = yield* openWarmRunner(dir, () => {}, { quiet: true }).pipe(Effect.provideService(FileSystem.FileSystem, fs),
-          Effect.provideService(Scope.Scope, scope), Effect.mapError(error => new TestSpawnError({ command: ["vitest", "select"], message: String(error) })));
+        selector = yield* openWarmRunner(dir, () => {}, { quiet: true, selectionOnly: true, onBackstop: onBackstop(dir.path) }).pipe(Effect.provideService(FileSystem.FileSystem, fs),
+          Effect.provideService(Scope.Scope, scope), Effect.mapError(error => error._tag === "TestSpawnError" ? error : new TestSpawnError({ command: ["vitest", "select"], message: String(error) })));
         selectors.set(dir.path, selector);
       }
       return yield* selector.select(file);
@@ -208,6 +215,7 @@ export const TestRunnerLive = Layer.effect(TestRunner, Effect.gen(function* () {
       return { durationMs: run.durationMs, testCommand: run.command, unreliable, hostPid: run.hostPid, telemetryWarnings: run.telemetryWarnings, testTimeoutDetails: run.testTimeoutDetails,
         testDurations: run.testDurations, testTimeouts: run.testTimeouts, testWorkers: run.testWorkers, testConcurrency: run.testConcurrency,
         testFileDurations: run.testFileDurations, startupMs: run.startupMs, probeSupported: run.probeSupported,
+        runnerModeReason: modeReason ?? (auto.has(dir.path) ? "Auto calibration pending" : "Cold execution; no warm session"),
         runnerMode: sessions.has(dir.path) && !warmDisabled && !auto.has(dir.path) ? "warm" as const : "cold" as const };
     }),
     calibrate: Effect.fn("TestRunner.calibrate")(function* (dir: ScratchDir, mutants: number, copies: number) {
@@ -218,9 +226,10 @@ export const TestRunnerLive = Layer.effect(TestRunner, Effect.gen(function* () {
         for (const session of sessions.values()) yield* session.disable;
       });
       if (mutants <= (primer.testFiles?.length ?? 0)) {
+        modeReason = `Auto: small selection (${mutants} testable mutants across ${primer.testFiles?.length ?? 0} files)`;
         yield* disable;
         yield* Console.warn(`Vitest auto mode: cold; small selection (${mutants} testable mutants across ${primer.testFiles?.length ?? 0} files), skipping paired calibration`);
-        return { runnerMode: "cold" as const, testableMutants: mutants };
+        return { runnerMode: "cold" as const, runnerModeReason: modeReason, testableMutants: mutants };
       }
       // A successful primer warmed the filesystem for BOTH measured runs.
       const startups = [...auto.values()].map(entry => entry.startupMs);
@@ -234,21 +243,22 @@ export const TestRunnerLive = Layer.effect(TestRunner, Effect.gen(function* () {
         warmStartupMs: startupCost(startups, copies),
         overheadMs: warm.durationMs + cold.durationMs, coldStartupMs: cold.startupMs ?? 0, warmRunStartupMs: warm.startupMs ?? 0, testFiles: cold.testFiles?.length ?? 0, mutants };
       const sameSelection = JSON.stringify([...(warm.testFiles ?? [])].sort()) === JSON.stringify([...(cold.testFiles ?? [])].sort());
-      const choice = warm.status === cold.status && sameSelection ? chooseMode(calibration) : "cold";
+      const choice = !warmDisabled && warm.status === cold.status && sameSelection ? chooseMode(calibration) : "cold";
+      modeReason = warmDisabled ? (modeReason ?? "Warm execution failed during calibration") : !sameSelection || warm.status !== cold.status ? "Auto: cold/warm selection or status mismatch" : `Auto: paired measurements favor ${choice}`;
       automaticMode = choice;
       auto.clear();
       yield* Console.warn(`Vitest auto mode: ${choice}; paired cold ${cold.durationMs} ms, warm ${warm.durationMs} ms; ${mutants} testable mutants, ${copies} copies, startup ${calibration.warmStartupMs} ms`);
       if (choice === "cold") yield* disable;
       else if (sessions.has(dir.path)) yield* sessions.get(dir.path)!.invalidate(warm.testFiles?.[0] ?? "package.json");
       const run = choice === "cold" ? cold : warm;
-      return { runnerMode: choice, calibration, testableMutants: mutants, hostPid: run.hostPid };
+      return { runnerMode: choice, runnerModeReason: modeReason, calibration, testableMutants: mutants, hostPid: run.hostPid };
     }),
     runRelated: Effect.fn("TestRunner.runRelated")(function* (dir: ScratchDir, file: string, timeoutMs: number, testTimeoutMs?: number) {
       const related = yield* execute(dir, ["related", file, "--run", "--passWithNoTests"], timeoutMs, testTimeoutMs);
       if (related.status !== "untested") return related;
       const remaining = Math.max(1, timeoutMs - related.durationMs);
       const full = yield* execute(dir, ["run", "--passWithNoTests"], remaining, testTimeoutMs);
-      return { ...full, status: full.status === "passed" ? "untested" as const : full.status, durationMs: related.durationMs + full.durationMs,
+      return { ...full, status: full.status === "passed" ? "untested" as const : full.status, durationMs: related.durationMs + full.durationMs, backstopMs: (related.backstopMs ?? 0) + (full.backstopMs ?? 0),
         output: related.output + "\nFull-suite fallback:\n" + full.output };
     })
   });

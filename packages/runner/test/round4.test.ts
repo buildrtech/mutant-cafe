@@ -1,5 +1,5 @@
 import { describe, expect, it } from "@effect/vitest";
-import { MutantSource, Reporter, Scratch, TestRunner, RunReport, type Mutant, type RunConfig } from "@mutant-cafe/core";
+import { MutantSource, Reporter, Scratch, TestRunner, TestSpawnError, RunReport, type Mutant, type RunConfig } from "@mutant-cafe/core";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Console from "effect/Console";
 import * as Deferred from "effect/Deferred";
@@ -51,10 +51,10 @@ describe("round four correctness gates", () => {
 
   it("recognizes nested worker-exit diagnostics but not an ordinary rejection", () => {
     const died = (error: unknown) => runInNewContext(workerDeathSource + "; workerDied(error)", { error });
-    expect(died({ message: "ordinary unhandled rejection" })).toBe(false);
+    for (const error of [{ message: "ordinary unhandled rejection" }, { message: "expected worker to have exited" }, { message: "Cloudflare worker aborted by signal" }, { name: "AssertionError", message: "expected Worker exited unexpectedly" }]) expect(died(error)).toBe(false);
     expect(died({ name: "worker exited test", result: { state: "passed" } })).toBe(false);
     expect(died({ tasks: [{ result: { errors: [{ message: "Worker exited unexpectedly with signal SIGKILL" }] } }] })).toBe(true);
-    for (const error of [{ message: "Worker exited unexpectedly with signal SIGKILL" }, { name: "WorkerExitError", message: "exit code 43" }, { cause: { message: "worker terminated with signal SIGTERM" } }, { errors: [{ code: "ERR_WORKER_OUT_OF_MEMORY" }] }]) expect(died(error)).toBe(true);
+    for (const error of [{ message: "Worker exited unexpectedly with signal SIGKILL" }, { name: "Error", message: "[vitest-pool]: Worker forks emitted error.", cause: { message: "Worker exited unexpectedly with signal SIGTERM" } }, { errors: [{ code: "ERR_WORKER_OUT_OF_MEMORY" }] }]) expect(died(error)).toBe(true);
   });
 
   it("does not charge already paid samples or opened-copy startup", () => {
@@ -81,16 +81,31 @@ describe("round four correctness gates", () => {
     expect(outcomes(cold)).toEqual([["control", "missed"], ["wrong", "caught"]]);
     expect(outcomes(forced)).toEqual(outcomes(cold)); expect(outcomes(auto)).toEqual(outcomes(cold));
     expect(forced.baseline.runnerMode).toBe("cold"); expect(auto.baseline.runnerMode).toBe("cold");
+    expect(forced.baseline.runnerModeReason).toContain("globalSetup"); expect(auto.baseline.runnerModeReason).toContain("globalSetup");
+    expect(auto.baseline.calibration).toBeUndefined();
+    expect(warnings.some(message => message.includes("unowned scratch-related"))).toBe(false);
   }).pipe(Effect.scoped, Effect.provide(live)), 45_000);
 
-  it.live("falls back for a real vmForks configuration", () => Effect.gen(function* () {
-    const root = yield* fixture(undefined, 'pool: "vmForks",');
+  for (const [options, reason] of [['pool: "vmForks",', "vmForks"], ['isolate: false,', "isolate: false"]] as const) for (const warm of [true, false]) it.live(`${warm ? "forced warm" : "auto"} refuses ${reason} before calibration`, () => Effect.gen(function* () {
+    const root = yield* fixture(undefined, options);
     const warnings: string[] = []; const original = yield* Console.Console;
-    const report = yield* run(settings(root), [mutant("wrong", 2)]).pipe(Effect.provideService(Console.Console, { ...original, warn: (...args: ReadonlyArray<unknown>) => { warnings.push(args.join(" ")); } }));
+    // Four mutants across one file would trigger paired calibration if allowed.
+    const report = yield* run({ ...settings(root), warm }, [2, 3, 4, 5].map(value => mutant(`wrong-${value}`, value))).pipe(Effect.provideService(Console.Console, { ...original, warn: (...args: ReadonlyArray<unknown>) => { warnings.push(args.join(" ")); } }));
     expect(report.baseline.runnerMode).toBe("cold"); expect(report.results[0]?.outcome).toBe("caught");
-    expect(warnings.filter(message => message.includes("warm Vitest unavailable"))).toHaveLength(1);
-    expect(warnings.some(message => message.includes("vmForks"))).toBe(true);
-  }).pipe(Effect.scoped, Effect.provide(live)), 20_000);
+    expect(warnings.filter(message => message.includes("warm Vitest unavailable"))).toHaveLength(warm ? 1 : 0);
+    expect(report.baseline.runnerModeReason).toContain(reason); expect(report.baseline.calibration).toBeUndefined();
+    expect(report.results.every(result => !result.output?.includes("mutant-warm:selected:"))).toBe(true);
+    expect(warnings.some(message => message.includes("unowned scratch-related"))).toBe(false);
+  }).pipe(Effect.scoped, Effect.provide(live)), 30_000);
+
+  it.live("keeps selection-only hosts read-only even when isolation is disabled", () => Effect.gen(function* () {
+    const root = yield* fixture(undefined, "isolate: false,"); const scratch = yield* Scratch; const dir = yield* scratch.acquire(root);
+    const selector = yield* openWarmRunner(dir, () => {}, { selectionOnly: true, quiet: true });
+    expect((yield* selector.select("src/value.ts"))?.length).toBe(1);
+    const result = yield* selector.run(undefined, 10_000).pipe(Effect.result);
+    expect(result._tag).toBe("Failure");
+    if (result._tag === "Failure") { expect(result.failure.kind).toBe("reporter"); expect(result.failure.message).toContain("Selection-only"); }
+  }).pipe(Effect.scoped, Effect.provide(live)), 15_000);
 
   it.live("overlaps forced-mode viability with running tests at jobs two", () => Effect.gen(function* () {
     const firstRun = yield* Deferred.make<void>(); const root = yield* fixture();
@@ -126,9 +141,12 @@ describe("round four correctness gates", () => {
       yield* fs.writeFileString(`${root}/vitest.config.ts`, `export default ${JSON.stringify({ test: { include: ["checks/*.mjs"], ...(workers === undefined ? {} : { maxWorkers: workers }) } })};`);
       const candidates = [mutant("wrong", 2)];
       const writer = yield* makeReporter({ root, outDir: "report", mutants: candidates });
-      yield* runMutants({ ...settings(root), cold, warm: !cold }, Stream.fromIterable(candidates)).pipe(Effect.provideService(MutantSource, source), Effect.provideService(Reporter, writer));
+      const warnings: string[] = []; const original = yield* Console.Console;
+      yield* runMutants({ ...settings(root), cold, warm: !cold }, Stream.fromIterable(candidates)).pipe(Effect.provideService(MutantSource, source), Effect.provideService(Reporter, writer), Effect.provideService(Console.Console, { ...original, warn: (...args: ReadonlyArray<unknown>) => { warnings.push(args.join(" ")); } }));
+      expect(warnings.some(message => message.includes("unowned scratch-related"))).toBe(false);
       const saved = yield* Schema.decodeEffect(Schema.fromJsonString(RunReport))(yield* fs.readFileString(`${root}/report/outcomes.json`));
       expect(saved.failure).toBeUndefined(); expect(saved.results[0]?.outcome).toBe("caught");
+      expect(saved.results[0]?.backstopMs).toBeGreaterThanOrEqual(0);
       expect(saved.baseline.testWorkers === undefined || Number.isSafeInteger(saved.baseline.testWorkers)).toBe(true);
       if (saved.baseline.testWorkers === undefined) expect(saved.baseline.telemetryWarnings?.some(message => message.includes("testWorkers"))).toBe(true);
       if (!cold) { expect(saved.baseline.runnerMode).toBe("warm"); expect(saved.hostRestarts).toBe(0); }
@@ -136,14 +154,21 @@ describe("round four correctness gates", () => {
   }
 
   it.live("surfaces our invalid protocol without pool retry or cold fallback", () => Effect.gen(function* () {
-    const root = yield* fixture(); const scratch = yield* Scratch; const dir = yield* scratch.acquire(root);
+    const root = yield* fixture(); const fs = yield* FileSystem.FileSystem;
+    yield* fs.writeFileString(`${root}/vitest.config.ts`, `import fs from "node:fs"; export default { plugins: [{ name: "host-proof", configResolved() { fs.writeFileSync("host.pid", String(process.pid)); } }], test: { maxWorkers: 2, include: ["checks/*.mjs"] } };`);
+    const scratch = yield* Scratch; const dir = yield* scratch.acquire(root);
     let fallback = false; const warnings: string[] = [];
     const session = yield* openWarmRunner(dir, () => { fallback = true; }, { warn: message => Effect.sync(() => { warnings.push(message); }), decodeMessage: value => decodeWarmMessage(typeof value === "object" && value !== null && Reflect.get(value, "type") === "result" ? { ...value, status: "our-bad-status" } : value) });
+    const pid = Number(yield* fs.readFileString(`${dir.path}/host.pid`));
+    expect(Number.isSafeInteger(pid) && pid > 0).toBe(true);
     const original = yield* Console.Console;
     const result = yield* session.run(undefined, 10_000).pipe(Effect.provideService(Console.Console, { ...original, warn: (...args: ReadonlyArray<unknown>) => { warnings.push(args.join(" ")); } }), Effect.result);
     expect(result._tag).toBe("Failure");
     if (result._tag === "Failure") { expect(result.failure.kind).toBe("reporter"); expect(result.failure.message).toContain("our-bad-status"); }
     expect(fallback).toBe(false); expect(warnings.some(message => message.includes("crashed"))).toBe(false);
+    const state = yield* Effect.try({ try: () => process.kill(pid, 0), catch: error => new TestSpawnError({ command: ["host-pid-proof"], message: typeof error === "object" && error !== null && Reflect.get(error, "code") === "ESRCH" ? "gone" : "Cannot inspect host PID" }) }).pipe(Effect.result);
+    expect(state._tag).toBe("Failure"); // before the surrounding test scope finalizes
+    if (state._tag === "Failure") expect(state.failure.message).toBe("gone");
   }).pipe(Effect.scoped, Effect.provide(live)), 20_000);
 
   it("keeps a valid verdict when worker telemetry is fractional or a percentage", () => {
@@ -158,10 +183,13 @@ describe("round four correctness gates", () => {
     const fs = yield* FileSystem.FileSystem; const root = yield* fixture();
     // Controlled latency exercises the decision, not a performance claim.
     yield* fs.writeFileString(`${root}/vitest.config.ts`, 'if (!process.argv[1]?.endsWith("host.mjs")) await new Promise(resolve => setTimeout(resolve, 800)); export default { test: { maxWorkers: 2, include: ["checks/*.mjs"] } };');
-    const report = yield* run({ ...settings(root), warm: false }, [2, 3, 4, 5].map(number => mutant(`wrong-${number}`, number)));
+    const warnings: string[] = []; const original = yield* Console.Console;
+    const report = yield* run({ ...settings(root), warm: false }, [2, 3, 4, 5].map(number => mutant(`wrong-${number}`, number))).pipe(Effect.provideService(Console.Console, { ...original, warn: (...args: ReadonlyArray<unknown>) => { warnings.push(args.join(" ")); } }));
+    expect(warnings.some(message => message.includes("unowned scratch-related"))).toBe(false);
     expect(report.baseline.runnerMode).toBe("warm"); expect(report.baseline.calibration).toBeDefined();
     expect(chooseMode(report.baseline.calibration!)).toBe("warm"); expect(report.baseline.calibration!.warmStartupMs).toBe(0);
     expect(report.results.every(result => result.outcome === "caught" && result.output?.includes("mutant-warm:selected:"))).toBe(true);
     expect(report.poolResets).toBe(0);
+    expect(report.results.every(result => result.backstopMs !== undefined && result.backstopMs >= 0)).toBe(true);
   }).pipe(Effect.scoped, Effect.provide(live)), 30_000);
 });
