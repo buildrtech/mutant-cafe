@@ -8,9 +8,12 @@ import type { MutableFunction, Value } from "./TypeOracle.ts";
 export function* generateFunction(fn: MutableFunction): Generator<Mutant> {
   const api = fn.api;
   const candidate = (genre: Genre, expression: string, value: Value = { text: "", synthetic: false }, description = expression): Mutant => {
+    // A return annotation on the inner function preserves the public inferred
+    // contract, even when this replacement only produces never or Option<never>.
+    const pinned = `((): ${fn.returnType} => (${expression}))()`;
     const text = fn.block
-      ? `{ return ${fn.generator ? "yield* " : ""}${expression}; }`
-      : `(${expression})`;
+      ? `{ return ${fn.generator ? "yield* " : ""}${pinned}; }`
+      : `(${pinned})`;
     return makeMutant(fn, genre, text, value.synthetic, description);
   };
   const shape = fn.shape;
@@ -18,12 +21,14 @@ export function* generateFunction(fn: MutableFunction): Generator<Mutant> {
     case "Effect": {
       const succeed = api("Effect", "succeed");
       if (succeed) {
-        for (const value of shape.values) yield candidate("EffectSucceed", `${succeed}(${value.text})`, value);
+        for (const value of shape.values) {
+          if (!fn.equivalentValues.includes(value.text)) yield candidate("EffectSucceed", `${succeed}(${value.text})`, value);
+        }
       }
       const fail = api("Effect", "fail");
       const catchTag = api("Effect", "catchTag");
       for (const error of shape.errors) {
-        if (fail) yield candidate("EffectFail", `${fail}(${error.text})`, error);
+        if (fail) yield candidate("EffectFail", `${fail}(${error.text})`, error, `${fail}(${error.text}) [${error.synthetic ? "synthetic tag cast" : "constructed error"}]`);
         const value = shape.values[0];
         const die = api("Effect", "die");
         const recovery = value && succeed ? `${succeed}(${value.text})`
@@ -34,7 +39,7 @@ export function* generateFunction(fn: MutableFunction): Generator<Mutant> {
           const original = fn.generator
             ? gen && `((): ${fn.returnType} => ${gen}(function* () ${fn.original}))()`
             : fn.block ? `((): ${fn.returnType} => ${fn.original})()` : `((): ${fn.returnType} => (${fn.original}))()`;
-          if (original) yield candidate("SwallowTag", `${original}.pipe(${catchTag}(${JSON.stringify(error.tag)}, () => ${recovery}))`, value, `body.pipe(${catchTag}(${JSON.stringify(error.tag)}, () => ${recovery}))`);
+          if (original) yield candidate(value ? "SwallowTag" : "TagToDefect", `${original}.pipe(${catchTag}(${JSON.stringify(error.tag)}, () => ${recovery}))`, value, value ? `body.pipe(${catchTag}(${JSON.stringify(error.tag)}, () => ${recovery}))` : `turn ${error.tag} into a defect`);
         }
       }
       const die = api("Effect", "die");
@@ -60,10 +65,12 @@ export function* generateFunction(fn: MutableFunction): Generator<Mutant> {
       break;
     }
     case "Layer": {
-      const layer = api("Layer", "effect");
+      const layer = api("Layer", "effectContext");
       const fail = api("Effect", "fail");
       if (layer && fail && shape.service) {
-        for (const error of shape.errors) yield candidate("LayerFail", `${layer}(${shape.service}, ${fail}(${error.text}))`, error);
+        // Layer output is contravariant. Let the pinned return type infer the
+        // complete output context, not just the first service found in the body.
+        for (const error of shape.errors) yield candidate("LayerFail", `${layer}(${fail}(${error.text}))`, error);
       }
       break;
     }
@@ -84,7 +91,7 @@ function makeMutant(fn: MutableFunction, genre: Genre, text: string, synthetic: 
   const replacement = { startOffset: fn.startOffset, endOffset: fn.endOffset, text };
   const id = createHash("sha256").update(JSON.stringify([fn.file, fn.span, genre, text])).digest("hex").slice(0, 24);
   return {
-    id, file: fn.file, functionName: fn.name, returnType: fn.returnType, genre,
+    id, file: fn.file, functionName: fn.name, returnType: fn.returnType, displayReturnType: fn.displayReturnType, genre,
     description: `replace ${fn.name} -> ${fn.returnType} with ${description}`,
     span: fn.span, replacement, synthetic,
   };

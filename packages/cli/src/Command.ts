@@ -51,7 +51,7 @@ export const makeCommand = (options: {
   const config = yield* Schema.decodeEffect(RunConfig)({
     root,
     tsconfig: input.tsconfig,
-    include: input.include.length > 0 ? input.include : fileConfig.include ?? ["**/*.ts", "**/*.tsx"],
+    include: input.include.length > 0 ? input.include : fileConfig.include ?? ["**/*.{ts,tsx}"],
     exclude: input.exclude.length > 0 ? input.exclude : fileConfig.exclude ?? [],
     functionFilter: fileConfig.functionFilter ?? [],
     ...(inDiff === undefined ? {} : { inDiff }),
@@ -66,10 +66,20 @@ export const makeCommand = (options: {
     return yield* new UsageError({ message: "Jobs and timeout values must be positive" });
   }
   const source = yield* MutantSource;
-  const generated = yield* Stream.runCollect(source.generate(config));
+  const generated = yield* Stream.runCollect(source.generate(config)).pipe(
+    Effect.mapError((error) => error.reason === "selection"
+      ? new UsageError({ message: error.diagnostics.join("\n") }) : error)
+  );
   const mutants = inDiff === undefined ? generated : yield* selectInDiff({ root, diffPath: inDiff, mutants: generated });
   if (input.list) {
     for (const mutant of mutants) yield* Console.log(mutantLine(mutant, config.root, path));
+    const counts = new Map<string, number>();
+    for (const mutant of mutants) {
+      const file = path.relative(root, path.resolve(root, mutant.file));
+      counts.set(file, (counts.get(file) ?? 0) + 1);
+    }
+    for (const [file, count] of [...counts].sort(([a], [b]) => a.localeCompare(b))) yield* Console.log(`${file}: ${count} mutants`);
+    yield* Console.log(`${mutants.length} mutants total`);
     if (options.onExit !== undefined) yield* options.onExit(0);
     return;
   }
@@ -88,7 +98,7 @@ export const runCli = Effect.fn("runCli")(function*(options: {
 }) {
   const code = yield* Ref.make(0);
   const command = makeCommand({ ...options, onExit: (value) => Ref.set(code, value) });
-  yield* Command.runWith(command, { version: "0.1.1" })(options.args).pipe(
+  yield* Command.runWith(command, { version: "0.1.2" })(options.args).pipe(
     Effect.catch((error) => Effect.gen(function*() {
       yield* Console.error(String(error));
       yield* Ref.set(code, errorExitCode(error));

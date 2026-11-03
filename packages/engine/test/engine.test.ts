@@ -37,6 +37,14 @@ function loadMutation<A = AccountModule>(mutant: Mutant) {
       Effect.promise(() => mkdtemp(resolve(root, "packages/engine/test/runtime-"))),
       (directory) => Effect.promise(() => rm(directory, { recursive: true, force: true })),
     );
+    // Multi-module fixtures retain sibling imports in the runtime copy.
+    for (const statement of ts.createSourceFile(mutant.file, original, ts.ScriptTarget.Latest, true).statements) {
+      if (ts.isImportDeclaration(statement) && ts.isStringLiteral(statement.moduleSpecifier) && statement.moduleSpecifier.text.startsWith("./")) {
+        const sibling = statement.moduleSpecifier.text;
+        const content = yield* Effect.promise(() => readFile(resolve(dirname(mutant.file), sibling), "utf8"));
+        yield* Effect.promise(() => writeFile(resolve(directory, sibling), content));
+      }
+    }
     const file = resolve(directory, "account.mjs");
     yield* Effect.promise(() => writeFile(file, ts.transpileModule(text, {
       compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2023 },
@@ -47,6 +55,61 @@ function loadMutation<A = AccountModule>(mutant: Mutant) {
 }
 
 describe("checker-directed mutation", () => {
+  for (const name of ["twice", "find"]) {
+    it.effect(`preserves scoped return types and callers for ${name} (B1/B2)`, () => Effect.gen(function* () {
+      const source = makeSource();
+      const mutants = yield* collect(source, config("packages/engine/test/fixtures/viability/tsconfig.json", { functionFilter: [name] }));
+      expect(mutants.length).toBeGreaterThan(3);
+      for (const mutant of mutants) {
+        expect((yield* source.checkViable(mutant)).diagnostics, mutant.description).toEqual([]);
+      }
+    }), 30_000);
+  }
+
+  it.effect("keeps literal recovery, visible constructors, transitive brands, union errors and exported names viable (B10–B17)", () => Effect.gen(function* () {
+    const source = makeSource();
+    const input = config("packages/engine/test/fixtures/viability/tsconfig.json");
+    const mutants = yield* collect(source, input);
+    for (const name of ["read", "imported", "digest", "checkAll", "branded", "reported", "callback"]) {
+      const items = mutants.filter(m => m.functionName === name);
+      expect(items.length, name).toBeGreaterThan(0);
+      for (const mutant of items) expect((yield* source.checkViable(mutant)).diagnostics, mutant.description).toEqual([]);
+    }
+    const digest = mutants.filter(m => m.functionName === "digest");
+    for (const genre of ["EffectFail", "SwallowTag", "EffectDie", "EffectNever"]) expect(digest.some(m => m.genre === genre), genre).toBe(true);
+    expect(mutants.some(m => m.functionName === "inner")).toBe(false);
+    const read = mutants.filter(m => m.functionName === "read");
+    expect(read.some(m => m.genre === "EffectSucceed" && m.replacement.text.includes('"on"'))).toBe(false);
+    expect(read.some(m => m.genre === "SwallowTag")).toBe(true);
+    for (const name of ["read", "imported"]) {
+      const fail = mutants.find(m => m.functionName === name && m.genre === "EffectFail");
+      expect(fail?.synthetic, name).toBe(false);
+      expect(fail?.description).toContain("constructed error");
+    }
+    for (const name of ["read", "imported"]) {
+      const mutant = mutants.find(m => m.functionName === name && m.genre === "EffectFail")!;
+      const module = yield* loadMutation<{ readonly read: (ok: boolean) => Effect.Effect<unknown, Error>; readonly imported: () => Effect.Effect<unknown, Error> }>(mutant);
+      const exit = yield* Effect.exit(name === "read" ? module.read(true) : module.imported());
+      expect(Exit.hasFails(exit)).toBe(true);
+      if (Exit.isFailure(exit)) {
+        const failure = exit.cause.reasons.find(reason => reason._tag === "Fail");
+        expect(failure && "error" in failure && failure.error instanceof Error).toBe(true);
+      }
+    }
+    expect(mutants.some(m => m.functionName === "same" && m.genre === "EffectSucceed")).toBe(false);
+    const selected = yield* collect(makeSource(), { ...input, include: ["**/advanced.ts"] });
+    expect(selected.map(m => [m.id, m.replacement])).toEqual(mutants.filter(m => m.file.endsWith("/advanced.ts")).map(m => [m.id, m.replacement]));
+  }), 30_000);
+
+  it.effect("keeps a failing multi-service layer viable", () => Effect.gen(function* () {
+    const source = makeSource();
+    const mutants = yield* collect(source, config("packages/engine/test/fixtures/viability/tsconfig.json", { functionFilter: ["services"] }));
+    expect(mutants).toHaveLength(1);
+    const mutant = mutants[0]!;
+    expect(mutant.genre).toBe("LayerFail");
+    expect((yield* source.checkViable(mutant)).diagnostics).toEqual([]);
+  }));
+
   it.effect("gives every generated mutant a distinct description within its function", () => Effect.gen(function* () {
     const source = makeSource();
     for (const input of [fixture, extra]) {
@@ -113,10 +176,10 @@ describe("checker-directed mutation", () => {
     for (const mutant of mutants) expect((yield* source.checkViable(mutant)).diagnostics, mutant.description).toEqual([]);
   }), 30_000);
 
-  it.effect("uses a defect to swallow an error when no success value exists", () => Effect.gen(function* () {
+  it.effect("labels conversion to a defect honestly when no success value exists", () => Effect.gen(function* () {
     const source = makeSource();
     const mutants = yield* collect(source, extra);
-    const swallow = mutants.find((m) => m.functionName === "program" && m.genre === "SwallowTag");
+    const swallow = mutants.find((m) => m.functionName === "program" && m.genre === "TagToDefect");
     expect(swallow).toBeDefined();
     if (!swallow) return;
     expect(swallow.synthetic).toBe(false);

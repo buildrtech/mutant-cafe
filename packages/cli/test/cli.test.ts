@@ -11,9 +11,10 @@ import * as ChildProcess from "effect/process/ChildProcess";
 import { expect } from "vitest";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 import { runCli, type Run } from "../src/Command.ts";
-import { makeReporter } from "../src/Reporter.ts";
+import { makeReporter, mutantLine } from "../src/Reporter.ts";
 import { reportExitCode } from "../src/ExitCode.ts";
 import { selectInDiff } from "../src/Diff.ts";
+import { unifiedDiff } from "../src/UnifiedDiff.ts";
 
 const mutant = (options: { file?: string; line?: number; id?: string } = {}): Mutant => ({
   id: options.id ?? "withdraw-missed", file: options.file ?? "account.ts", functionName: "withdraw", returnType: "boolean",
@@ -73,6 +74,27 @@ it.live("the real CLI reports three distinct missed mutants with root-relative c
   expect(report.results.every((result) => path.isAbsolute(result.mutant.file))).toBe(true);
 }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)), 60_000);
 
+it.live("the real CLI catches a viable multi-service layer failure", () => Effect.gen(function* () {
+  const fs = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const root = path.resolve(import.meta.dirname, "../../engine/test/fixtures/viability");
+  const output = yield* fs.makeTempDirectoryScoped({ prefix: "multi-layer-e2e-" });
+  const handle = yield* ChildProcess.make(process.execPath, [
+    path.resolve(import.meta.dirname, "../src/bin.ts"), "--file", "src/layers.ts", "--output", path.join(output, "report"),
+  ], { cwd: root });
+  const [logs, code] = yield* Effect.all([
+    Stream.mkString(Stream.decodeText(handle.all)), handle.exitCode,
+  ], { concurrency: "unbounded" });
+  expect(Number(code), logs).toBe(0);
+  const report = yield* Schema.decodeEffect(Schema.fromJsonString(RunReport))(
+    yield* fs.readFileString(path.join(output, "report/outcomes.json")),
+  );
+  expect(report.results).toHaveLength(1);
+  expect(report.results[0]?.mutant.genre).toBe("LayerFail");
+  expect(report.results[0]?.outcome, logs).toBe("caught");
+  expect(report.results[0]?.diagnostics).toEqual([]);
+}).pipe(Effect.scoped, Effect.provide(NodeServices.layer)), 30_000);
+
 it.effect("writes missed output, returns CI failure, and rotates the previous run", () => Effect.gen(function*() {
   const fs = yield* FileSystem.FileSystem;
   const root = yield* project;
@@ -131,6 +153,68 @@ it.effect("a real git diff of the fixture selects only mutants in the edited fun
   yield* fs.writeFileString(`${root}/account.ts`, fixture);
   expect(yield* invoke(root, ["--list", "--in-diff", "edit.diff"], [inside, outside])).toBe(5);
 }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)));
+
+it.effect("resolves toplevel and --relative patches from a nested package (B6)", () => Effect.gen(function* () {
+  const fs = yield* FileSystem.FileSystem;
+  const root = yield* fs.makeTempDirectoryScoped({ prefix: "nested-diff-" });
+  const nested = `${root}/packages/a`;
+  yield* fs.makeDirectory(nested, { recursive: true });
+  const run = (args: ReadonlyArray<string>) => Effect.gen(function* () {
+    const handle = yield* ChildProcess.make("git", args, { cwd: nested });
+    const output = yield* Stream.mkString(Stream.decodeText(handle.stdout));
+    expect(Number(yield* handle.exitCode)).toBe(0);
+    return output;
+  });
+  yield* fs.writeFileString(`${nested}/account.ts`, "export const f = () => true;\n");
+  yield* run(["init", "--quiet", root]);
+  yield* run(["add", "account.ts"]);
+  yield* fs.writeFileString(`${root}/account.ts`, "export const unrelated = 1;\n");
+  yield* fs.writeFileString(`${nested}/account.ts`, "export const f = () => false;\n");
+  for (const args of [["diff"], ["diff", "--relative"]]) {
+    yield* fs.writeFileString(`${nested}/edit.diff`, yield* run(args));
+    expect((yield* selectInDiff({ root: nested, diffPath: "edit.diff", mutants: [mutant()] })).map(m => m.id)).toEqual(["withdraw-missed"]);
+  }
+}).pipe(Effect.scoped, Effect.provide(NodeServices.layer)));
+
+it.effect("bounds displayed types, preserves full JSON, and links every line to an id (B4)", () => Effect.gen(function* () {
+  const fs = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const root = yield* project;
+  const returnType = `{ ${"readonly field: number; ".repeat(100)} }`;
+  const item = { ...mutant(), returnType, description: `replace withdraw -> ${returnType} with false` };
+  const line = mutantLine(item, root, path);
+  expect(line.length).toBeLessThan(180);
+  expect(line).toContain("…");
+  expect(line).toContain(item.id);
+  expect(mutantLine({ ...item, displayReturnType: "RecordAlias" }, root, path)).toContain("-> RecordAlias with");
+  const reporter = yield* makeReporter({ root, outDir: "mutants.out", mutants: [item] });
+  yield* reporter.write(report(root, [item]));
+  const output = yield* Schema.decodeEffect(Schema.fromJsonString(RunReport))(yield* fs.readFileString(`${root}/mutants.out/outcomes.json`));
+  expect(output.results[0]?.mutant.returnType).toBe(returnType);
+  const untested = { ...report(root, [item]), results: report(root, [item]).results.map(r => ({ ...r, outcome: "untested" as const })) };
+  expect(reportExitCode(untested)).toBe(2);
+  yield* reporter.write(untested);
+  expect(yield* fs.readFileString(`${root}/mutants.out/untested.txt`)).toContain(item.id);
+  const mixed = { ...untested, results: [...untested.results, { ...untested.results[0]!, outcome: "timeout" as const }] };
+  expect(reportExitCode(mixed)).toBe(2);
+}).pipe(Effect.scoped, Effect.provide(NodeServices.layer)));
+
+it.live("the real CLI rejects each unmatched --file and an outside path (B13)", () => Effect.gen(function* () {
+  const path = yield* Path.Path;
+  const root = path.resolve(import.meta.dirname, "../../../fixtures/tagged-errors");
+  const listed = yield* ChildProcess.make(process.execPath, [path.resolve(import.meta.dirname, "../src/bin.ts"), "--list"], { cwd: root });
+  const listing = yield* Stream.mkString(Stream.decodeText(listed.stdout));
+  expect(Number(yield* listed.exitCode)).toBe(0);
+  expect(listing).toContain("9 mutants total");
+  expect(listing).toContain("src/account.ts: 9 mutants");
+  for (const args of [["--list", "--file", "src/nope.ts", "--file", "src/also-nope.ts"], ["--file", "../elsewhere.ts"]]) {
+    const handle = yield* ChildProcess.make(process.execPath, [path.resolve(import.meta.dirname, "../src/bin.ts"), ...args], { cwd: root });
+    const [output, code] = yield* Effect.all([Stream.mkString(Stream.decodeText(handle.all)), handle.exitCode], { concurrency: "unbounded" });
+    expect(Number(code), output).toBe(1);
+    for (let i = 0; i < args.length; i++) if (args[i] === "--file") expect(output).toContain(args[i + 1]);
+    if (args.includes("../elsewhere.ts")) expect(output).toContain("outside the package root");
+  }
+}).pipe(Effect.scoped, Effect.provide(NodeServices.layer)), 20_000);
 
 it.effect("malformed diffs exit 6 without running tests or creating reports", () => Effect.gen(function*() {
   const fs = yield* FileSystem.FileSystem;
@@ -192,6 +276,47 @@ it.effect("does not erase unrelated files at an output or backup path", () => Ef
   yield* fs.writeFileString(`${root}/mutants.out/keep.txt`, "user work");
   expect(yield* invoke(root, [], [])).toBe(70);
   expect(yield* fs.readFileString(`${root}/mutants.out/keep.txt`)).toBe("user work");
+}).pipe(Effect.scoped, Effect.provide(NodeServices.layer)));
+
+it.effect("emits a context-sized applicable patch with relative paths for an absolute mutant (B7)", () => Effect.gen(function* () {
+  const fs = yield* FileSystem.FileSystem;
+  const root = yield* project;
+  const original = Array.from({ length: 60 }, (_, i) => `export const value${i} = ${i};`).join("\n") + "\n";
+  yield* fs.writeFileString(`${root}/account.ts`, original);
+  const startOffset = original.indexOf("= 30;") + 2;
+  const item = { ...mutant({ file: `${root}/account.ts` }), replacement: { startOffset, endOffset: startOffset + 2, text: "999" } };
+  yield* makeReporter({ root, outDir: "mutants.out", mutants: [item] });
+  const patch = yield* fs.readFileString(`${root}/mutants.out/diff/${item.id}.diff`);
+  expect(patch.split("\n").length).toBeLessThan(15);
+  expect(patch).not.toContain(root);
+  const handle = yield* ChildProcess.make("git", ["apply", `mutants.out/diff/${item.id}.diff`], { cwd: root });
+  expect(Number(yield* handle.exitCode)).toBe(0);
+  expect(yield* fs.readFileString(`${root}/account.ts`)).toBe(original.replace("= 30;", "= 999;"));
+  yield* fs.writeFileString(`${root}/account.ts`, original);
+  const wrapped = { ...item, id: "wrapped", replacement: { startOffset: 0, endOffset: original.length, text: "// before\n" + original + "// after\n" } };
+  yield* makeReporter({ root, outDir: "wrapped.out", mutants: [wrapped] });
+  const wrapperPatch = yield* fs.readFileString(`${root}/wrapped.out/diff/wrapped.diff`);
+  expect(wrapperPatch.match(/^@@ /gm)).toHaveLength(2);
+  expect(wrapperPatch.split("\n").length).toBeLessThan(15);
+  const apply = yield* ChildProcess.make("git", ["apply", "wrapped.out/diff/wrapped.diff"], { cwd: root });
+  expect(Number(yield* apply.exitCode)).toBe(0);
+  expect(yield* fs.readFileString(`${root}/account.ts`)).toBe(wrapped.replacement.text);
+}).pipe(Effect.scoped, Effect.provide(NodeServices.layer)));
+
+it.effect("context patches preserve insertions, deletions, repeated lines and newline changes", () => Effect.gen(function* () {
+  const fs = yield* FileSystem.FileSystem;
+  const root = yield* project;
+  const versions = ["", "a\n", "a", "a\nb\na\n", "b\na\nb\n", "\n", "a\nb\nc", "a\nx\nb\ny\nc\n"];
+  for (const original of versions) for (const modified of versions) {
+    const patch = unifiedDiff(original, modified, "account.ts");
+    if (original === modified) { expect(patch).toBe(""); continue; }
+    yield* fs.writeFileString(`${root}/account.ts`, original);
+    yield* fs.writeFileString(`${root}/case.diff`, patch);
+    const handle = yield* ChildProcess.make("git", ["apply", "case.diff"], { cwd: root });
+    const [errors, code] = yield* Effect.all([Stream.mkString(Stream.decodeText(handle.stderr)), handle.exitCode], { concurrency: "unbounded" });
+    expect(Number(code), errors + patch).toBe(0);
+    expect(yield* fs.readFileString(`${root}/account.ts`)).toBe(modified);
+  }
 }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)));
 
 it.effect("generated mutant patches apply cleanly to the original, including missing final newlines", () => Effect.gen(function*() {

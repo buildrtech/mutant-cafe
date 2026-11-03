@@ -39,13 +39,14 @@ export class Scratch extends Context.Service<
   }
 >()("mutant.cafe/Scratch") {}
 
-export type TestStatus = "passed" | "failed" | "timedOut";
+export type TestStatus = "passed" | "failed" | "timedOut" | "untested";
 
 export interface TestRun {
   readonly status: TestStatus;
   readonly durationMs: number;
   readonly command: ReadonlyArray<string>;
   readonly output: string;
+  readonly testsCollected?: boolean;
 }
 
 export class TestRunner extends Context.Service<
