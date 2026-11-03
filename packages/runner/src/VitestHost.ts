@@ -6,7 +6,7 @@ export const reporterSource = (marker: string, probe?: ProbeOptions) => `
 import { relative } from "node:path";
 export default class {
   files = []; collected = false; failed = false; durations = {}; timeouts = {}; workers = 0; concurrency = 0; fileDurations = {}; firstTestStart = 0; verdict = null;
-  constructor(token = ${JSON.stringify(probe?.token ?? null)}, setupFile = ${JSON.stringify(probe?.setupFile ?? null)}) { this.token = token; this.setupFile = setupFile; this.loaded = false; this.originals = []; }
+  constructor(token = ${JSON.stringify(probe?.token ?? null)}, setupFile = ${JSON.stringify(probe?.setupFile ?? null)}) { this.token = token; this.setupFile = setupFile; this.loaded = false; this.originals = []; this.caseFailure = false; this.timedOut = false; this.cleanupRequired = false; }
   onInit(ctx) {
     if (!this.setupFile) return;
     for (const config of new Set(ctx.projects.map(project => project.config))) {
@@ -41,8 +41,10 @@ export default class {
     console.log(${JSON.stringify(marker + "concurrency:")} + this.concurrency);
   }
   onTestCaseResult(test) {
-    const state = test.result().state;
-    if (state === "failed") { this.failed = true; process.send?.({ type: "failed" }); console.log(${JSON.stringify(marker + "failed")}); }
+    const result = test.result();
+    const state = result.state;
+    if (result.errors?.some(error => /^(?:Test|Hook) timed out in \\d+ms\\b/.test(error.message ?? ""))) this.timedOut = true;
+    if (state === "failed") { this.caseFailure = true; this.failed = true; process.send?.({ type: "failed" }); console.log(${JSON.stringify(marker + "failed")}); }
     if (state === "passed") {
       const start = test.diagnostic()?.startTime ?? 0;
       if (start > 0) this.firstTestStart = this.firstTestStart ? Math.min(this.firstTestStart, start) : start;
@@ -54,6 +56,11 @@ export default class {
   }
   onTestRunEnd(modules, errors = [], state) {
     this.verdict = state ?? null;
+    const timeouts = [...errors, ...modules.flatMap(module => module.errors?.() ?? [])];
+    this.timedOut ||= timeouts.some(error => /^(?:Test|Hook) timed out in \\d+ms\\b/.test(error.message ?? ""));
+    // Vitest supplies no timeout error code. Reporter error messages select
+    // cleanup only; the official run verdict still owns classification.
+    this.cleanupRequired = this.timedOut || (state != null && state !== "passed" && !this.caseFailure);
     // Vitest's official run verdict also covers cancelled or pending modules.
     // Parallel bail can omit case-result hooks and module-end results.
     if ((state != null && state !== "passed") || errors.length) { this.failed = true; process.send?.({ type: "failed" }); console.log(${JSON.stringify(marker + "failed")}); }
@@ -140,7 +147,7 @@ process.on("message", async request => {
     // parallel bail, child failures can exist while the module stays pending.
     const failed = reporter.failed || result.unhandledErrors.length > 0;
     process.send({ type: "result", status: failed ? "failed" : empty ? "untested" : "passed",
-      testFiles: reporter.files, testsCollected: reporter.collected, testDurations: reporter.durations, testTimeouts: reporter.timeouts, testWorkers: reporter.workers, testConcurrency: reporter.concurrency, testFileDurations: reporter.fileDurations, firstTestStart: reporter.firstTestStart, probeSupported: reporter.probeSupported, probeLoaded: reporter.loaded,
+      testFiles: reporter.files, testsCollected: reporter.collected, testDurations: reporter.durations, testTimeouts: reporter.timeouts, testWorkers: reporter.workers, testConcurrency: reporter.concurrency, testFileDurations: reporter.fileDurations, firstTestStart: reporter.firstTestStart, probeSupported: reporter.probeSupported, probeLoaded: reporter.loaded, cleanupRequired: reporter.cleanupRequired,
       crashed: result.unhandledErrors.length > 0 });
     process.exitCode = 0;
   } catch (error) { reporter?.restore(); process.send({ type: "crash", message: String(error) }); }

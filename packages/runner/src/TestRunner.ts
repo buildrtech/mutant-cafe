@@ -12,6 +12,7 @@ import * as ChildProcess from "effect/process/ChildProcess";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 import { openWarmRunner } from "./WarmRunner.ts";
 import { reporterSource, type ProbeOptions } from "./VitestHost.ts";
+import { acquireProcessTree } from "./ProcessTree.ts";
 import { chooseMode, type Calibration } from "./Mode.ts";
 
 export const TestRunnerLive = Layer.effect(TestRunner, Effect.gen(function* () {
@@ -45,27 +46,33 @@ export const TestRunnerLive = Layer.effect(TestRunner, Effect.gen(function* () {
     // Keep diagnostics off stdout so GitHub output is a Markdown document.
     if (timeoutMs === undefined) yield* Console.error(`Baseline command: ${command.join(" ")} (cwd: ${dir.path})`);
     const started = yield* Clock.currentTimeMillis;
+    const owned = yield* acquireProcessTree().pipe(Effect.provideService(FileSystem.FileSystem, fs),
+      Effect.mapError(error => new TestSpawnError({ command, message: String(error) })));
     const chunks: Array<string> = [];
     let exitCode = 1;
     const child = Effect.scoped(Effect.gen(function* () {
       const handle = yield* spawner.spawn(ChildProcess.make(command[0]!, command.slice(1), {
         cwd: dir.path,
+        env: owned.env,
         // Node's scoped spawner kills the detached process group, not just pnpm.
         detached: true,
         killSignal: "SIGKILL",
         forceKillAfter: "100 millis",
         stdin: "ignore"
       }));
+      yield* Effect.sync(() => owned.addRoot(handle.pid));
       const collect = handle.all.pipe(Stream.decodeText(), Stream.runForEach((chunk) =>
         Effect.sync(() => { chunks.push(chunk); })));
-      const [code] = yield* Effect.all([handle.exitCode, collect], { concurrency: "unbounded" });
+      const [code] = yield* Effect.all([handle.exitCode.pipe(Effect.tap(() => owned.cleanup)), collect], { concurrency: "unbounded" });
       exitCode = code;
       return code === 0 ? "passed" as const : "failed" as const;
-    }));
+    }).pipe(Effect.onInterrupt(() => owned.cleanup)));
     const status = yield* (timeoutMs === undefined ? child : child.pipe(
       Effect.timeout(timeoutMs),
       Effect.catchTag("TimeoutError", () => Effect.succeed("timedOut" as const))
     )).pipe(Effect.mapError((error) => new TestSpawnError({ command, message: error.message })));
+    yield* owned.cleanup;
+    yield* owned.assertClean;
     const ended = yield* Clock.currentTimeMillis;
     const output = chunks.join("");
     const failed = output.includes(marker + "failed");
