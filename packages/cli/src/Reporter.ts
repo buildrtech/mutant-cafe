@@ -1,0 +1,121 @@
+import { Reporter, ReportWriteError, RunReport, Mutant, type MutantResult } from "@mutant-cafe/core";
+import * as Clock from "effect/Clock";
+import * as Console from "effect/Console";
+import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
+import * as Layer from "effect/Layer";
+import * as Path from "effect/Path";
+import * as Schema from "effect/Schema";
+import * as Semaphore from "effect/Semaphore";
+
+export const mutantLine = (mutant: Mutant): string =>
+  `${mutant.file}:${mutant.span.start.line}:${mutant.span.start.column}: ${mutant.description}`;
+
+const outcomes = ["caught", "missed", "timeout", "unviable"] as const;
+const jsonReport = Schema.encodeEffect(Schema.fromJsonString(RunReport));
+const logText = (result: MutantResult): string => [
+  ...("output" in result && typeof result.output === "string" ? [result.output] : []),
+  ...result.diagnostics,
+].join("\n");
+
+// A whole-file hunk is deliberately used: it is a valid patch even for replacements
+// spanning many lines, and it preserves the no-final-newline marker on both sides.
+const unifiedDiff = (mutant: Mutant, original: string): string => {
+  const replacement = mutant.replacement;
+  const modified = original.slice(0, replacement.startOffset) + replacement.text + original.slice(replacement.endOffset);
+  const body = (text: string, prefix: string): ReadonlyArray<string> => {
+    if (text === "") return [];
+    const lines = text.split("\n");
+    if (lines.at(-1) === "") lines.pop();
+    const result = lines.map((line) => prefix + line);
+    if (!text.endsWith("\n")) result.push("\\ No newline at end of file");
+    return result;
+  };
+  const count = (text: string) => text === "" ? 0 : text.split("\n").length - (text.endsWith("\n") ? 1 : 0);
+  const oldCount = count(original);
+  const newCount = count(modified);
+  return [`--- a/${mutant.file}`, `+++ b/${mutant.file}`, `@@ -${oldCount === 0 ? 0 : 1},${oldCount} +${newCount === 0 ? 0 : 1},${newCount} @@`, ...body(original, "-"), ...body(modified, "+"), ""].join("\n");
+};
+
+export const makeReporter = Effect.fn("makeReporter")(function*(options: {
+  readonly root: string;
+  readonly outDir: string;
+  readonly mutants: ReadonlyArray<Mutant>;
+}) {
+  const fs = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const dir = path.resolve(options.root, options.outDir);
+  const started = yield* Clock.currentTimeMillis;
+  const semaphore = yield* Semaphore.make(1);
+  const results: MutantResult[] = [];
+  let pendingError: ReportWriteError | undefined;
+  const writeError = (error: unknown) => new ReportWriteError({ path: dir, message: String(error) });
+  const ids = new Set<string>();
+  for (const mutant of options.mutants) {
+    if (!/^[A-Za-z0-9_-]+$/.test(mutant.id) || ids.has(mutant.id)) return yield* writeError("Mutant ids must be unique safe filenames");
+    ids.add(mutant.id);
+  }
+  yield* Effect.gen(function*() {
+    // Rotating an ancestor would move the source tree. An unrelated output path
+    // is allowed, but an old directory is removed only if it is our report.
+    const relative = path.relative(dir, path.resolve(options.root));
+    if (relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative))) {
+      return yield* new ReportWriteError({ path: dir, message: "Output cannot be the project root or an ancestor" });
+    }
+    if (yield* fs.exists(dir)) {
+      if (!(yield* fs.exists(path.join(dir, "mutants.json")))) return yield* writeError("Existing output is not a mutant report; choose another --output");
+      if (yield* fs.exists(`${dir}.old`)) {
+        if (!(yield* fs.exists(path.join(`${dir}.old`, "mutants.json")))) return yield* writeError("Previous output is not a mutant report; choose another --output");
+        yield* fs.remove(`${dir}.old`, { recursive: true });
+      }
+      yield* fs.rename(dir, `${dir}.old`);
+    }
+    yield* fs.makeDirectory(path.join(dir, "diff"), { recursive: true });
+    yield* fs.makeDirectory(path.join(dir, "logs"), { recursive: true });
+  }).pipe(Effect.mapError(writeError));
+  // Encode the actual core contract, not a second report shape.
+  const encodedMutants = yield* Schema.encodeEffect(Schema.fromJsonString(Schema.Array(Mutant)))(options.mutants).pipe(Effect.mapError(writeError));
+  yield* fs.writeFileString(path.join(dir, "mutants.json"), encodedMutants).pipe(Effect.mapError(writeError));
+  yield* Effect.forEach(outcomes, (outcome) => fs.writeFileString(path.join(dir, `${outcome}.txt`), ""), { discard: true }).pipe(Effect.mapError(writeError));
+  for (const mutant of options.mutants) {
+    const original = yield* fs.readFileString(path.resolve(options.root, mutant.file)).pipe(Effect.mapError(writeError));
+    yield* fs.writeFileString(path.join(dir, "diff", `${mutant.id}.diff`), unifiedDiff(mutant, original)).pipe(Effect.mapError(writeError));
+  }
+  const writeLists = (items: ReadonlyArray<MutantResult>) => Effect.forEach(outcomes, (outcome) => {
+    const lines = items.filter((result) => result.outcome === outcome).map((result) => mutantLine(result.mutant));
+    return fs.writeFileString(path.join(dir, `${outcome}.txt`), lines.length === 0 ? "" : lines.join("\n") + "\n");
+  }, { discard: true });
+  const service = Reporter.of({
+    progress: (result) => semaphore.withPermit(Effect.gen(function*() {
+      results.push(result);
+      yield* Console.log(`${result.outcome} ${mutantLine(result.mutant)} (${result.durationMs}ms)`);
+      yield* Effect.gen(function*() {
+        if (!ids.has(result.mutant.id)) return yield* writeError("Progress result does not belong to this report");
+        yield* writeLists(results);
+        yield* fs.writeFileString(path.join(dir, "logs", `${result.mutant.id}.log`), logText(result));
+      }).pipe(Effect.catch((error) => Effect.gen(function*() {
+        if (pendingError === undefined) {
+          pendingError = writeError(error);
+          yield* Console.warn(`Report write failed: ${pendingError.message}`);
+        }
+      })));
+    })),
+    write: (report) => semaphore.withPermit(Effect.gen(function*() {
+      if (pendingError !== undefined) return yield* pendingError;
+      const encoded = yield* jsonReport(report).pipe(Effect.mapError(writeError));
+      yield* fs.writeFileString(path.join(dir, "outcomes.json.tmp"), encoded).pipe(Effect.mapError(writeError));
+      yield* fs.rename(path.join(dir, "outcomes.json.tmp"), path.join(dir, "outcomes.json")).pipe(Effect.mapError(writeError));
+      yield* writeLists(report.results).pipe(Effect.mapError(writeError));
+      for (const result of report.results) {
+        if (!ids.has(result.mutant.id)) return yield* writeError("Final result does not belong to this report");
+        yield* fs.writeFileString(path.join(dir, "logs", `${result.mutant.id}.log`), logText(result)).pipe(Effect.mapError(writeError));
+      }
+      const elapsed = (yield* Clock.currentTimeMillis) - started;
+      yield* Console.log(outcomes.map((outcome) => `${report.results.filter((result) => result.outcome === outcome).length} ${outcome}`).join(", ") + `; ${(elapsed / 1000).toFixed(2)}s`);
+    })),
+  });
+  return service;
+});
+
+export const ReporterLive = (options: Parameters<typeof makeReporter>[0]) =>
+  Layer.effect(Reporter, makeReporter(options));

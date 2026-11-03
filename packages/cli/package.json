@@ -1,0 +1,21 @@
+{
+  "name": "@mutant-cafe/cli",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "bin": {
+    "mutant-cafe": "./src/bin.ts"
+  },
+  "scripts": {
+    "typecheck": "effect-tsrs diagnostics --project tsconfig.json",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@mutant-cafe/core": "workspace:*",
+    "@effect/platform-node": "4.1.2",
+    "effect": "4.1.2"
+  }
+}
