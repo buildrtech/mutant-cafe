@@ -145,12 +145,12 @@ it.live("prints TypeScript diagnostics and a failed baseline command, retaining 
   const failed = yield* invoke([]);
   expect(failed.code, failed.logs).toBe(4);
   expect(failed.logs).toContain("Baseline command:");
-  expect(failed.logs).toContain("Baseline failed (1): npx --no vitest run");
+  expect(failed.logs).toContain("Baseline failed (1):");
   expect(failed.logs).toContain("broken original");
   const report = yield* Schema.decodeEffect(Schema.fromJsonString(RunReport))(yield* fs.readFileString(`${root}/mutants.out/outcomes.json`));
   expect(report.failure).toContain("vitest run");
   expect(report.failure).toContain("broken original");
-  expect(report.baseline.testCommand.length).toBeGreaterThan(3);
+  expect(report.baseline.testCommand).toContain("vitest");
   expect(failed.logs).toContain(report.baseline.testCommand.join(" "));
   yield* fs.writeFileString(`${root}/account.ts`, "export const broken = (;");
   const invalid = yield* invoke(["--list"]);
@@ -344,6 +344,18 @@ it.effect("malformed diffs exit 6 without running tests or creating reports", ()
   yield* fs.writeFileString(`${root}/bad.diff`, "--- a/account.ts\n+++ b/account.ts\n@@ -1,2 +1,1 @@\n+truncated\n");
   expect(yield* invoke(root, ["--in-diff", "bad.diff"], [mutant()], () => Effect.die("Must not execute"))).toBe(6);
   expect(yield* fs.exists(`${root}/mutants.out`)).toBe(false);
+}).pipe(Effect.scoped, Effect.provide(NodeServices.layer)));
+
+it.effect("--cold reaches the runner and warm is the default", () => Effect.gen(function* () {
+  const root = yield* project;
+  const modes: boolean[] = [];
+  const run: Run = (config, mutants) => Effect.sync(() => {
+    modes.push(config.cold ?? false);
+    return report(config.root, mutants);
+  });
+  yield* invoke(root, ["--cold"], [mutant()], run);
+  yield* invoke(root, [], [mutant()], run);
+  expect(modes).toEqual([true, false]);
 }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)));
 
 it.effect("flags win over config and timeout flags use seconds", () => Effect.gen(function*() {

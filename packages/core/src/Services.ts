@@ -48,16 +48,21 @@ export interface TestRun {
   readonly output: string;
   readonly testsCollected?: boolean;
   readonly testFiles?: ReadonlyArray<string>;
+  readonly testDurations?: Readonly<Record<string, number>>;
+  readonly testTimeouts?: Readonly<Record<string, number>>;
 }
 
 export class TestRunner extends Context.Service<
   TestRunner,
   {
+    readonly open?: (dir: ScratchDir, cold: boolean) => Effect.Effect<void, TestSpawnError, Scope.Scope>;
+    readonly invalidate?: (dir: ScratchDir, file: string) => Effect.Effect<void, TestSpawnError>;
     readonly baseline: (dir: ScratchDir, tsconfig?: string) => Effect.Effect<Baseline, BaselineFailed | TestSpawnError>;
     readonly runRelated: (
       dir: ScratchDir,
       file: string,
-      timeoutMs: number
+      timeoutMs: number,
+      testTimeoutMs?: number
     ) => Effect.Effect<TestRun, TestSpawnError>;
   }
 >()("mutant.cafe/TestRunner") {}

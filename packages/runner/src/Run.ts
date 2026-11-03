@@ -2,7 +2,7 @@ import {
   MutantSource, MutantResult, NotMutated, Reporter, Scratch, TestRunner,
   type Baseline, BaselineFailed, type Mutant,
   type ProgramLoadError, type ReportWriteError, type RunConfig, type RunReport,
-  type ScratchDir, type ScratchError, type TestSpawnError
+  type ScratchDir, ScratchError, type TestSpawnError
 } from "@mutant-cafe/core";
 import { createEffectActor, createEffectLogic, join, send, setupEffect } from "@xstate/effect";
 import { types } from "xstate";
@@ -51,7 +51,12 @@ export const runMutants = Effect.fn("Runner.runMutants")(function* (
   });
   const capture = <A, R>(effect: Effect.Effect<A, RunError, R>) => Effect.result(effect);
   const copying = createEffectLogic(() => capture(Effect.gen(function* () {
-    const pool = yield* Pool.make({ acquire: scratch.acquire(config.root), size: jobs }).pipe(
+    const acquire = Effect.gen(function* () {
+      const dir = yield* scratch.acquire(config.root);
+      if (tests.open) yield* tests.open(dir, config.cold ?? false);
+      return dir;
+    }).pipe(Effect.mapError(error => error._tag === "ScratchError" ? error : new ScratchError({ operation: "warm runner", path: config.root, message: String(error) })));
+    const pool = yield* Pool.make({ acquire, size: jobs }).pipe(
       Effect.provideService(Scope.Scope, scope));
     // Force the first acquisition in the copying phase. The pool owns the
     // tree; this short lease does not reserve a worker during later tests.
@@ -77,6 +82,7 @@ export const runMutants = Effect.fn("Runner.runMutants")(function* (
     // Measure the original related selection once per file before applying any
     // mutant. Slow unrelated tests must not manufacture a caught never mutant.
     const neverBudgets = new Map<string, number>();
+    const neverLimits = new Map<string, number>();
     for (const mutant of input.state.pending) {
       if (mutant.genre !== "EffectNever" || neverBudgets.has(mutant.file) || unreliableFor(input.state.baseline, path.isAbsolute(mutant.file) ? path.relative(config.root, mutant.file) : mutant.file).length > 0) continue;
       const measured = yield* Effect.scoped(Effect.gen(function* () {
@@ -86,7 +92,9 @@ export const runMutants = Effect.fn("Runner.runMutants")(function* (
       if (measured.status === "failed" || measured.status === "timedOut") {
         return yield* new BaselineFailed({ exitCode: 1, output: measured.output, command: measured.command });
       }
-      neverBudgets.set(mutant.file, Math.max(config.neverTimeoutMs, Math.ceil(measured.durationMs * config.timeoutMultiplier)));
+      const slowest = Math.max(0, ...Object.values(measured.testDurations ?? input.state.baseline.testDurations ?? {}));
+      neverBudgets.set(mutant.file, Math.max(2_000, config.neverTimeoutMs, Math.ceil(slowest * config.timeoutMultiplier)));
+      neverLimits.set(mutant.file, Math.max(0, ...Object.values(measured.testTimeouts ?? {})));
     }
     yield* Stream.fromIterable(input.state.pending).pipe(
       Stream.mapEffect((mutant) => Effect.scoped(Effect.gen(function* () {
@@ -107,11 +115,19 @@ export const runMutants = Effect.fn("Runner.runMutants")(function* (
           return;
         }
         const dir = yield* Pool.get(dirs);
+        const testTimeoutMs = mutant.genre === "EffectNever" ? neverBudgets.get(mutant.file)! : undefined;
+        const timeoutMs = testTimeoutMs === undefined ? input.state.timeoutMs : Math.max(testTimeoutMs, neverLimits.get(mutant.file) ?? 0) + input.state.baseline.durationMs;
         const run = yield* Effect.acquireUseRelease(
           dir.apply(mutant),
-          () => tests.runRelated(dir, path.isAbsolute(mutant.file) ? path.relative(config.root, mutant.file) : mutant.file, mutant.genre === "EffectNever" ? neverBudgets.get(mutant.file)! : input.state.timeoutMs),
-          // A dirty directory must never return to the pool, even on cancel.
-          () => dir.revert(mutant).pipe(Effect.orDie)
+          () => Effect.gen(function* () {
+            if (tests.invalidate) yield* tests.invalidate(dir, localFile);
+            return yield* tests.runRelated(dir, localFile, timeoutMs, testTimeoutMs);
+          }),
+          // Restore and re-invalidate even on interruption before leasing again.
+          () => Effect.gen(function* () {
+            yield* dir.revert(mutant);
+            if (tests.invalidate) yield* tests.invalidate(dir, localFile);
+          }).pipe(Effect.orDie)
         );
         const selectedIssues = unreliableFor(input.state.baseline, localFile, run.testFiles);
         const result: MutantResult = {
@@ -120,6 +136,7 @@ export const runMutants = Effect.fn("Runner.runMutants")(function* (
           outcome: selectedIssues.length ? "unreliable" : run.status === "timedOut" ? (mutant.genre === "EffectNever" && run.testsCollected ? "caught" : "timeout")
             : run.status === "failed" ? "caught" : run.status === "untested" ? "untested" : "missed",
           durationMs: run.durationMs,
+          timeoutMs: testTimeoutMs ?? timeoutMs,
           testCommand: run.command,
           diagnostics: selectedIssues.map(issue => issue.reason),
           ...(run.output === "" ? {} : { output: run.output })

@@ -58,6 +58,7 @@ export const MutantResult = Schema.Struct({
   testCommand: Schema.Array(Schema.String),
   diagnostics: Schema.Array(Schema.String),
   output: Schema.optional(Schema.String),
+  timeoutMs: Schema.optional(Schema.Int),
 });
 export type MutantResult = typeof MutantResult.Type;
 
@@ -73,6 +74,8 @@ export const Baseline = Schema.Struct({
   durationMs: Schema.Int,
   testCommand: Schema.Array(Schema.String),
   unreliable: Schema.optional(Schema.Array(SelectionIssue)),
+  testDurations: Schema.optional(Schema.Record(Schema.String, Schema.Finite)),
+  testTimeouts: Schema.optional(Schema.Record(Schema.String, Schema.Finite)),
 });
 export type Baseline = typeof Baseline.Type;
 

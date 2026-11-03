@@ -159,7 +159,15 @@ This does not add `node:test` support. Literal relative imports are traced trans
 
 Selection and partial failures come from Vitest's reporter hooks, not its human-readable messages. A reported failure still counts as caught if another test file hangs.
 
-Ordinary mutants use the configured timeout. For `Effect.never`, mutant.cafe measures the unmutated related run once per file, including any full-suite fallback. Its budget is that duration × the timeout multiplier, with a 1 s floor. Slow tests that never call the function can finish normally; a process killed before test collection is not credited as caught. Each mutant run also sets Vitest's per-test timeout to half its budget, overriding a package's `testTimeout: 0`, and stops after the first reported failure.
+### Warm and cold runs
+
+By default, each scratch copy keeps one warm instance of the project's installed Vitest. Mutations and restores invalidate the changed module and its importers before the next run. Vitest's normal per-file isolation resets module-level state. `--jobs N` uses N scratch copies and N instances.
+
+Use `--cold` to start a fresh Vitest process for every mutant. Projects with `isolate: false`, `poolOptions.*.isolate: false`, or `--no-isolate` use cold mode with a warning. An unsupported Vitest Node API also falls back to cold mode. The warm adapter is tested against Vitest 5.1.0.
+
+A run that exceeds its deadline requests cancellation. If it does not settle within 500 ms, mutant.cafe closes the instance and starts another. A crashed pool gets one restart for that mutant. A second crash switches the remaining run to cold mode with a warning.
+
+Ordinary mutants use the configured timeout. For `Effect.never`, the reporter measures the slowest passing test in the original related files, including any full-suite fallback. The per-test timeout is that duration × the timeout multiplier, with a 2 s floor, rather than the duration of the whole suite. Explicit per-test timeout options remain in effect, including larger values. Vitest does not expose a configuration API to raise a smaller explicit per-test timeout; those tests still use their own value. Reports record the computed timeout on each mutant result. The outer deadline also allows the baseline run's duration for startup, collection and hooks. A process killed before test collection is not credited as caught. Other mutants keep the existing per-test timeout of half their run budget. Both modes stop after the first reported failure.
 
 ## Prior art
 

@@ -33,6 +33,7 @@ const flags = {
   include: Flag.String("file").pipe(Flag.atLeast(0), Flag.withDescription("Include source glob relative to package root; repeatable")),
   exclude: Flag.String("exclude").pipe(Flag.atLeast(0), Flag.withDescription("Exclude source glob; repeatable")),
   exportedOnly: Flag.Boolean("exported-only").pipe(Flag.withDefault(false), Flag.withDescription("Only exported binding paths, returned curried functions and Layer service methods; exclude local helpers")),
+  cold: Flag.Boolean("cold").pipe(Flag.withDefault(false), Flag.withDescription("Start a fresh Vitest process for every mutant")),
   jobs: Flag.Int("jobs").pipe(Flag.optional, Flag.withDescription("Concurrent scratch/test workers; default 1")),
   timeout: Flag.Finite("timeout").pipe(Flag.optional, Flag.withDescription("Absolute test timeout in seconds")),
   timeoutMultiplier: Flag.Finite("timeout-multiplier").pipe(Flag.optional, Flag.withDescription("Baseline duration multiplier; default 5")),
@@ -77,6 +78,7 @@ export const makeCommand = (options: {
     exclude: input.exclude.length > 0 ? input.exclude : fileConfig.exclude ?? [],
     functionFilter: fileConfig.functionFilter ?? [],
     ...(inDiff === undefined ? {} : { inDiff }),
+    cold: input.cold,
     jobs: Option.getOrElse(input.jobs, () => fileConfig.jobs ?? 1),
     ...(Option.isSome(timeoutMs) ? { timeoutMs: timeoutMs.value } : {}),
     timeoutMultiplier: Option.getOrElse(input.timeoutMultiplier, () => fileConfig.timeoutMultiplier ?? 5),
@@ -169,7 +171,7 @@ export const runCli = Effect.fn("runCli")(function*(options: {
 }) {
   const code = yield* Ref.make(0);
   const command = makeCommand({ ...options, onExit: (value) => Ref.set(code, value) });
-  yield* Command.runWith(command, { version: "0.1.5" })(options.args).pipe(
+  yield* Command.runWith(command, { version: "0.1.6" })(options.args).pipe(
     Effect.catch((error) => Effect.gen(function*() {
       yield* Console.error(error._tag === "ProgramLoadError" ? `${error.tsconfig}:\n${error.diagnostics.join("\n")}`
         : error._tag === "BaselineFailed" ? `Baseline failed (${error.exitCode}): ${error.command.join(" ")}\n${error.output.slice(-8000)}`
