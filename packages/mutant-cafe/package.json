@@ -1,0 +1,37 @@
+{
+  "name": "mutant-cafe",
+  "version": "0.1.0",
+  "description": "Type-directed mutation testing for Effect TypeScript",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "mutant-cafe": "./dist/bin.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=24"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/joelhooks/mutant-cafe.git"
+  },
+  "homepage": "https://mutant.cafe",
+  "scripts": {
+    "build": "node build.mjs",
+    "prepack": "node build.mjs"
+  },
+  "dependencies": {
+    "effect": "4.1.2",
+    "@effect/platform-node": "4.1.2",
+    "typescript": "6.0.2",
+    "xstate": "6.0.0-alpha.73",
+    "@xstate/effect": "1.0.0-alpha.12"
+  },
+  "devDependencies": {
+    "esbuild-wasm": "0.28.2"
+  }
+}
