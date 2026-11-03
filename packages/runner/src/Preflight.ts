@@ -11,12 +11,15 @@ const probe = String.raw`
 import { readFile, readdir } from "node:fs/promises";
 import { resolve, relative, dirname } from "node:path";
 import { createRequire } from "node:module";
+import { fileURLToPath } from "node:url";
 const root = process.cwd();
 const issues = [];
 const pkg = JSON.parse(await readFile("package.json", "utf8").catch(error => { if (error.code === "ENOENT") return "{}"; throw error; }));
 const script = pkg.scripts?.test;
-if (script && !/(?:^|[\s/])vitest(?:\s|$)/.test(script)) {
-  issues.push({ file: "*", reason: 'package.json scripts.test = ' + JSON.stringify(script) + '; mutant.cafe only runs Vitest' });
+const vitestScript = !script || /(?:^|[\s/])vitest(?=\s|$|[;&|])/.test(script);
+const delegated = script && /(?:\bturbo\s+(?:run\s+)?test\b|\bpnpm\s+(?:-r|--recursive|--filter\s+\S+)\s+(?:run\s+)?test\b)/.test(script);
+if (!vitestScript) {
+  issues.push({ file: "*", reason: 'package.json scripts.test = ' + JSON.stringify(script) + (delegated ? '; delegated test runner: Vitest selection is unverified' : '; mutant.cafe only runs Vitest') });
 } else {
   let ctx;
   try {
@@ -39,7 +42,15 @@ if (script && !/(?:^|[\s/])vitest(?:\s|$)/.test(script)) {
       for (const match of (sources.get(file) ?? '').matchAll(/(?:from\s*|import\s*\(?\s*|require\s*\(\s*)["']([^"']+)["']/g)) {
         let target;
         if (match[1].startsWith('.')) target = resolve(dirname(file), match[1]);
-        else { try { target = createRequire(file).resolve(match[1]); } catch { continue; } }
+        else {
+          try {
+            const selfImport = pkg.name && (match[1] === pkg.name || match[1].startsWith(pkg.name + '/'));
+            target = selfImport ? fileURLToPath(import.meta.resolve(match[1])) : createRequire(file).resolve(match[1]);
+            if (selfImport && !/\.[cm]?tsx?$/.test(target)) {
+              issues.push({ file: '*', reason: relative(root, file) + ' imports ' + match[1] + '; self entry resolves to built output ' + relative(root, target) + ', not mutated TypeScript source' });
+            }
+          } catch { continue; }
+        }
         const candidate = [target, target.replace(/\.js$/, '.ts'), target + '.ts', target + '.tsx', resolve(target, 'index.ts')].find(p => sources.has(p));
         if (candidate) dependencies(candidate, seen);
       }
@@ -58,7 +69,7 @@ if (script && !/(?:^|[\s/])vitest(?:\s|$)/.test(script)) {
     issues.push({ file: '*', reason: 'Cannot verify Vitest resolved selection: ' + String(error) });
   } finally { await ctx?.close(); }
 }
-console.log('mutant-cafe-preflight:' + JSON.stringify(issues));
+console.log('mutant-cafe-preflight:' + JSON.stringify([...new Map(issues.map(issue => [JSON.stringify(issue), issue])).values()]));
 `;
 
 export const preflight = Effect.fn("TestRunner.preflight")(function* (root: string) {

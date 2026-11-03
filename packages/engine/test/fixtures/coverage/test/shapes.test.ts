@@ -23,6 +23,20 @@ it("checks policy, guards and curried functions", () => {
   expect(s.allowed(1)).toBe(true);
   expect(s.guardFor("https:")("https://example.com")).toBe("send");
 });
+it("exercises new shapes with deliberately weak assertions", async () => {
+  const exit = await Effect.runPromise(Effect.exit(s.NumberService.pipe(Effect.provide(s.weakLayer))));
+  expect(typeof exit).toBe("object");
+  expect(typeof s.weakInternalUse(2)).toBe("number");
+  expect(typeof (await Effect.runPromise(s.Greeter.pipe(Effect.flatMap(service => service.loose(2)), Effect.provide(s.Greeter.layer))))).toBe("number");
+  expect(typeof s.weakPolicy.allowed(1)).toBe("boolean");
+  expect(typeof s.weakGuardFor("x")("xyz")).toBe("string");
+  expect(typeof s.weakBrand("real")).toBe("string");
+  expect(s.weakSet()).toBeInstanceOf(Set);
+  expect(s.weakMap()).toBeInstanceOf(Map);
+  expect(typeof s.weakObject(1).state).toBe("string");
+  expect(typeof s.weakIdentity(1, 2)).toBe("number");
+});
+
 it("checks synthesized values", () => {
   expect(s.brand("real").length).toBeGreaterThan(0);
   expect(s.set().size).toBe(1);

@@ -9,7 +9,7 @@ import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as Command from "effect/cli/Command";
 import * as Flag from "effect/cli/Flag";
-import { selectInDiff } from "./Diff.ts";
+import { selectDiffScope } from "./Diff.ts";
 import { errorExitCode, reportExitCode } from "./ExitCode.ts";
 import { makeReporter, mutantLine } from "./Reporter.ts";
 
@@ -24,7 +24,7 @@ const flags = {
   inDiff: Flag.String("in-diff").pipe(Flag.optional, Flag.withDescription("Only mutate bodies overlapping this unified diff")),
   include: Flag.String("file").pipe(Flag.atLeast(0), Flag.withDescription("Include source glob relative to package root; repeatable")),
   exclude: Flag.String("exclude").pipe(Flag.atLeast(0), Flag.withDescription("Exclude source glob; repeatable")),
-  exportedOnly: Flag.Boolean("exported-only").pipe(Flag.withDefault(false), Flag.withDescription("Exclude internal functions and values (legacy scope)")),
+  exportedOnly: Flag.Boolean("exported-only").pipe(Flag.withDefault(false), Flag.withDescription("Only exported binding paths, returned curried functions and Layer service methods; exclude local helpers")),
   jobs: Flag.Int("jobs").pipe(Flag.optional, Flag.withDescription("Concurrent scratch/test workers; default 1")),
   timeout: Flag.Finite("timeout").pipe(Flag.optional, Flag.withDescription("Absolute test timeout in seconds")),
   timeoutMultiplier: Flag.Finite("timeout-multiplier").pipe(Flag.optional, Flag.withDescription("Baseline duration multiplier; default 5")),
@@ -72,8 +72,10 @@ export const makeCommand = (options: {
     Effect.mapError((error) => error.reason === "selection"
       ? new UsageError({ message: error.diagnostics.join("\n") }) : error)
   );
-  const notMutated = yield* source.notMutated?.() ?? Effect.succeed([]);
-  const mutants = inDiff === undefined ? generated : yield* selectInDiff({ root, diffPath: inDiff, mutants: generated });
+  const skipped = yield* source.notMutated(config);
+  const selected = inDiff === undefined ? { mutants: generated, notMutated: skipped }
+    : yield* selectDiffScope({ root, diffPath: inDiff, mutants: generated, notMutated: skipped });
+  const { mutants, notMutated } = selected;
   if (input.list) {
     for (const mutant of mutants) yield* Console.log(mutantLine(mutant, config.root, path));
     const counts = new Map<string, number>();
@@ -104,7 +106,7 @@ export const runCli = Effect.fn("runCli")(function*(options: {
   yield* Command.runWith(command, { version: "0.1.3" })(options.args).pipe(
     Effect.catch((error) => Effect.gen(function*() {
       yield* Console.error(error._tag === "ProgramLoadError" ? `${error.tsconfig}:\n${error.diagnostics.join("\n")}`
-        : error._tag === "BaselineFailed" ? `Baseline failed (${error.exitCode}): ${(error.command ?? []).join(" ")}\n${error.output.slice(-8000)}`
+        : error._tag === "BaselineFailed" ? `Baseline failed (${error.exitCode}): ${error.command.join(" ")}\n${error.output.slice(-8000)}`
         : String(error));
       yield* Ref.set(code, errorExitCode(error));
     })),

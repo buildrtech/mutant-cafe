@@ -8,7 +8,7 @@ export class ProgramLoadError extends Schema.TaggedError<ProgramLoadError>()("Pr
 
 export class BaselineFailed extends Schema.TaggedError<BaselineFailed>()("BaselineFailed", {
   exitCode: Schema.Int,
-  command: Schema.optional(Schema.Array(Schema.String)),
+  command: Schema.Array(Schema.String),
   output: Schema.String,
 }) {}
 

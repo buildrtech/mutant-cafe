@@ -30,6 +30,10 @@ export interface MutableFunction {
   readonly block: boolean;
   readonly generator: boolean;
   readonly shape: ReturnShape;
+  readonly identityFile?: string;
+  readonly identityOrdinal?: number;
+  readonly logicalSpan?: { readonly offset: number; readonly length: number };
+  readonly importInsertionOffset?: number;
   readonly sourcePrefix?: string;
   readonly extraImports?: ReadonlyArray<{ readonly namespace: string; readonly statement: string }>;
   /** Resolve an API to an existing import or a collision-free mutation import. */
@@ -38,7 +42,9 @@ export interface MutableFunction {
 
 /** Compiler-specific state stays behind this port. A future adapter can use tsgo. */
 export interface TypeOracle {
-  readonly notMutated: NotMutated[];
-  readonly discover: (config: RunConfig) => Iterable<MutableFunction>;
+  readonly discover: (config: RunConfig) => {
+    readonly functions: ReadonlyArray<MutableFunction>;
+    readonly notMutated: ReadonlyArray<NotMutated>;
+  };
   readonly checkViable: (mutant: Mutant) => Viability;
 }

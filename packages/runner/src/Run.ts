@@ -43,9 +43,9 @@ export const runMutants = Effect.fn("Runner.runMutants")(function* (
   const path = yield* Path.Path;
   const jobs = Math.max(1, Math.floor(config.jobs));
   const report = (state: RunState): RunReport => ({
-    schemaVersion: 1, tool: "mutant.cafe", root: config.root,
+    schemaVersion: 2, tool: "mutant.cafe", root: config.root,
     baseline: state.baseline, timeoutMs: state.timeoutMs, results: state.results,
-    ...(state.failure === undefined ? {} : { failure: state.failure._tag === "BaselineFailed" ? `${state.failure._tag}: ${(state.failure.command ?? []).join(" ")}\n${state.failure.output.slice(-8000)}` : String(state.failure) })
+    ...(state.failure === undefined ? {} : { failure: state.failure._tag === "BaselineFailed" ? `${state.failure._tag}: ${state.failure.command.join(" ")}\n${state.failure.output.slice(-8000)}` : String(state.failure) })
   });
   const capture = <A, R>(effect: Effect.Effect<A, RunError, R>) => Effect.result(effect);
   const copying = createEffectLogic(() => capture(Effect.gen(function* () {
@@ -158,7 +158,7 @@ export const runMutants = Effect.fn("Runner.runMutants")(function* (
         onDone: ({ context, event }) => Result.isSuccess(event.output)
           ? { target: "generating", context: { ...context, ...event.output.success } }
           : { target: "reporting", context: { ...context, failure: event.output.failure,
-            baseline: event.output.failure._tag === "BaselineFailed" ? { durationMs: 0, testCommand: event.output.failure.command ?? [] } : context.baseline
+            baseline: event.output.failure._tag === "BaselineFailed" ? { durationMs: 0, testCommand: event.output.failure.command } : context.baseline
           } }
       } },
       generating: { invoke: { src: "generating", onDone: ({ context, event }) => Result.isSuccess(event.output)

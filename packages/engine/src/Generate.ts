@@ -91,10 +91,14 @@ export function* generateFunction(fn: MutableFunction): Generator<Mutant> {
 
 function makeMutant(fn: MutableFunction, genre: Genre, text: string, synthetic: boolean, description: string): Mutant {
   const additions = fn.extraImports?.filter(item => text.includes(`${item.namespace}.`)) ?? [];
+  const prefix = fn.sourcePrefix ?? "";
+  const insertion = fn.importInsertionOffset ?? 0;
   const replacement = additions.length && fn.sourcePrefix !== undefined
-    ? { startOffset: 0, endOffset: fn.endOffset, text: additions.map(item => item.statement).join("\n") + "\n" + fn.sourcePrefix + text }
+    ? { startOffset: 0, endOffset: fn.endOffset, text: prefix.slice(0, insertion) + (insertion ? "\n" : "") + additions.map(item => item.statement).join("\n") + "\n" + prefix.slice(insertion) + text }
     : { startOffset: fn.startOffset, endOffset: fn.endOffset, text };
-  const id = createHash("sha256").update(JSON.stringify([fn.file, fn.name, fn.span, genre, replacement.text])).digest("hex").slice(0, 24);
+  // Identity describes the logical edit, never the physical prefix retained to
+  // insert imports. Source line shifts above a binding do not retarget its id.
+  const id = createHash("sha256").update(JSON.stringify([fn.identityFile ?? fn.file, fn.name, fn.identityOrdinal ?? 0, fn.logicalSpan, genre, text, additions.map(item => item.statement)])).digest("hex").slice(0, 24);
   return {
     id, file: fn.file, functionName: fn.name, returnType: fn.returnType, displayReturnType: fn.displayReturnType, genre,
     description: `replace ${fn.name} -> ${fn.returnType} with ${description}`,

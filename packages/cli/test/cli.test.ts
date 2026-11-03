@@ -1,6 +1,6 @@
 import { it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { BaselineFailed, MutantSource, Reporter, Scratch, TestRunner, RunReport, type Mutant } from "@mutant-cafe/core";
+import { BaselineFailed, MutantSource, Reporter, Scratch, TestRunner, RunReport, type Mutant, type NotMutated } from "@mutant-cafe/core";
 import * as Effect from "effect/Effect";
 import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
@@ -13,6 +13,7 @@ import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 import { runCli, type Run } from "../src/Command.ts";
 import { makeReporter, mutantLine } from "../src/Reporter.ts";
 import { reportExitCode } from "../src/ExitCode.ts";
+import { makeMutantSource, makeTypeScriptOracle } from "@mutant-cafe/engine";
 import { selectInDiff } from "../src/Diff.ts";
 import { unifiedDiff } from "../src/UnifiedDiff.ts";
 
@@ -23,7 +24,7 @@ const mutant = (options: { file?: string; line?: number; id?: string } = {}): Mu
   replacement: { startOffset: 0, endOffset: 0, text: "// mutant\n" },
 });
 const report = (root: string, mutants: ReadonlyArray<Mutant>): RunReport => ({
-  schemaVersion: 1, tool: "mutant.cafe", root, baseline: { durationMs: 10, testCommand: ["vitest", "run"] }, timeoutMs: 20_000,
+  schemaVersion: 2, tool: "mutant.cafe", root, baseline: { durationMs: 10, testCommand: ["vitest", "run"] }, timeoutMs: 20_000,
   results: mutants.map((mutant) => ({ mutant, outcome: "missed", durationMs: 5, testCommand: ["vitest", "related", mutant.file], diagnostics: [] })),
 });
 const missedRun: Run = (config, mutants) => Effect.gen(function*() {
@@ -32,8 +33,8 @@ const missedRun: Run = (config, mutants) => Effect.gen(function*() {
   for (const result of output.results) yield* reporter.progress(result);
   return output;
 });
-const invoke = (root: string, args: ReadonlyArray<string>, mutants: ReadonlyArray<Mutant>, run: Run = missedRun) => runCli({ root, args, run }).pipe(
-  Effect.provideService(MutantSource, { generate: () => Stream.fromIterable(mutants), checkViable: () => Effect.succeed({ viable: true, diagnostics: [] }) }),
+const invoke = (root: string, args: ReadonlyArray<string>, mutants: ReadonlyArray<Mutant>, run: Run = missedRun, skipped: ReadonlyArray<NotMutated> = []) => runCli({ root, args, run }).pipe(
+  Effect.provideService(MutantSource, { notMutated: () => Effect.succeed(skipped), generate: () => Stream.fromIterable(mutants), checkViable: () => Effect.succeed({ viable: true, diagnostics: [] }) }),
   Effect.provideService(Scratch, { acquire: () => Effect.die("Unexpected scratch acquisition in CLI adapter test") }),
   Effect.provideService(TestRunner, { baseline: () => Effect.die("Unexpected baseline"), runRelated: () => Effect.die("Unexpected test spawn") }),
 );
@@ -117,12 +118,15 @@ it.live("runs all coverage shapes and writes honest skips, with caught and misse
     expect(outcomes, group.join(", ")).toContain("caught");
     expect(outcomes, group.join(", ")).toContain("missed");
   }
+  for (const name of ["weakLayer", "weakInternal", "Greeter.layer.loose", "weakPolicy.allowed", "weakGuardFor.<inner>", "weakBrand", "weakSet", "weakMap", "weakObject", "weakIdentity"]) {
+    expect(report.results.some(result => result.mutant.functionName === name && result.outcome === "missed"), `exercised weak assertion: ${name}`).toBe(true);
+  }
   const skipped = yield* fs.readFileString(path.join(output, "report/not-mutated.txt"));
   expect(skipped).toContain("generic: generic");
   expect(skipped).toContain("opaque: no synthesizable value for field call");
   expect(logs).toContain("Baseline command:");
   expect(logs).toContain("not mutated");
-}).pipe(Effect.scoped, Effect.provide(NodeServices.layer)), 180_000);
+}).pipe(Effect.scoped, Effect.provide(NodeServices.layer)), 300_000);
 
 it.live("prints TypeScript diagnostics and a failed baseline command, retaining outcomes.json", () => Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem;
@@ -146,14 +150,72 @@ it.live("prints TypeScript diagnostics and a failed baseline command, retaining 
   const report = yield* Schema.decodeEffect(Schema.fromJsonString(RunReport))(yield* fs.readFileString(`${root}/mutants.out/outcomes.json`));
   expect(report.failure).toContain("vitest run");
   expect(report.failure).toContain("broken original");
+  expect(report.baseline.testCommand.length).toBeGreaterThan(3);
+  expect(failed.logs).toContain(report.baseline.testCommand.join(" "));
   yield* fs.writeFileString(`${root}/account.ts`, "export const broken = (;");
   const invalid = yield* invoke(["--list"]);
-  expect(invalid.code).toBe(70);
+  expect(invalid.code).toBe(1);
   expect(invalid.logs).toContain(`${root}/tsconfig.json`);
   expect(invalid.logs).toMatch(/TS\d+:/);
+  yield* fs.writeFileString(`${root}/account.ts`, "export const isEmpty = () => true;\n");
+  yield* fs.writeFileString(`${root}/unparseable.json`, '{ "compilerOptions": ');
+  yield* fs.writeFileString(`${root}/bad-extends.json`, JSON.stringify({ extends: "./absent-base.json", include: ["account.ts"] }));
+  for (const name of ["missing.json", "unparseable.json", "bad-extends.json"]) {
+    const result = yield* invoke(["--list", "--tsconfig", name]);
+    expect(result.code, result.logs).toBe(1);
+    expect(result.logs).toContain(`${root}/${name}`);
+    expect(result.logs).toMatch(/TS\d+:/);
+  }
   const help = yield* invoke(["--help"]);
-  for (const description of ["List mutants", "Only mutate bodies", "Include source glob", "Exclude source glob", "Exclude internal", "Concurrent scratch", "Absolute test timeout", "Baseline duration multiplier", "Minimum test timeout", "Report directory", "TypeScript project path"]) expect(help.logs).toContain(description);
-}).pipe(Effect.scoped, Effect.provide(NodeServices.layer)), 20_000);
+  for (const description of ["List mutants", "Only mutate bodies", "Include source glob", "Exclude source glob", "Only exported binding paths", "Concurrent scratch", "Absolute test timeout", "Baseline duration multiplier", "Minimum test timeout", "Report directory", "TypeScript project path"]) expect(help.logs).toContain(description);
+}).pipe(Effect.scoped, Effect.provide(NodeServices.layer)), 60_000);
+
+it.effect("selects import-adding mutants by their logical span and scopes skip reports to touched files", () => Effect.gen(function* () {
+  const fs = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const fixtureRoot = path.resolve(import.meta.dirname, "../../engine/test/fixtures/coverage");
+  const file = path.join(fixtureRoot, "src/layers-only.ts");
+  const original = yield* fs.readFileString(file);
+  const source = makeMutantSource(makeTypeScriptOracle());
+  const items = yield* Stream.runCollect(source.generate({ root: fixtureRoot, tsconfig: "tsconfig.json", include: ["src/layers-only.ts"], exclude: [], functionFilter: ["layerOnly"], jobs: 1, timeoutMultiplier: 5, minimumTimeoutMs: 20_000, neverTimeoutMs: 1000, outDir: "mutants.out" }));
+  expect(items).toHaveLength(1);
+  expect(items[0]?.replacement.startOffset).toBe(0);
+  const temp = yield* fs.makeTempDirectoryScoped({ prefix: "logical-diff-" });
+  const patch = path.join(temp, "edit.diff");
+  const name = "packages/engine/test/fixtures/coverage/src/layers-only.ts";
+  yield* fs.writeFileString(patch, unifiedDiff(original.replace('import { Context, Layer }', 'import { Context, Layer } /* before */'), original, name));
+  expect(yield* selectInDiff({ root: fixtureRoot, diffPath: patch, mutants: items })).toEqual([]);
+  yield* fs.writeFileString(patch, unifiedDiff(original.replace('Layer.succeed(Only, { n: 1 })', 'Layer.succeed(Only, { n: 9 })'), original, name));
+  expect((yield* selectInDiff({ root: fixtureRoot, diffPath: patch, mutants: items })).map(item => item.id)).toEqual(items.map(item => item.id));
+
+  const root = yield* project;
+  const before = yield* fs.readFileString(`${root}/account.ts`);
+  const after = before.replace("true", "false");
+  yield* fs.writeFileString(`${root}/account.ts`, after);
+  yield* fs.writeFileString(`${root}/other.ts`, "export const other = 1;\n");
+  yield* fs.writeFileString(`${root}/edit.diff`, unifiedDiff(before, after, "account.ts"));
+  const skipped = [
+    { file: `${root}/account.ts`, functionName: "touched", reason: "opaque" },
+    { file: `${root}/other.ts`, functionName: "untouched", reason: "generic" },
+  ];
+  expect(yield* invoke(root, ["--in-diff", "edit.diff"], [], missedRun, skipped)).toBe(0);
+  const report = yield* fs.readFileString(`${root}/mutants.out/not-mutated.txt`);
+  expect(report).toContain("touched: opaque");
+  expect(report).not.toContain("untouched");
+}).pipe(Effect.scoped, Effect.provide(NodeServices.layer)), 30_000);
+
+it.effect("gives unreliable its own exit code and publishes only report schema v2", () => Effect.gen(function* () {
+  const root = yield* project;
+  const base = report(root, [mutant()]);
+  const unreliable = { ...base, results: base.results.map(result => ({ ...result, outcome: "unreliable" as const })) };
+  expect(reportExitCode(unreliable)).toBe(7);
+  expect(reportExitCode({ ...unreliable, results: [...unreliable.results, ...base.results] })).toBe(2);
+  expect(reportExitCode({ ...unreliable, results: [...unreliable.results, { ...base.results[0]!, outcome: "timeout" }] })).toBe(7);
+  expect(reportExitCode({ ...unreliable, results: [...unreliable.results, { ...base.results[0]!, outcome: "untested" }] })).toBe(7);
+  expect(yield* invoke(root, [], [mutant()], () => Effect.succeed(unreliable))).toBe(7);
+  expect(yield* Schema.decodeUnknownEffect(RunReport)({ ...base, schemaVersion: 1 }).pipe(Effect.result, Effect.map(Result.isFailure))).toBe(true);
+  expect((yield* Schema.decodeEffect(RunReport)(base)).schemaVersion).toBe(2);
+}).pipe(Effect.scoped, Effect.provide(NodeServices.layer)));
 
 it.effect("writes missed output, returns CI failure, and rotates the previous run", () => Effect.gen(function*() {
   const fs = yield* FileSystem.FileSystem;
@@ -305,7 +367,7 @@ it.effect("flags win over config and timeout flags use seconds", () => Effect.ge
 
 it.effect("maps baseline failure, timeouts, unviable mutants and internal defects for CI", () => Effect.gen(function*() {
   const root = yield* project;
-  const baselineFailure: Run = () => Effect.fail(new BaselineFailed({ exitCode: 1, output: "Failing original suite" }));
+  const baselineFailure: Run = () => Effect.fail(new BaselineFailed({ exitCode: 1, output: "Failing original suite", command: ["vitest", "run"] }));
   expect(yield* invoke(root, [], [], baselineFailure)).toBe(4);
   const timeoutRun: Run = (config, mutants) => Effect.succeed({ ...report(config.root, mutants), results: report(config.root, mutants).results.map((result) => ({ ...result, outcome: "timeout" })) });
   expect(yield* invoke(root, [], [mutant()], timeoutRun)).toBe(3);

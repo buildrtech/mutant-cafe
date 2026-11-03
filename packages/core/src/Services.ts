@@ -21,7 +21,7 @@ export interface Viability {
 export class MutantSource extends Context.Service<
   MutantSource,
   {
-    readonly notMutated?: () => Effect.Effect<ReadonlyArray<NotMutated>>;
+    readonly notMutated: (config: RunConfig) => Effect.Effect<ReadonlyArray<NotMutated>, ProgramLoadError>;
     readonly generate: (config: RunConfig) => Stream.Stream<Mutant, ProgramLoadError>;
     readonly checkViable: (mutant: Mutant) => Effect.Effect<Viability, ProgramLoadError>;
   }

@@ -76,7 +76,7 @@ export const NotMutated = Schema.Struct({
 export type NotMutated = typeof NotMutated.Type;
 
 export const RunReport = Schema.Struct({
-  schemaVersion: Schema.Literal(1),
+  schemaVersion: Schema.Literal(2),
   tool: Schema.Literal("mutant.cafe"),
   root: Schema.String,
   baseline: Baseline,
