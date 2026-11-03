@@ -35,7 +35,7 @@ const withPorts = <A, E, R>(effect: Effect.Effect<A, E, R>, reports: Array<RunRe
 );
 
 describe("real vitest mutation runs", () => {
-  it.live("catches a wrong account, misses the untested Frozen path, times out never, and leaves source bytes unchanged", () =>
+  it.live("catches a wrong account, misses the untested Frozen path, counts a hung Effect.never as caught, and leaves source bytes unchanged", () =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
       const fixtureFiles = [file, "test/account.test.ts", "package.json", "tsconfig.json", "README.md"];
@@ -50,11 +50,11 @@ describe("real vitest mutation runs", () => {
         mutation(original, "swallow-frozen", `  return (() => {${body}})().pipe(Effect.catchTag("Frozen", () => Effect.succeed(account)));`, "SwallowTag"),
         mutation(original, "never", '  process.stdout.write("mutant-never-pid=" + process.pid + "\\n"); return Effect.never;', "EffectNever")
       )), reports);
-      expect(report.results.map((result) => result.outcome)).toEqual(["caught", "missed", "timeout"]);
+      expect(report.results.map((result) => result.outcome)).toEqual(["caught", "missed", "caught"]);
       expect(report.timeoutMs).toBe(20_000);
       expect(report.baseline.durationMs).toBeGreaterThan(0);
       expect(reports).toHaveLength(1);
-      const timedOut = report.results.find((result) => result.outcome === "timeout");
+      const timedOut = report.results.find((result) => result.mutant.genre === "EffectNever");
       const pid = /mutant-never-pid=(\d+)/.exec(timedOut?.output ?? "")?.[1];
       expect(pid).toBeDefined();
       const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;

@@ -78,7 +78,8 @@ export const runMutants = Effect.fn("Runner.runMutants")(function* (
           );
           const result: MutantResult = {
             mutant,
-            outcome: run.status === "timedOut" ? "timeout" : run.status === "failed" ? "caught" : "missed",
+            // Effect.never is meant to hang: a test that waits on it and times out noticed the mutant.
+            outcome: run.status === "timedOut" ? (mutant.genre === "EffectNever" ? "caught" : "timeout") : run.status === "failed" ? "caught" : "missed",
             durationMs: run.durationMs,
             testCommand: run.command,
             diagnostics: [],

@@ -1,6 +1,6 @@
 // Compiler-host boundary: TS requires synchronous native paths; matchesGlob has no Effect Path equivalent.
 // @effect-diagnostics-next-line nodeBuiltinImport:off
-import { resolve, relative, matchesGlob } from "node:path";
+import { dirname, resolve, relative, matchesGlob } from "node:path";
 import ts from "typescript";
 import { ProgramLoadError, type Mutant, type RunConfig, type Viability } from "@mutant-cafe/core";
 import type { MutableFunction, ReturnShape, TaggedValue, TypeOracle, Value } from "./TypeOracle.ts";
@@ -82,7 +82,9 @@ export function makeTypeScriptOracle(): TypeOracle {
       for (const source of session.program.getSourceFiles()) {
         const file = resolve(source.fileName);
         const local = relative(config.root, file).replaceAll("\\", "/");
-        if (source.isDeclarationFile || local.startsWith("../") || /(?:^|\/)(?:node_modules|__tests__)\//.test(local) || /\.(?:test|spec)\.[cm]?[jt]sx?$/.test(local)) continue;
+        // Test support lives beside the project, so judge it relative to the tsconfig.
+        const project = relative(dirname(configPath), file).replaceAll("\\", "/");
+        if (source.isDeclarationFile || local.startsWith("../") || /(?:^|\/)(?:node_modules|__tests__|__mocks__|tests?)\//.test(project) || /\.(?:test|spec)\.[cm]?[jt]sx?$/.test(local)) continue;
         if (config.include.length && !config.include.some((glob) => matchesGlob(local, glob))) continue;
         if (config.exclude.some((glob) => matchesGlob(local, glob))) continue;
         owners.set(file, session);
