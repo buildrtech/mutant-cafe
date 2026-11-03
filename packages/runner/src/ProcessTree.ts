@@ -2,10 +2,12 @@ import { TestSpawnError } from "@mutant-cafe/core";
 import { createEffectActor, createEffectLogic, join, send, setupEffect } from "@xstate/effect";
 import { types } from "xstate";
 import * as Console from "effect/Console";
+import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
+import * as Semaphore from "effect/Semaphore";
 // @effect-diagnostics-next-line nodeBuiltinImport:off -- OS process inspection and PID signals have no portable Effect service.
 import { execFile } from "node:child_process";
 // @effect-diagnostics-next-line nodeBuiltinImport:off -- Adapt the OS inspector's callback API at this boundary.
@@ -16,6 +18,12 @@ import { randomUUID } from "node:crypto";
 import { pathToFileURL } from "node:url";
 
 const execute = promisify(execFile);
+export const ProcessInspector = Context.Reference<{
+  readonly inspect: (args: ReadonlyArray<string>) => Effect.Effect<{ readonly stdout: string }, TestSpawnError>;
+}>("mutant.cafe/ProcessInspector", { defaultValue: () => ({ inspect: args => Effect.tryPromise({
+  try: () => execute("ps", [...args], { encoding: "utf8", maxBuffer: 32 * 1024 * 1024, timeout: 5000, env: { PATH: process.env.PATH, LC_ALL: "C", TZ: "UTC" } }),
+  catch: () => new TestSpawnError({ command: ["ps"], message: "Cannot inspect owned test processes" })
+}) }) });
 const tokenKey = "MUTANT_CAFE_PROCESS_TOKEN";
 const ledgerKey = "MUTANT_CAFE_PROCESS_LEDGER";
 const preloadKey = "MUTANT_CAFE_PROCESS_PRELOAD";
@@ -30,24 +38,34 @@ const ledger = process.env.${ledgerKey};
 const token = process.env.${tokenKey};
 const preload = process.env.${preloadKey};
 const birth = pid => {
-  try { return inspect("ps", ["-p", String(pid), "-o", "lstart="], { encoding: "utf8", timeout: 2000, env: { ...process.env, LC_ALL: "C", TZ: "UTC" }, stdio: ["ignore", "pipe", "ignore"] }).trim(); }
+  try { return inspect("ps", ["-p", String(pid), "-o", "lstart="], { encoding: "utf8", timeout: 2000, env: { PATH: process.env.PATH, LC_ALL: "C", TZ: "UTC" }, stdio: ["ignore", "pipe", "ignore"] }).trim(); }
   catch { return ""; }
 };
 const record = pid => {
   if (!pid || !ledger) return;
   const started = birth(pid);
-  if (started) try { appendFileSync(ledger, JSON.stringify({ pid, birth: started }) + "\\n"); } catch {}
+  if (started) try { appendFileSync(ledger, JSON.stringify({ pid, birth: started, phase: process.env.MUTANT_CAFE_PROCESS_PHASE }) + "\\n"); } catch {}
 };
+if (ledger && token && preload) {
 record(process.pid);
-const environment = env => ({ ...env, ${tokenKey}: token, ${ledgerKey}: ledger, ${preloadKey}: preload,
-  NODE_OPTIONS: (env?.NODE_OPTIONS || "").includes(preload) ? env.NODE_OPTIONS : ((env?.NODE_OPTIONS || "") + " --import=" + preload).trim() });
-const options = value => ({ ...value, env: environment(value?.env || process.env) });
+const environment = node => {
+  const env = { ...process.env };
+  const ownImport = "--import=" + preload;
+  const original = (env.NODE_OPTIONS || "").replaceAll(ownImport, "").trim();
+  if (node && env.${ledgerKey} === ledger && env.${tokenKey} === token) env.NODE_OPTIONS = (original + " " + ownImport).trim();
+  else if (original) env.NODE_OPTIONS = original;
+  else delete env.NODE_OPTIONS;
+  return env;
+};
+const options = (value, node) => value?.env !== undefined ? value : ({ ...value, env: environment(node) });
 for (const name of ["spawn", "fork", "execFile", "exec"]) {
   const original = cp[name];
   const wrapped = function (...args) {
     const index = name === "exec" ? 1 : Array.isArray(args[1]) || (args[1] === undefined && args.length > 2) ? 2 : 1;
-    if (typeof args[index] === "function") args.splice(index, 0, options());
-    else args[index] = options(args[index]);
+    const value = typeof args[index] === "object" && args[index] !== null ? args[index] : undefined;
+    const node = name === "fork" ? (value?.execPath || process.execPath) === process.execPath : args[0] === process.execPath;
+    if (typeof args[index] === "function") args.splice(index, 0, options(undefined, node));
+    else args[index] = options(value, node);
     const child = original.apply(this, args);
     record(child.pid);
     return child;
@@ -70,6 +88,7 @@ for (const name of ["spawn", "fork", "execFile", "exec"]) {
   cp[name] = wrapped;
 }
 syncBuiltinESMExports();
+}
 `;
 
 const Record = Schema.Struct({ pid: Schema.Int, birth: Schema.String });
@@ -92,11 +111,8 @@ export const acquireProcessTree = Effect.fn("ProcessTree.acquire")(function* () 
   yield* fs.writeFileString(script, preloadSource);
   const roots = new Set<number>();
   const command = ["vitest", "process-cleanup"];
-  const inspect = (args: ReadonlyArray<string>) => Effect.tryPromise({
-    try: () => execute("ps", [...args], { encoding: "utf8", maxBuffer: 32 * 1024 * 1024, timeout: 5000, env: { ...process.env, LC_ALL: "C", TZ: "UTC" } }),
-    // Never include inspector output: the ownership scan also sees environment values.
-    catch: () => new TestSpawnError({ command, message: "Cannot inspect owned test processes" })
-  });
+  // Never include inspector output: it can contain environment values.
+  const { inspect } = yield* ProcessInspector;
   const snapshot = Effect.gen(function* () {
     const result = yield* inspect(["-A", "-o", "pid=,ppid=,pgid=,stat=,lstart="]);
     const found = new Map<number, ProcessInfo>();
@@ -104,12 +120,17 @@ export const acquireProcessTree = Effect.fn("ProcessTree.acquire")(function* () 
       const match = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(.+)$/.exec(line);
       if (!match) continue;
       const pid = Number(match[1]);
-      if (pid !== process.pid) found.set(pid, { pid, ppid: Number(match[2]), pgid: Number(match[3]), state: match[4]!, birth: match[5]!.trim() });
+      if (pid !== process.pid && !match[4]!.startsWith("Z")) found.set(pid, { pid, ppid: Number(match[2]), pgid: Number(match[3]), state: match[4]!, birth: match[5]!.trim() });
     }
     return found;
   });
-  const discover = Effect.gen(function* () {
+  const discover = (preserved: ReadonlySet<number>, retained: ReadonlyArray<Record>) => Effect.gen(function* () {
     const table = yield* snapshot;
+    const keep = new Set(preserved);
+    const subtrees = new Set(retained.filter(item => table.get(item.pid)?.birth === item.birth).map(item => item.pid));
+    let keepAdded: boolean;
+    do { keepAdded = false; for (const item of table.values()) if (subtrees.has(item.ppid) && !subtrees.has(item.pid)) { subtrees.add(item.pid); keepAdded = true; } } while (keepAdded);
+    for (const pid of subtrees) keep.add(pid);
     const registered = yield* fs.readFileString(ledger).pipe(Effect.mapError(() => new TestSpawnError({ command, message: "Cannot read the test process ownership ledger" })));
     const owned = new Set<number>();
     const uncertain = new Set<number>();
@@ -155,9 +176,9 @@ export const acquireProcessTree = Effect.fn("ProcessTree.acquire")(function* () 
     // from an actual key. A label alone must never authorize signalling another
     // session: require its birth ledger or current PPID chain, otherwise warn.
     const unverified = [...uncertain].filter(pid => !owned.has(pid));
-    if (unverified.length && !owned.size) return yield* new TestSpawnError({ command, message: `Cannot verify test process ownership for PIDs: ${unverified.join(", ")}; not signalled` });
+    if (unverified.length && ![...owned].some(pid => !keep.has(pid))) return yield* new TestSpawnError({ command, message: `Cannot verify test process ownership for PIDs: ${unverified.join(", ")}; not signalled` });
     if (unverified.length) yield* Console.warn(`Warning: unverified process PIDs ${unverified.join(", ")}; not signalled. Cleaning verified descendants first.`);
-    return [...owned].flatMap(pid => table.has(pid) ? [table.get(pid)!] : []);
+    return [...owned].flatMap(pid => table.has(pid) && !keep.has(pid) ? [table.get(pid)!] : []);
   });
   const signal = (pending: ReadonlyArray<ProcessInfo>, value: "SIGSTOP" | "SIGKILL") => Effect.gen(function* () {
     const current = yield* snapshot;
@@ -172,7 +193,12 @@ export const acquireProcessTree = Effect.fn("ProcessTree.acquire")(function* () 
       });
     }
   });
-  const discovering = createEffectLogic(() => discover.pipe(Effect.result));
+  const semaphore = yield* Semaphore.make(1);
+  type Outcome = "clean" | "warning";
+  let closed: Outcome | undefined;
+  const sweep = (preserved: ReadonlyArray<number>, retained: ReadonlyArray<Record> = []) => Effect.scoped(Effect.gen(function* () {
+  const keep = new Set(preserved);
+  const discovering = createEffectLogic(() => discover(keep, retained).pipe(Effect.result));
   const stopping = createEffectLogic(({ input }: { input: ReadonlyArray<ProcessInfo> }) => signal(input, "SIGSTOP").pipe(Effect.result));
   const killing = createEffectLogic(({ input }: { input: ReadonlyArray<ProcessInfo> }) => signal(input, "SIGKILL").pipe(Effect.result));
   // tracking -> discovering -> stopping -> killing -> verifying -> closed.
@@ -203,30 +229,25 @@ export const acquireProcessTree = Effect.fn("ProcessTree.acquire")(function* () 
     }
   });
   const actor = yield* createEffectActor(machine);
-  const cleanup = Effect.gen(function* () {
-    const snapshot = actor.getSnapshot();
-    let result: CleanupState;
-    if (snapshot.status === "done") result = snapshot.context;
-    else {
-      yield* send(actor, { type: "CLOSE" });
-      // @effect-diagnostics-next-line anyUnknownInErrorContext:off -- Inspection failures are machine outputs; join failures are unexpected actor defects.
-      result = yield* join(actor).pipe(Effect.orDie);
-    }
-    if (result.failure) yield* Console.warn(`Warning: ${result.failure} (tracked PIDs ${(result.pending.length ? result.pending.map(item => item.pid) : [...roots]).join(", ")}); ownership ledger kept at ${ledger}`);
-  }).pipe(Effect.uninterruptible);
+  yield* send(actor, { type: "CLOSE" });
+  // @effect-diagnostics-next-line anyUnknownInErrorContext:off -- Inspection failures are machine outputs; join failures are unexpected actor defects.
+  const result = yield* join(actor).pipe(Effect.orDie);
+  if (result.failure) yield* Console.warn(`Warning: ${result.failure} (tracked PIDs ${(result.pending.length ? result.pending.map(item => item.pid) : [...roots]).join(", ")}); ownership ledger kept at ${ledger}; continuing without reusing the host`);
+  return result.failure ? "warning" as const : "clean" as const;
+  })).pipe(Effect.uninterruptible);
+  const reap = (preserved: ReadonlyArray<number>, retained: ReadonlyArray<Record> = []) => semaphore.withPermit(Effect.suspend(() => closed === undefined ? sweep(preserved, retained) : Effect.succeed(closed)));
+  const cleanup = semaphore.withPermit(Effect.gen(function* () {
+    if (closed === undefined) closed = yield* sweep([]);
+  }));
   yield* Effect.addFinalizer(() => Effect.gen(function* () {
     yield* cleanup;
-    if (!actor.getSnapshot().context.failure) yield* fs.remove(directory, { recursive: true }).pipe(
+    if (closed === "clean") yield* fs.remove(directory, { recursive: true }).pipe(
       Effect.catch(error => Console.warn(`Warning: cannot remove process ledger directory: ${error.message}`)));
   }));
-  const assertClean = Effect.suspend(() => {
-    const failure = actor.getSnapshot().context.failure;
-    return failure ? Effect.fail(new TestSpawnError({ command, message: failure })) : Effect.void;
-  });
   const existing = process.env.NODE_OPTIONS ?? "";
   return {
-    env: { ...process.env, [tokenKey]: token, [ledgerKey]: ledger, [preloadKey]: url, NODE_OPTIONS: `${existing} --import=${url}`.trim() },
-    addRoot: (pid: number) => { roots.add(pid); }, cleanup, assertClean
+    env: { ...process.env, MUTANT_CAFE_PROCESS_PHASE: undefined, [tokenKey]: token, [ledgerKey]: ledger, [preloadKey]: url, NODE_OPTIONS: `${existing} --import=${url}`.trim() },
+    addRoot: (pid: number) => { roots.add(pid); }, cleanup, reap
   };
 });
 export type OwnedProcessTree = Effect.Success<ReturnType<typeof acquireProcessTree>>;

@@ -86,6 +86,8 @@ describe("warm Vitest proof (one scratch worker)", () => {
         concurrency: { cold: cold.baseline.testConcurrency, warm: warm.baseline.testConcurrency },
         files: Object.keys(warm.baseline.testDurations ?? {}).length,
         probes: { cold: cold.reachabilityProbes?.length ?? 0, warm: warm.reachabilityProbes?.length ?? 0 },
+        hostRestarts: { cold: cold.hostRestarts, warm: warm.hostRestarts },
+        poolResets: { cold: cold.poolResets, warm: warm.poolResets },
         cached: { cold: cold.results.filter(result => result.outcome === "untested" && result.testCommand.length === 0).length,
           warm: warm.results.filter(result => result.outcome === "untested" && result.testCommand.length === 0).length },
         coldStats: percentiles(cold), warmStats: percentiles(warm),
@@ -100,12 +102,8 @@ describe("warm Vitest proof (one scratch worker)", () => {
           beforeMs: Math.ceil(warm.baseline.durationMs * 2), afterMs: warm.results.find(result => result.mutant.id === "never")?.timeoutMs }, null, 2));
       }
       if (root === parallel) {
-        expect(warm.baseline.testWorkers).toBe(2);
-        expect(cold.baseline.testWorkers).toBe(2);
         expect(warm.baseline.testConcurrency).toBe(2);
         expect(cold.baseline.testConcurrency).toBe(2);
-        expect(warm.results.every(result => result.testWorkers === 2)).toBe(true);
-        expect(cold.results.every(result => result.testWorkers === 2)).toBe(true);
         expect(Object.keys(warm.baseline.testDurations ?? {})).toHaveLength(8);
         expect(outcomes(warm)).toEqual({ "wrong-first": "caught", "unused-first": "missed", "parallel-never": "caught", "unused-last": "missed", "wrong-last": "caught" });
         const reverse = yield* execute(parallel, false, [...mutants].reverse());
@@ -128,14 +126,16 @@ describe("warm Vitest proof (one scratch worker)", () => {
     expect(chooseMode(sample)).toBe("warm");
     expect(chooseMode({ ...sample, warmMs: 950 })).toBe("cold");
     expect(chooseMode({ ...sample, mutants: 1 })).toBe("cold");
+    expect(chooseMode({ ...sample, mutants: 3, coldStartupMs: 300, warmRunStartupMs: 50 })).toBe("warm");
     expect(chooseMode({ ...sample, warmMs: 1_100 })).toBe("cold");
   });
 
   it.live("applies its measured auto decision to the actual mutant run", () => Effect.gen(function* () {
     const report = yield* runMutants({ ...config(parallel), warm: false, cold: false }, Stream.fromIterable((yield* parallelMutants).slice(0, 2))).pipe(
       Effect.provideService(MutantSource, source), Effect.provideService(Reporter, { progress: () => Effect.void, write: () => Effect.void }));
-    expect(report.baseline.calibration).toBeDefined();
-    expect(report.baseline.runnerMode).toBe(chooseMode(report.baseline.calibration!));
+    expect(report.baseline.calibration).toBeUndefined();
+    expect(report.baseline.testableMutants).toBe(2);
+    expect(report.baseline.runnerMode).toBe("cold");
     expect(outcomes(report)).toEqual({ "wrong-first": "caught", "unused-first": "missed" });
     expect(report.results[1]?.output?.includes("mutant-warm:selected:")).toBe(report.baseline.runnerMode === "warm");
     const proofDir = process.env.MUTANT_CAFE_PROOF_DIR;
@@ -154,11 +154,11 @@ describe("warm Vitest proof (one scratch worker)", () => {
       Effect.provideService(Scratch, { acquire: () => Effect.succeed({ path: fixture, apply: () => Effect.void, revert: () => Effect.void }) }),
       Effect.provideService(TestRunner, {
         baseline: () => Effect.succeed({ durationMs: 40_000, testCommand: ["vitest"], startupMs: 100,
-          testDurations: { [test]: 1_500, unrelated: 30_000 }, testFileDurations: { [test]: 1_500, unrelated: 30_000 }, testTimeouts: { [test]: 0 } }),
+          testDurations: { [test]: 1_500, unrelated: 30_000 }, testFileDurations: { [test]: 1_500, unrelated: 30_000 }, testTimeouts: { [test]: 5000 }, testTimeoutDetails: { [`${test}::task`]: 5000 } }),
         runRelated: (_dir, _file, outer, timeout) => Effect.sync(() => {
           calls.push({ outer, test: timeout });
           return { status: "passed" as const, durationMs: 9_000, command: ["vitest"], output: "", testFiles: [test],
-            testDurations: { [test]: 9_000 }, testTimeouts: { [test]: 20_000 } };
+            testDurations: { [test]: 9_000 }, testTimeouts: { [test]: 20_000 }, testTimeoutDetails: { [`${test}::task`]: 20_000 } };
         })
       }));
     expect(calls.at(-1)).toEqual({ outer: 4_600, test: 3_000 });

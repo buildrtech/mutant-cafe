@@ -22,6 +22,10 @@ it("checks the value without leaving a worker behind", async () => {
     const pending = promisify(execFile)(process.execPath, ["-e", 'process.stdout.write("child-control")']);
     expect(pending.child.pid).toBeGreaterThan(0);
     expect((await pending).stdout).toBe("child-control");
+    for (const env of [{}, { ONLY: "kept" }]) {
+      const result = await promisify(execFile)(process.execPath, ["-e", 'process.stdout.write(JSON.stringify({ value: 2 + 3, env: process.env }))'], { env });
+      expect(JSON.parse(result.stdout)).toEqual({ value: 5, env });
+    }
     expect(mode).toBe(1);
     return;
   }
@@ -34,7 +38,7 @@ it("checks the value without leaving a worker behind", async () => {
     record(parent, "ancestor");
     parent = Number(inspect(parent, "ppid"));
   }
-  if ([2, 3, 4].includes(mode)) {
+  if ([2, 3, 4, 5].includes(mode)) {
     const shared = `const fs = require("node:fs"), cp = require("node:child_process"); const proof = ${JSON.stringify(proof)};
       const inspect = field => cp.execFileSync("ps", ["-p", String(process.pid), "-o", field + "="], { encoding: "utf8", env: { ...process.env, TZ: "UTC", LC_ALL: "C" }, stdio: ["ignore", "pipe", "ignore"] }).trim();
       const record = kind => fs.appendFileSync(proof, JSON.stringify({ pid: process.pid, kind, birth: inspect("lstart"), pgid: Number(inspect("pgid")) }) + "\\n");`;
@@ -43,8 +47,14 @@ it("checks the value without leaving a worker behind", async () => {
     const cursor = readFileSync(proof).length;
     const child = spawn(process.execPath, ["-e", middle], { detached: true, stdio: "ignore" });
     child.unref();
+    if (mode === 5) { await waitForEscape(cursor); return; }
     if (mode === 3) { await waitForEscape(cursor); process.exit(43); }
     if (mode === 4) { await waitForEscape(cursor); await new Promise(() => {}); }
+  }
+  if (mode === 6) {
+    Promise.reject(new Error("fixture-unhandled-rejection"));
+    await new Promise(resolve => setTimeout(resolve, 25));
+    return;
   }
   const loop = () => { while (true) {} };
   loop();

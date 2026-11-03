@@ -85,8 +85,11 @@ export const Baseline = Schema.Struct({
   testFileDurations: Schema.optional(Schema.Record(Schema.String, Schema.Finite)),
   startupMs: Schema.optional(Schema.Int),
   probeSupported: Schema.optional(Schema.Boolean),
+  testableMutants: Schema.optional(Schema.Int),
+  hostPid: Schema.optional(Schema.Int),
+  testTimeoutDetails: Schema.optional(Schema.Record(Schema.String, Schema.Finite)),
   runnerMode: Schema.optional(Schema.Literals(["cold", "warm"])),
-  calibration: Schema.optional(Schema.Struct({ coldMs: Schema.Int, warmMs: Schema.Int, warmStartupMs: Schema.Int, testFiles: Schema.Int, mutants: Schema.Int })),
+  calibration: Schema.optional(Schema.Struct({ coldMs: Schema.Int, warmMs: Schema.Int, warmStartupMs: Schema.Int, overheadMs: Schema.optional(Schema.Int), coldStartupMs: Schema.optional(Schema.Int), warmRunStartupMs: Schema.optional(Schema.Int), testFiles: Schema.Int, mutants: Schema.Int })),
 });
 export type Baseline = typeof Baseline.Type;
 
@@ -126,6 +129,8 @@ export const ReachabilityProbe = Schema.Struct({
 export type ReachabilityProbe = typeof ReachabilityProbe.Type;
 
 export const RunReport = Schema.Struct({
+  hostRestarts: Schema.optional(Schema.Int),
+  poolResets: Schema.optional(Schema.Int),
   reachabilityProbes: Schema.optional(Schema.Array(ReachabilityProbe)),
   selected: Schema.optional(Schema.Int),
   run: Schema.optional(Schema.Int),

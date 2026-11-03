@@ -7,7 +7,7 @@ export const outcomeNames = ["caught", "missed", "timeout", "unviable", "unteste
 export const countsLine = (report: RunReport, notMutated: number): string =>
   `${report.selected ?? report.results.length} selected, ${report.run ?? report.results.length} run, ${report.budgetSkipped ?? 0} budget-skipped; ` +
   outcomeNames.map(outcome => `${report.results.filter(result => result.outcome === outcome).length} ${outcome}`).join(", ") +
-  `; ${notMutated} not mutated`;
+  `; ${notMutated} not mutated` + (report.hostRestarts === undefined ? "" : `; ${report.hostRestarts} host restarts, ${report.poolResets ?? 0} pool resets`);
 
 // HTML entities avoid starting code spans; backslashes protect table separators.
 const cell = (text: string): string => text.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;")

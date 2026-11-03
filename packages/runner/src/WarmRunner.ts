@@ -14,17 +14,19 @@ import { reporterSource, vitestHostSource, type ProbeOptions } from "./VitestHos
 
 const Message = Schema.Union([
   Schema.Struct({ type: Schema.Literal("ready") }),
+  Schema.Struct({ type: Schema.Literal("retained"), pids: Schema.Array(Schema.Struct({ pid: Schema.Int, birth: Schema.String })) }),
   Schema.Struct({ type: Schema.Literal("invalidated") }),
   Schema.Struct({ type: Schema.Literal("collected") }),
   Schema.Struct({ type: Schema.Literal("failed") }),
   Schema.Struct({ type: Schema.Literal("selected"), files: Schema.Array(Schema.String) }),
   Schema.Struct({ type: Schema.Literal("selection"), files: Schema.Array(Schema.String) }),
   Schema.Struct({ type: Schema.Literal("probeLoaded") }),
+  Schema.Struct({ type: Schema.Literal("quiescing") }), Schema.Struct({ type: Schema.Literal("quiesced") }), Schema.Struct({ type: Schema.Literal("healthy") }),
   Schema.Struct({ type: Schema.Literal("fallback"), message: Schema.String }),
   Schema.Struct({ type: Schema.Literal("crash"), message: Schema.String }),
   Schema.Struct({ type: Schema.Literal("result"), status: Schema.Literals(["passed", "failed", "untested"]),
     testFiles: Schema.Array(Schema.String), testsCollected: Schema.Boolean,
-    testDurations: Schema.Record(Schema.String, Schema.Finite), testTimeouts: Schema.Record(Schema.String, Schema.Finite), testWorkers: Schema.Int, testConcurrency: Schema.Int, testFileDurations: Schema.Record(Schema.String, Schema.Finite), firstTestStart: Schema.Finite, probeSupported: Schema.Boolean, probeLoaded: Schema.Boolean, cleanupRequired: Schema.Boolean, crashed: Schema.Boolean })
+    testDurations: Schema.Record(Schema.String, Schema.Finite), testTimeouts: Schema.Record(Schema.String, Schema.Finite), testWorkers: Schema.Int, testConcurrency: Schema.Int, testFileDurations: Schema.Record(Schema.String, Schema.Finite), firstTestStart: Schema.Finite, probeSupported: Schema.Boolean, probeLoaded: Schema.Boolean, testTimeoutDetails: Schema.Record(Schema.String, Schema.Finite), crashed: Schema.Boolean })
 ]);
 type Message = typeof Message.Type;
 
@@ -39,12 +41,16 @@ class Host {
   collected = false;
   failed = false;
   testFiles: ReadonlyArray<string> = [];
+  runPending: Promise<Message> | undefined;
+  retained: ReadonlyArray<{ readonly pid: number; readonly birth: string }> = [];
   private pending: { resolve: (value: Message) => void; reject: (error: Error) => void } | undefined;
   private startup: Promise<Message>;
-  constructor(root: string, script: string, reporter: string, tree: OwnedProcessTree, scope: Scope.Closeable) {
+  private quiescing: (() => void) | undefined;
+  private quiesced: (() => void) | undefined;
+  constructor(root: string, script: string, reporter: string, tree: OwnedProcessTree, scope: Scope.Closeable, selectionOnly = false) {
     this.tree = tree;
     this.scope = scope;
-    this.child = spawn(process.execPath, [script, reporter], {
+    this.child = spawn(process.execPath, [script, reporter, selectionOnly ? "select" : "run"], {
       cwd: root, env: tree.env, detached: true, stdio: ["ignore", "pipe", "pipe", "ipc"]
     });
     if (this.child.pid) tree.addRoot(this.child.pid);
@@ -54,6 +60,9 @@ class Host {
     this.child.on("message", value => {
       try {
         const message = Schema.decodeUnknownSync(Message)(value);
+        if (message.type === "retained") { this.retained = message.pids; return; }
+        if (message.type === "quiescing") { this.quiescing?.(); return; }
+        if (message.type === "quiesced") { this.quiesced?.(); return; }
         if (message.type === "collected") { this.collected = true; return; }
         if (message.type === "failed") { this.failed = true; return; }
         if (message.type === "probeLoaded") return;
@@ -75,6 +84,15 @@ class Host {
     // @effect-diagnostics-next-line newPromise:off -- One IPC reply, consumed by Effect.tryPromise at the service boundary.
     return new Promise<Message>((resolve, reject) => { this.pending = { resolve, reject }; });
   }
+  quiesce() {
+    // Native IPC phase acknowledgements are separate from a still-pending run.
+    // @effect-diagnostics-next-line newPromise:off -- IPC phase acknowledgement.
+    const started = new Promise<void>(resolve => { this.quiescing = resolve; });
+    // @effect-diagnostics-next-line newPromise:off -- IPC phase acknowledgement.
+    const done = new Promise<void>(resolve => { this.quiesced = resolve; });
+    this.post({ type: "quiesce" });
+    return { started, done };
+  }
   ready() { return this.startup; }
   request(message: object) {
     const response = this.wait();
@@ -87,7 +105,7 @@ class Host {
     });
     else this.pending?.reject(new Error("Vitest host disconnected"));
   }
-  close() { return Scope.close(this.scope, Exit.succeed(undefined)).pipe(Effect.andThen(this.tree.assertClean)); }
+  close() { return Scope.close(this.scope, Exit.succeed(undefined)); }
   grace() {
     const self = this;
     return Effect.gen(function* () {
@@ -123,7 +141,7 @@ const lifecycle = setupEffect({ schemas: { events: {
   }
 });
 
-export const openWarmRunner = Effect.fn("TestRunner.openWarm")(function* (dir: ScratchDir, onFallback: () => void) {
+export const openWarmRunner = Effect.fn("TestRunner.openWarm")(function* (dir: ScratchDir, onFallback: () => void, options: { readonly quiet?: boolean; readonly onRestart?: () => void; readonly onPoolReset?: () => void } = {}) {
   const fs = yield* FileSystem.FileSystem;
   const parentScope = yield* Scope.Scope;
   const temp = yield* fs.makeTempDirectoryScoped({ prefix: "mutant-warm-" });
@@ -142,13 +160,13 @@ export const openWarmRunner = Effect.fn("TestRunner.openWarm")(function* (dir: S
     yield* Effect.addFinalizer(() => Scope.close(scope, Exit.succeed(undefined))).pipe(Effect.provideService(Scope.Scope, parentScope));
     const tree = yield* acquireProcessTree().pipe(Effect.provideService(Scope.Scope, scope), Effect.provideService(FileSystem.FileSystem, fs),
       Effect.mapError(error => new TestSpawnError({ command: ["vitest", "warm"], message: String(error) })));
-    const active = new Host(dir.path, script, reporter, tree, scope);
+    const active = new Host(dir.path, script, reporter, tree, scope, options.quiet === true);
     host = active;
     yield* Effect.addFinalizer(() => active.grace()).pipe(Effect.provideService(Scope.Scope, scope));
     const ready = yield* attempt(() => host!.ready()).pipe(Effect.timeout(30_000),
       Effect.mapError(error => new TestSpawnError({ command: ["vitest", "warm"], message: String(error) })));
     if (ready.type !== "ready") {
-      yield* Console.warn(`Warning: warm Vitest unavailable; using cold mode: ${"message" in ready ? ready.message : ready.type}`);
+      if (!options.quiet) yield* Console.warn(`Warning: warm Vitest unavailable; using cold mode: ${"message" in ready ? ready.message : ready.type}`);
       yield* Effect.sync(onFallback);
       yield* send(actor, { type: "FALLBACK" });
       yield* close();
@@ -161,6 +179,7 @@ export const openWarmRunner = Effect.fn("TestRunner.openWarm")(function* (dir: S
   const restart = Effect.gen(function* () {
     yield* retire;
     yield* start;
+    yield* Effect.sync(() => options.onRestart?.());
     if (actor.getSnapshot().value !== "cold") yield* send(actor, { type: "READY" });
   });
   yield* start;
@@ -171,12 +190,23 @@ export const openWarmRunner = Effect.fn("TestRunner.openWarm")(function* (dir: S
       // The caller restored the source before invalidating. Do not initialize a
       // replacement's config while the timed-out mutation is still on disk.
       yield* start;
+      yield* Effect.sync(() => options.onRestart?.());
       if (!isCold()) yield* send(actor, { type: "READY" });
       return;
     }
     const result = yield* attempt(() => host!.request({ type: "invalidate", file })).pipe(Effect.timeout(1_000), Effect.result);
     // A fresh host has no stale transforms. Never return a dirty graph to the pool.
     if (result._tag === "Failure") yield* restart;
+  });
+  const finish = Effect.fn("Warm.finish")(function* (active: Host, pending: Promise<Message>) {
+    const pool = active.quiesce();
+    const started = yield* attempt(() => pool.started).pipe(Effect.timeout(500), Effect.result);
+    const clean = yield* active.tree.reap(active.child.pid === undefined ? [] : [active.child.pid], active.retained);
+    yield* attempt(() => pool.done).pipe(Effect.timeout(100), Effect.result);
+    const settled = yield* attempt(() => pending).pipe(Effect.timeout(500), Effect.result);
+    const health = settled._tag === "Success" ? yield* attempt(() => active.request({ type: "ping" })).pipe(Effect.timeout(500), Effect.result) : settled;
+    yield* Effect.sync(() => options.onPoolReset?.());
+    return clean === "clean" && started._tag === "Success" && health._tag === "Success" && health.success.type === "healthy";
   });
   const run = Effect.fn("Warm.run")(function* (file: string | undefined, timeoutMs?: number, testTimeout?: number, probe?: ProbeOptions): Effect.fn.Return<TestRun | undefined, TestSpawnError> {
     if (isCold()) return undefined;
@@ -190,29 +220,29 @@ export const openWarmRunner = Effect.fn("TestRunner.openWarm")(function* (dir: S
       active.testFiles = [];
       const started = yield* Clock.currentTimeMillis;
       const pending = active.request({ type: "run", file, testTimeout, probe });
+      active.runPending = pending;
       const response = attempt(() => pending);
       const result = yield* (timeoutMs === undefined ? response : response.pipe(Effect.timeout(timeoutMs))).pipe(Effect.result);
       if (result._tag === "Success" && result.success.type === "result" && !result.success.crashed) {
-        if (result.success.cleanupRequired) yield* retire;
-        else yield* send(actor, { type: "DONE" });
+        if (yield* finish(active, pending)) yield* send(actor, { type: "DONE" });
+        else yield* retire;
         return { ...result.success, startupMs: result.success.firstTestStart > 0 ? Math.max(0, Math.ceil(result.success.firstTestStart - started)) : 0,
-          command, output: active.output, durationMs: (yield* Clock.currentTimeMillis) - started };
+          ...(active.child.pid === undefined ? {} : { hostPid: active.child.pid }), command, output: active.output, durationMs: (yield* Clock.currentTimeMillis) - started };
       }
       if (result._tag === "Failure" && result.failure._tag === "TimeoutError") {
         const failedAtDeadline = active.failed;
         yield* send(actor, { type: "CANCEL" });
         // cancelCurrentRun waits for the test: enforce a separate recovery grace.
         active.post({ type: "cancel" });
-        yield* attempt(() => pending).pipe(Effect.timeout(500), Effect.result);
-        // Cancellation can leave a setsid child outside Vitest's pool. A clean
-        // replacement is mandatory even if the cancellation RPC returned.
-        yield* retire;
+        if (yield* finish(active, pending)) yield* send(actor, { type: "DONE" });
+        else yield* retire;
         return { status: failedAtDeadline ? "failed" : "timedOut", command, output: active.output, durationMs: (yield* Clock.currentTimeMillis) - started,
-          testsCollected: active.collected, testFiles: active.testFiles };
+          ...(active.child.pid === undefined ? {} : { hostPid: active.child.pid }), testsCollected: active.collected, testFiles: active.testFiles };
       }
       if (crash === 0) {
         yield* Console.warn(`Warning: Vitest pool crashed; restarting once: ${result._tag === "Failure" ? String(result.failure) : "message" in result.success ? result.success.message : result.success.type}`);
-        yield* restart;
+        if (yield* finish(active, pending)) yield* send(actor, { type: "DONE" });
+        else yield* restart;
       }
       else {
         yield* send(actor, { type: "FAIL" });
@@ -226,10 +256,10 @@ export const openWarmRunner = Effect.fn("TestRunner.openWarm")(function* (dir: S
     return undefined;
   }, effect => effect.pipe(Effect.onInterrupt(() => Effect.gen(function* () {
     yield* send(actor, { type: "CANCEL" });
-    host?.post({ type: "cancel" });
-    yield* close().pipe(Effect.orDie);
-    // The owner is cancelling this lease; restore must not wait on its old RPC.
-    yield* send(actor, { type: "FALLBACK" });
+    const active = host;
+    active?.post({ type: "cancel" });
+    if (active?.runPending && (yield* finish(active, active.runPending).pipe(Effect.orDie))) yield* send(actor, { type: "DONE" });
+    else yield* retire.pipe(Effect.orDie);
   }))));
   const disable = Effect.gen(function* () {
     yield* close();

@@ -13,6 +13,7 @@ import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 import { runCli, type Run } from "../src/Command.ts";
 import { makeReporter, mutantLine } from "../src/Reporter.ts";
 import { reportExitCode } from "../src/ExitCode.ts";
+import { countsLine } from "../src/Summary.ts";
 import { makeMutantSource, makeTypeScriptOracle } from "@mutant-cafe/engine";
 import { selectInDiff } from "../src/Diff.ts";
 import { unifiedDiff } from "../src/UnifiedDiff.ts";
@@ -26,6 +27,9 @@ const mutant = (options: { file?: string; line?: number; id?: string } = {}): Mu
 const report = (root: string, mutants: ReadonlyArray<Mutant>): RunReport => ({
   schemaVersion: 2, tool: "mutant.cafe", root, baseline: { durationMs: 10, testCommand: ["vitest", "run"] }, timeoutMs: 20_000,
   results: mutants.map((mutant) => ({ mutant, outcome: "missed", durationMs: 5, testCommand: ["vitest", "related", mutant.file], diagnostics: [] })),
+});
+it("includes actual host restarts and pool resets in the summary", () => {
+  expect(countsLine({ ...report("/fixture", []), hostRestarts: 2, poolResets: 7 }, 0)).toContain("2 host restarts, 7 pool resets");
 });
 const missedRun: Run = (config, mutants) => Effect.gen(function*() {
   const reporter = yield* Reporter;
@@ -142,15 +146,16 @@ it.live("prints TypeScript diagnostics and a failed baseline command, retaining 
     const [logs, code] = yield* Effect.all([Stream.mkString(Stream.decodeText(handle.all)), handle.exitCode], { concurrency: "unbounded" });
     return { logs, code: Number(code) };
   });
-  const failed = yield* invoke([]);
+  const failed = yield* invoke(["--cold"]);
   expect(failed.code, failed.logs).toBe(4);
   expect(failed.logs).toContain("Baseline command:");
-  expect(failed.logs).toContain("Baseline failed (1):");
+  expect(failed.logs).toContain("Baseline failed (1): npx --no vitest run");
   expect(failed.logs).toContain("broken original");
   const report = yield* Schema.decodeEffect(Schema.fromJsonString(RunReport))(yield* fs.readFileString(`${root}/mutants.out/outcomes.json`));
   expect(report.failure).toContain("vitest run");
   expect(report.failure).toContain("broken original");
-  expect(report.baseline.testCommand).toContain("vitest");
+  expect(report.baseline.testCommand.slice(0, 4)).toEqual(["npx", "--no", "vitest", "run"]);
+  expect(report.baseline.testCommand.length).toBeGreaterThan(3);
   expect(failed.logs).toContain(report.baseline.testCommand.join(" "));
   yield* fs.writeFileString(`${root}/account.ts`, "export const broken = (;");
   const invalid = yield* invoke(["--list"]);

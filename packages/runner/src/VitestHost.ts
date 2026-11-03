@@ -3,18 +3,37 @@
 export interface ProbeOptions { readonly token: string; readonly setupFile: string }
 
 export const reporterSource = (marker: string, probe?: ProbeOptions) => `
-import { relative } from "node:path";
+import { relative, dirname } from "node:path";
 export default class {
   files = []; collected = false; failed = false; durations = {}; timeouts = {}; workers = 0; concurrency = 0; fileDurations = {}; firstTestStart = 0; verdict = null;
-  constructor(token = ${JSON.stringify(probe?.token ?? null)}, setupFile = ${JSON.stringify(probe?.setupFile ?? null)}) { this.token = token; this.setupFile = setupFile; this.loaded = false; this.originals = []; this.caseFailure = false; this.timedOut = false; this.cleanupRequired = false; }
+  constructor(token = ${JSON.stringify(probe?.token ?? null)}, setupFile = ${JSON.stringify(probe?.setupFile ?? null)}) { this.token = token; this.setupFile = setupFile; this.loaded = false; this.originals = []; this.timeoutDetails = {}; this.activeModules = new Set(); this.hooks = new Map(); this.allowances = []; }
   onInit(ctx) {
+    this.ctx = ctx;
     if (!this.setupFile) return;
+    for (const vite of new Set(ctx.projects.map(project => project.vite.config))) {
+      const fs = vite.server?.fs;
+      if (fs) { this.allowances.push([fs, fs.allow]); fs.allow = [...fs.allow, dirname(this.setupFile)]; }
+    }
     for (const config of new Set(ctx.projects.map(project => project.config))) {
       this.originals.push([config, config.setupFiles]);
       config.setupFiles = [this.setupFile, ...config.setupFiles];
     }
   }
-  restore() { for (const [config, setupFiles] of this.originals) config.setupFiles = setupFiles; this.originals = []; }
+  restore() {
+    for (const [config, setupFiles] of this.originals) config.setupFiles = setupFiles;
+    for (const [fs, allow] of this.allowances) fs.allow = allow;
+    this.originals = []; this.allowances = [];
+  }
+  onHookStart(hook) { this.hooks.set(hook.entity.id + hook.name, performance.now()); }
+  onHookEnd(hook) {
+    const module = hook.entity.module ?? hook.entity;
+    const started = this.hooks.get(hook.entity.id + hook.name);
+    if (module.moduleId && started !== undefined) {
+      const file = relative(process.cwd(), module.moduleId);
+      this.durations[file] = Math.max(this.durations[file] ?? 0, performance.now() - started);
+      console.log(${JSON.stringify(marker + "duration:")} + JSON.stringify({ file, duration: this.durations[file], timeout: 0, key: file + "::hook::" + hook.entity.id + hook.name, start: this.firstTestStart }));
+    }
+  }
   onUserConsoleLog(log) {
     if (this.token && log.content.includes(this.token)) { this.loaded = true; process.send?.({ type: "probeLoaded" }); console.log(${JSON.stringify(marker + "probeLoaded")}); }
   }
@@ -27,6 +46,11 @@ export default class {
     process.send?.({ type: "selected", files: this.files });
     console.log(${JSON.stringify(marker + "selected:")} + JSON.stringify(this.files));
   }
+  onTestModuleStart(module) {
+    this.activeModules.add(module.moduleId);
+    this.concurrency = Math.max(this.concurrency, this.activeModules.size);
+    console.log(${JSON.stringify(marker + "concurrency:")} + this.concurrency);
+  }
   onTestModuleCollected() {
     this.collected = true;
     process.send?.({ type: "collected" });
@@ -37,33 +61,27 @@ export default class {
     const timing = module.diagnostic();
     this.fileDurations[file] = timing.duration + timing.collectDuration + timing.prepareDuration + timing.setupDuration + timing.environmentSetupDuration;
     console.log(${JSON.stringify(marker + "fileDuration:")} + JSON.stringify({ file, duration: this.fileDurations[file] }));
-    this.concurrency = Math.max(this.concurrency, timing.concurrencyId ?? 0);
-    console.log(${JSON.stringify(marker + "concurrency:")} + this.concurrency);
+    this.activeModules.delete(module.moduleId);
   }
   onTestCaseResult(test) {
     const result = test.result();
     const state = result.state;
-    if (result.errors?.some(error => /^(?:Test|Hook) timed out in \\d+ms\\b/.test(error.message ?? ""))) this.timedOut = true;
-    if (state === "failed") { this.caseFailure = true; this.failed = true; process.send?.({ type: "failed" }); console.log(${JSON.stringify(marker + "failed")}); }
+    if (state === "failed") { this.failed = true; process.send?.({ type: "failed" }); console.log(${JSON.stringify(marker + "failed")}); }
     if (state === "passed") {
       const start = test.diagnostic()?.startTime ?? 0;
       if (start > 0) this.firstTestStart = this.firstTestStart ? Math.min(this.firstTestStart, start) : start;
       const file = relative(process.cwd(), test.module.moduleId);
       this.durations[file] = Math.max(this.durations[file] ?? 0, test.diagnostic()?.duration ?? 0);
       this.timeouts[file] = Math.max(this.timeouts[file] ?? 0, test.options.timeout ?? 0);
-      console.log(${JSON.stringify(marker + "duration:")} + JSON.stringify({ file, duration: this.durations[file], timeout: this.timeouts[file], start: this.firstTestStart }));
+      this.timeoutDetails[file + "::" + test.id] = test.options.timeout ?? 0;
+      console.log(${JSON.stringify(marker + "duration:")} + JSON.stringify({ file, duration: this.durations[file], timeout: this.timeouts[file], key: file + "::" + test.id, start: this.firstTestStart }));
     }
   }
   onTestRunEnd(modules, errors = [], state) {
     this.verdict = state ?? null;
-    const timeouts = [...errors, ...modules.flatMap(module => module.errors?.() ?? [])];
-    this.timedOut ||= timeouts.some(error => /^(?:Test|Hook) timed out in \\d+ms\\b/.test(error.message ?? ""));
-    // Vitest supplies no timeout error code. Reporter error messages select
-    // cleanup only; the official run verdict still owns classification.
-    this.cleanupRequired = this.timedOut || (state != null && state !== "passed" && !this.caseFailure);
     // Vitest's official run verdict also covers cancelled or pending modules.
     // Parallel bail can omit case-result hooks and module-end results.
-    if ((state != null && state !== "passed") || errors.length) { this.failed = true; process.send?.({ type: "failed" }); console.log(${JSON.stringify(marker + "failed")}); }
+    if ((state != null && state !== "passed") || (!this.ctx?.config.dangerouslyIgnoreUnhandledErrors && errors.length)) { this.failed = true; process.send?.({ type: "failed" }); console.log(${JSON.stringify(marker + "failed")}); }
     if (!this.files.length) console.log(${JSON.stringify(marker + "empty")});
     this.restore();
   }
@@ -78,23 +96,39 @@ const require = createRequire(resolve("package.json"));
 const { default: Reporter } = await import(pathToFileURL(process.argv[2]).href);
 let ctx;
 let reporter;
+const retained = () => {
+  try { return readFileSync(process.env.MUTANT_CAFE_PROCESS_LEDGER, "utf8").split("\n").filter(Boolean).flatMap(line => { try { const item = JSON.parse(line); return item.phase === "setup" ? [{ pid: item.pid, birth: item.birth }] : []; } catch { return []; } }); }
+  catch { return []; }
+};
+const setup = async fn => {
+  const previous = process.env.MUTANT_CAFE_PROCESS_PHASE;
+  process.env.MUTANT_CAFE_PROCESS_PHASE = "setup";
+  try { return await fn(); } finally { if (previous === undefined) delete process.env.MUTANT_CAFE_PROCESS_PHASE; else process.env.MUTANT_CAFE_PROCESS_PHASE = previous; }
+};
 try {
   const { createVitest } = await import(pathToFileURL(require.resolve("vitest/node")).href);
   if (typeof createVitest !== "function") throw new Error("createVitest is unavailable");
-  ctx = await createVitest({ root: process.cwd(), run: true, watch: false, cache: false, fsModuleCache: false,
-    bail: 1, passWithNoTests: true, reporters: ["default", new Reporter()] });
+  ctx = await setup(() => createVitest({ root: process.cwd(), run: true, watch: false, cache: false, fsModuleCache: false,
+    bail: 1, passWithNoTests: true, reporters: ["default", new Reporter()] }));
   if (typeof ctx.runTestSpecifications !== "function" || typeof ctx.invalidateFile !== "function"
-    || typeof ctx.cancelCurrentRun !== "function" || typeof ctx.getRelevantTestSpecifications !== "function") {
+    || typeof ctx.cancelCurrentRun !== "function" || typeof ctx.getRelevantTestSpecifications !== "function" || typeof ctx.initializeGlobalSetup !== "function") {
     throw new Error("installed Vitest does not expose the supported warm API");
   }
   const isolated = config => config.isolate !== false &&
     !Object.values(config.poolOptions ?? {}).some(pool => pool?.isolate === false);
   const script = JSON.parse(readFileSync(resolve("package.json"), "utf8")).scripts?.test ?? "";
-  if (/(?:^|\s)--no-isolate(?:\s|$)|--isolate(?:=|\s+)false/.test(script) || !isolated(ctx.config) || !isolated(ctx.vite.config.test ?? {}) ||
-    ctx.projects.some(project => !isolated(project.config) || !isolated(project.vite.config.test ?? {}))) {
+  if (process.argv[3] !== "select" && (/(?:^|\s)--no-isolate(?:\s|$)|--isolate(?:=|\s+)false/.test(script) || !isolated(ctx.config) || !isolated(ctx.vite.config.test ?? {}) ||
+    ctx.projects.some(project => !isolated(project.config) || !isolated(project.vite.config.test ?? {})))) {
     throw new Error("isolate: false (including poolOptions or --no-isolate) cannot reset module state");
   }
-  await ctx.standalone();
+  const initialize = ctx.initializeGlobalSetup.bind(ctx);
+  ctx.initializeGlobalSetup = (...args) => setup(async () => {
+    const result = await initialize(...args);
+    process.send({ type: "retained", pids: retained() });
+    return result;
+  });
+  await setup(() => ctx.standalone());
+  process.send({ type: "retained", pids: retained() });
   process.send({ type: "ready" });
 } catch (error) {
   process.send({ type: "fallback", message: String(error) });
@@ -125,6 +159,21 @@ process.on("message", async request => {
     if (request.type === "close") { await ctx.close(); process.exit(0); }
     if (request.type === "cancel") { await ctx.cancelCurrentRun("keyboard-input"); return; }
     if (request.type === "invalidate") { invalidate(request.file); process.send({ type: "invalidated" }); return; }
+    if (request.type === "ping") {
+      if (!ctx.runningPromise) ctx.cancelPromise = undefined;
+      process.send({ type: "healthy" });
+      return;
+    }
+    if (request.type === "quiesce") {
+      const pool = ctx.pool;
+      ctx.pool = undefined;
+      let closing;
+      try { closing = pool?.close?.(); } catch { /* Disposable pool is already dead. */ }
+      process.send({ type: "quiescing" });
+      try { await closing; } catch { /* Parent verifies and reaps its children. */ }
+      process.send({ type: "quiesced" });
+      return;
+    }
     if (request.type === "select") {
       ctx.config.related = [resolve(request.file)];
       const specs = await ctx.getRelevantTestSpecifications();
@@ -136,19 +185,29 @@ process.on("message", async request => {
     reporter.onInit(ctx);
     ctx.reporters = [...defaultReporters, reporter];
     ctx.config.related = request.file ? [resolve(request.file)] : undefined;
-    if (request.testTimeout === undefined) delete ctx.configOverride.testTimeout;
-    else ctx.configOverride.testTimeout = request.testTimeout;
+    if (request.testTimeout === undefined) { delete ctx.configOverride.testTimeout; delete ctx.configOverride.hookTimeout; }
+    else { ctx.configOverride.testTimeout = request.testTimeout; ctx.configOverride.hookTimeout = request.testTimeout; }
     const specs = await ctx.getRelevantTestSpecifications();
     // The shared adapter handles the full-suite fallback and remaining budget.
     const empty = specs.length === 0;
-    const result = await ctx.runTestSpecifications(specs, !request.file);
+    let result;
+    try { result = await ctx.runTestSpecifications(specs, !request.file); }
+    catch (error) {
+      // A thrown run error (for example a mutant breaking global setup) is a
+      // failure, not evidence that the host or a worker died.
+      console.error(error?.stack ?? String(error));
+      reporter.failed = true;
+      reporter.verdict = "failed";
+      result = { unhandledErrors: [error] };
+    }
     if (!["passed", "failed", "interrupted"].includes(reporter.verdict)) throw new Error("installed Vitest does not expose the supported current-run verdict");
     // Use the official current-run verdict, not retained module state. In a
     // parallel bail, child failures can exist while the module stays pending.
-    const failed = reporter.failed || result.unhandledErrors.length > 0;
+    process.send({ type: "retained", pids: retained() });
+    const failed = reporter.failed || (!ctx.config.dangerouslyIgnoreUnhandledErrors && result.unhandledErrors.length > 0);
     process.send({ type: "result", status: failed ? "failed" : empty ? "untested" : "passed",
-      testFiles: reporter.files, testsCollected: reporter.collected, testDurations: reporter.durations, testTimeouts: reporter.timeouts, testWorkers: reporter.workers, testConcurrency: reporter.concurrency, testFileDurations: reporter.fileDurations, firstTestStart: reporter.firstTestStart, probeSupported: reporter.probeSupported, probeLoaded: reporter.loaded, cleanupRequired: reporter.cleanupRequired,
-      crashed: result.unhandledErrors.length > 0 });
+      testFiles: reporter.files, testsCollected: reporter.collected, testDurations: reporter.durations, testTimeouts: reporter.timeouts, testWorkers: reporter.workers, testConcurrency: reporter.concurrency, testFileDurations: reporter.fileDurations, firstTestStart: reporter.firstTestStart, probeSupported: reporter.probeSupported, probeLoaded: reporter.loaded, testTimeoutDetails: reporter.timeoutDetails,
+      crashed: result.unhandledErrors.some(error => String(error?.message ?? "").startsWith("Worker exited unexpectedly ")) });
     process.exitCode = 0;
   } catch (error) { reporter?.restore(); process.send({ type: "crash", message: String(error) }); }
 });
