@@ -57,16 +57,21 @@ describe("real vitest mutation runs", () => {
       expect(yield* preflight(dir.path)).toEqual([]);
     }).pipe(Effect.scoped, Effect.provide(live)), 20_000);
   }
-  for (const script of ["turbo run test", "pnpm -r test"]) {
+  for (const script of ["turbo run test", "pnpm -r test", "custom-test-wrapper"]) {
     it.live(`reports delegated selection as unverified for ${script}`, () => Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
       const dir = yield* selectionFixture;
       yield* fs.writeFileString(`${dir.path}/package.json`, JSON.stringify({ type: "module", scripts: { test: script } }));
       const issues = yield* preflight(dir.path);
-      expect(issues[0]?.file).toBe("*");
-      expect(issues[0]?.reason).toContain("delegated test runner");
+      expect(issues[0]?.kind).toBe("warning");
+      expect(issues[0]?.reason).toContain(script === "custom-test-wrapper" ? "unknown test wrapper" : "delegated test runner");
       expect(issues[0]?.reason).toContain("unverified");
       expect(issues[0]?.reason).not.toContain("only runs Vitest");
+      yield* fs.writeFileString(`${dir.path}/test/visible.test.ts`, 'import { it, expect } from "vitest"; it("baseline executes", () => expect(1).toBe(1));');
+      const tests = yield* TestRunner;
+      const baseline = yield* tests.baseline(dir);
+      expect(baseline.durationMs).toBeGreaterThan(0);
+      expect(baseline.testCommand).toContain("--reporter=default");
     }).pipe(Effect.scoped, Effect.provide(live)), 20_000);
   }
   for (const name of ["unit.spec.ts", "__tests__/unit.ts", "unit.test.mts"]) {
@@ -94,11 +99,78 @@ describe("real vitest mutation runs", () => {
       const item = { ...mutation(original, "built-self", ""), file: "src/value.ts", replacement: { startOffset, endOffset: startOffset + 4, text: "false" } };
       const report = yield* withPorts(runMutants(config(dir.path), Stream.make(item)), []);
       expect(report.results[0]?.outcome).toBe("unreliable");
+      expect(report.baseline.durationMs).toBeGreaterThan(0);
       expect(report.results[0]?.diagnostics.join("\n")).toContain(`${output}/index.js`);
       expect(report.results[0]?.diagnostics.join("\n")).toContain("built output");
       expect(yield* fs.readFileString(`${dir.path}/src/value.ts`)).toBe(original);
     }).pipe(Effect.scoped, Effect.provide(live)), 20_000);
   }
+
+  for (const mapping of ["types", "tsconfig", "unmapped"]) {
+    it.live(`scopes a built subpath by source closure and actual selected tests (${mapping})`, () => Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const dir = yield* selectionFixture;
+      yield* fs.makeDirectory(`${dir.path}/dist`);
+      yield* fs.writeFileString(`${dir.path}/package.json`, JSON.stringify({ name: "built-subpath-fixture", type: "module", exports: { "./sub": { types: mapping === "types" ? "./src/sub.ts" : "./dist/sub.d.ts", import: "./dist/sub.js" } }, scripts: { test: "vitest run" } }));
+      if (mapping === "tsconfig") {
+        yield* fs.makeDirectory(`${dir.path}/config`);
+        yield* fs.writeFileString(`${dir.path}/config/base.json`, '{ // build mapping\n "note": "// preserve quoted text", "compilerOptions": { "rootDir": "../unused", "outDir": "../dist", }, }');
+        yield* fs.writeFileString(`${dir.path}/build.json`, '{ "extends": ["./config/base.json"], "compilerOptions": { "rootDir": "src" }, "include": ["src"] }');
+      }
+      const sub = 'import { ready } from "./dependency.ts"; export const sub = () => ready();';
+      const dependency = 'export const ready = () => true;';
+      const other = 'export const other = (n: number): number => n + 1;';
+      yield* fs.writeFileString(`${dir.path}/src/sub.ts`, sub);
+      yield* fs.writeFileString(`${dir.path}/src/dependency.ts`, dependency);
+      yield* fs.writeFileString(`${dir.path}/src/other.ts`, other);
+      yield* fs.writeFileString(`${dir.path}/src/orphan.ts`, dependency);
+      yield* fs.writeFileString(`${dir.path}/dist/sub.js`, 'export const sub = () => true;');
+      yield* fs.writeFileString(`${dir.path}/test/built.test.ts`, 'import { it, expect } from "vitest"; import { sub } from "built-subpath-fixture/sub"; it("built subpath", () => expect(sub()).toBe(true));');
+      const directTest = 'import { it, expect } from "vitest"; import { other } from "../src/other.ts"; it("source", () => expect(other(1)).toBe(2));';
+      yield* fs.writeFileString(`${dir.path}/test/source.test.ts`, directTest);
+      const item = (file: string, original: string, expression: string, text: string, id: string): Mutant => ({ ...mutation(original, id, ""), file, replacement: { startOffset: original.indexOf(expression), endOffset: original.indexOf(expression) + expression.length, text } });
+      const subMutant = item("src/sub.ts", sub, "ready()", "false", "sub");
+      const depMutant = item("src/dependency.ts", dependency, "true", "false", "dependency");
+      const runConfig = { ...config(dir.path), tsconfig: mapping === "tsconfig" ? `${dir.path}/build.json` : "tsconfig.json" };
+      const first = yield* withPorts(runMutants(runConfig, Stream.fromIterable([subMutant, depMutant,
+        item("src/other.ts", other, "n + 1", "0", "caught"), item("src/other.ts", other, "n + 1", "2", "missed"), item("src/orphan.ts", dependency, "true", "false", "orphan") ])), []);
+      expect(first.baseline.durationMs).toBeGreaterThan(0);
+      expect(first.baseline.testCommand).toContain("--reporter=default");
+      expect(first.results.map(result => result.outcome)).toEqual(["unreliable", "unreliable", "caught", "missed", mapping === "unmapped" ? "unreliable" : "untested"]);
+      const issue = first.baseline.unreliable?.find(issue => issue.kind === "built");
+      expect(issue?.kind).toBe("built");
+      if (issue?.kind === "built") {
+        expect(issue.testFiles).toEqual(["test/built.test.ts"]);
+        expect(issue.files).toEqual(mapping === "unmapped" ? undefined : ["src/sub.ts", "src/dependency.ts"]);
+      }
+      // Both tests remain selected by Vitest globally. Related selection now
+      // reaches source directly, excludes the dist test, and must catch normally.
+      yield* fs.writeFileString(`${dir.path}/test/source.test.ts`, directTest + '\nimport { sub } from "../src/sub.ts"; it("direct sub", () => expect(sub()).toBe(true));');
+      const second = yield* withPorts(runMutants(runConfig, Stream.fromIterable([subMutant, depMutant])), []);
+      expect(second.results.map(result => result.outcome)).toEqual(["caught", "caught"]);
+      expect(yield* fs.readFileString(`${dir.path}/src/sub.ts`)).toBe(sub);
+      expect(yield* fs.readFileString(`${dir.path}/src/dependency.ts`)).toBe(dependency);
+    }).pipe(Effect.scoped, Effect.provide(live)), 40_000);
+  }
+
+  it.live("does not turn a selection probe failure into an unverified runner", () => Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const dir = yield* selectionFixture;
+    yield* fs.writeFileString(`${dir.path}/vitest.config.ts`, 'throw new Error("broken fixture config"); export default {};');
+    const issues = yield* preflight(dir.path);
+    expect(issues.some(issue => issue.kind === "warning")).toBe(true);
+    expect(issues.some(issue => issue.kind === "runner")).toBe(false);
+    const tests = yield* TestRunner;
+    const baseline = yield* tests.baseline(dir).pipe(Effect.result);
+    expect(baseline._tag).toBe("Failure");
+    if (baseline._tag === "Failure") {
+      expect(baseline.failure._tag).toBe("BaselineFailed");
+      if (baseline.failure._tag === "BaselineFailed") {
+        expect(baseline.failure.command).toContain("--reporter=default");
+        expect(baseline.failure.output).toContain("broken fixture config");
+      }
+    }
+  }).pipe(Effect.scoped, Effect.provide(live)), 20_000);
 
   it.live("marks non-Vitest scripts and excluded importing tests unreliable before baseline", () => Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem;

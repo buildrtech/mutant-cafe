@@ -13,6 +13,7 @@ import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
+import { unreliableFor } from "./Preflight.ts";
 
 type RunError = BaselineFailed | ScratchError | TestSpawnError | ProgramLoadError | ReportWriteError;
 // XState freezes plain context objects in development. A pool is a live
@@ -60,7 +61,7 @@ export const runMutants = Effect.fn("Runner.runMutants")(function* (
     if (input === undefined) return yield* Effect.die("Missing scratch pool");
     const baseline = yield* Effect.scoped(Effect.gen(function* () {
       const dir = yield* Pool.get(input.value);
-      return yield* tests.baseline(dir);
+      return yield* tests.baseline(dir, path.isAbsolute(config.tsconfig) ? path.relative(config.root, config.tsconfig) : config.tsconfig);
     }));
     return { baseline, timeoutMs: config.timeoutMs ?? Math.max(config.minimumTimeoutMs, Math.ceil(config.timeoutMultiplier * baseline.durationMs)) };
   })));
@@ -75,7 +76,7 @@ export const runMutants = Effect.fn("Runner.runMutants")(function* (
     // mutant. Slow unrelated tests must not manufacture a caught never mutant.
     const neverBudgets = new Map<string, number>();
     for (const mutant of input.state.pending) {
-      if (mutant.genre !== "EffectNever" || neverBudgets.has(mutant.file) || input.state.baseline.unreliable?.some(issue => issue.file === "*" || issue.file === (path.isAbsolute(mutant.file) ? path.relative(config.root, mutant.file) : mutant.file))) continue;
+      if (mutant.genre !== "EffectNever" || neverBudgets.has(mutant.file) || unreliableFor(input.state.baseline, path.isAbsolute(mutant.file) ? path.relative(config.root, mutant.file) : mutant.file).length > 0) continue;
       const measured = yield* Effect.scoped(Effect.gen(function* () {
         const dir = yield* Pool.get(dirs);
         return yield* tests.runRelated(dir, path.isAbsolute(mutant.file) ? path.relative(config.root, mutant.file) : mutant.file, input.state.timeoutMs);
@@ -95,7 +96,7 @@ export const runMutants = Effect.fn("Runner.runMutants")(function* (
           return;
         }
         const localFile = path.isAbsolute(mutant.file) ? path.relative(config.root, mutant.file) : mutant.file;
-        const unreliable = input.state.baseline.unreliable?.filter(issue => issue.file === "*" || issue.file === localFile) ?? [];
+        const unreliable = unreliableFor(input.state.baseline, localFile);
         if (unreliable.length) {
           const result: MutantResult = { mutant, outcome: "unreliable", durationMs: 0, testCommand: input.state.baseline.testCommand, diagnostics: unreliable.map(issue => issue.reason) };
           yield* input.record(result);
@@ -109,14 +110,15 @@ export const runMutants = Effect.fn("Runner.runMutants")(function* (
           // A dirty directory must never return to the pool, even on cancel.
           () => dir.revert(mutant).pipe(Effect.orDie)
         );
+        const selectedIssues = unreliableFor(input.state.baseline, localFile, run.testFiles);
         const result: MutantResult = {
           mutant,
           // A kill before collection proves nothing about whether tests noticed.
-          outcome: run.status === "timedOut" ? (mutant.genre === "EffectNever" && run.testsCollected ? "caught" : "timeout")
+          outcome: selectedIssues.length ? "unreliable" : run.status === "timedOut" ? (mutant.genre === "EffectNever" && run.testsCollected ? "caught" : "timeout")
             : run.status === "failed" ? "caught" : run.status === "untested" ? "untested" : "missed",
           durationMs: run.durationMs,
           testCommand: run.command,
-          diagnostics: [],
+          diagnostics: selectedIssues.map(issue => issue.reason),
           ...(run.output === "" ? {} : { output: run.output })
         };
         yield* input.record(result);

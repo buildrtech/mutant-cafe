@@ -61,10 +61,18 @@ export const MutantResult = Schema.Struct({
 });
 export type MutantResult = typeof MutantResult.Type;
 
+export const SelectionIssue = Schema.Union([
+  Schema.Struct({ kind: Schema.Literal("runner"), reason: Schema.String }),
+  Schema.Struct({ kind: Schema.Literal("warning"), reason: Schema.String }),
+  Schema.Struct({ kind: Schema.Literal("target"), file: Schema.String, reason: Schema.String }),
+  Schema.Struct({ kind: Schema.Literal("built"), files: Schema.optional(Schema.Array(Schema.String)), testFiles: Schema.Array(Schema.String), reason: Schema.String }),
+]);
+export type SelectionIssue = typeof SelectionIssue.Type;
+
 export const Baseline = Schema.Struct({
   durationMs: Schema.Int,
   testCommand: Schema.Array(Schema.String),
-  unreliable: Schema.optional(Schema.Array(Schema.Struct({ file: Schema.String, reason: Schema.String }))),
+  unreliable: Schema.optional(Schema.Array(SelectionIssue)),
 });
 export type Baseline = typeof Baseline.Type;
 

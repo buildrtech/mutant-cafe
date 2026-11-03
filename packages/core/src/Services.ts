@@ -48,12 +48,13 @@ export interface TestRun {
   readonly command: ReadonlyArray<string>;
   readonly output: string;
   readonly testsCollected?: boolean;
+  readonly testFiles?: ReadonlyArray<string>;
 }
 
 export class TestRunner extends Context.Service<
   TestRunner,
   {
-    readonly baseline: (dir: ScratchDir) => Effect.Effect<Baseline, BaselineFailed | TestSpawnError>;
+    readonly baseline: (dir: ScratchDir, tsconfig?: string) => Effect.Effect<Baseline, BaselineFailed | TestSpawnError>;
     readonly runRelated: (
       dir: ScratchDir,
       file: string,

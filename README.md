@@ -79,11 +79,17 @@ Precedence is **missed (2), unreliable (7), untested (2), then timeout (3)**. A 
 | unviable | the mutant does not type-check |
 | timeout | the tests ran past the per-mutant budget without a reported failure or evidence of a caught `Effect.never` |
 | untested | related selection found no test files and the full-suite fallback did not fail |
-| unreliable | runner evidence is incomplete: a non-Vitest test script, an omitted importing test, or a selection probe that could not verify the package |
+| unreliable | an unsupported runner, an omitted importing test, or a selected test reading a built self-entry instead of the affected source |
 
 Vitest first runs tests related to the mutated file. When that selects no test files, mutant.cafe reruns the package's full suite within the remaining budget. A failing fallback counts as caught, including dynamic-import consumers. A passing fallback is untested, not missed: unrelated passing tests do not prove they reached the mutant.
 
-Before the baseline, mutant.cafe checks `package.json`'s test script and asks the installed Vitest for its resolved test files. It warns when another runner owns the test script or a test importing a target is omitted. Test support imported by selected tests is not an omitted suite. Affected viable mutants are unreliable and are not scored as missed; their diagnostics name the script or omitted test. Common wrappers (`pnpm exec vitest`, `npx vitest`, `cross-env … vitest`, chained commands and `vitest --project`) count as Vitest scripts. Delegated scripts such as `turbo run test` or `pnpm -r test` are unverified, not declared non-Vitest. An unverified runner skips the baseline and records unreliable results rather than running an unsupported suite. Self-imports that resolve to built JavaScript instead of the mutated TypeScript source are also unreliable: remapping a package link cannot rebuild its output. This does not add node:test support. Literal relative imports are traced transitively; computed imports remain subject to the full-suite fallback.
+Before the baseline, mutant.cafe checks `package.json`'s test script and asks the installed Vitest for its resolved test files. It warns when another runner owns the test script or a test importing a target is omitted. Test support imported by selected tests is not an omitted suite. Affected viable mutants are unreliable and are not scored as missed; their diagnostics name the script or omitted test. Common wrappers (`pnpm exec vitest`, `npx vitest`, `cross-env … vitest`, chained commands and `vitest --project`) count as Vitest scripts. Delegated scripts such as `turbo run test` or `pnpm -r test` are unverified, not declared non-Vitest.
+
+Only an explicit non-Vitest runner skips the baseline and makes all results unreliable. Delegated or unknown scripts and failed selection probes warn but do not disable the Vitest baseline.
+
+Self-imports that resolve to built JavaScript are scoped: the export's `types` condition or explicit tsconfig `rootDir`/`outDir` maps the entry back to source and its import closure. A mutant in that closure is unreliable only if its actual selected tests include a test that imports the built entry. If mapping is unavailable, only that selected-test condition applies. Selection comes from the running Vitest reporter, including a full-suite fallback. Other mutants run normally; a built self-import never disables the baseline. Remapping a package link cannot rebuild its output.
+
+This does not add node:test support. Literal relative imports are traced transitively; computed imports remain subject to the full-suite fallback.
 
 Selection and partial failures come from Vitest's reporter hooks, not its human-readable messages. A reported failure still counts as caught if another test file hangs.
 
