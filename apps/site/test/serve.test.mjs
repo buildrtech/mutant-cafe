@@ -41,4 +41,14 @@ test("the built page serves the README heading and cargo-mutants credit", async 
   const image = await readFile(new URL("../dist/client/banner.jpg", import.meta.url));
   const source = await readFile(new URL("../../../assets/banner.jpg", import.meta.url));
   assert.ok(image.equals(source), "social image must be the approved banner");
+
+  const linked = [...html.matchAll(/<link rel="(?:icon|apple-touch-icon|manifest)" href="\/([^"]+)"/g)].map((match) => match[1]);
+  assert.ok(linked.length >= 4, "page must link its icons and manifest");
+  for (const file of linked) {
+    await readFile(new URL(`../dist/client/${file}`, import.meta.url));
+  }
+  const manifest = JSON.parse(await readFile(new URL("../dist/client/site.webmanifest", import.meta.url), "utf8"));
+  for (const icon of manifest.icons) {
+    await readFile(new URL(`../dist/client${icon.src}`, import.meta.url));
+  }
 });
