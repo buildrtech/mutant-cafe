@@ -4,13 +4,26 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "plan": "alchemy plan --profile ratstack",
-    "deploy": "alchemy deploy --profile ratstack"
+    "typecheck": "effect-tsrs diagnostics --project tsconfig.json --strict --type-check",
+    "build": "vite build",
+    "startup": "node scripts/startup.mjs",
+    "test": "vite build && node --test test/serve.test.mjs",
+    "plan": "alchemy plan --stage prod --profile ratstack",
+    "deploy": "alchemy deploy --stage prod --profile ratstack"
   },
   "dependencies": {
     "@alchemy.run/cloudflare": "2.0.0-beta.85",
     "@effect/platform-node": "4.1.2",
+    "@effect/platform-browser": "4.1.2",
+    "@foldkit/markdown": "0.15.0",
     "alchemy": "2.0.0-beta.85",
-    "effect": "4.1.2"
+    "effect": "4.1.2",
+    "foldkit": "0.170.0"
+  },
+  "devDependencies": {
+    "@foldkit/vite-plugin": "0.29.0",
+    "@yielded/effect-tsrs": "0.2.3",
+    "typescript": "7.0.2",
+    "vite": "8.3.4"
   }
 }
