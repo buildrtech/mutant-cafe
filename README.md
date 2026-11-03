@@ -89,7 +89,7 @@ Only an explicit non-Vitest runner skips the baseline and makes all results unre
 
 Self-imports that resolve to built JavaScript are scoped: the export's `types` condition or explicit tsconfig `rootDir`/`outDir` maps the entry back to source and its import closure. A mutant in that closure is unreliable only if its actual selected tests include a test that imports the built entry. If mapping is unavailable, only that selected-test condition applies. Selection comes from the running Vitest reporter, including a full-suite fallback. Other mutants run normally; a built self-import never disables the baseline. Remapping a package link cannot rebuild its output.
 
-This does not add node:test support. Literal relative imports are traced transitively; computed imports remain subject to the full-suite fallback.
+This does not add `node:test` support. Literal relative imports are traced transitively; computed imports remain subject to the full-suite fallback.
 
 Selection and partial failures come from Vitest's reporter hooks, not its human-readable messages. A reported failure still counts as caught if another test file hangs.
 
