@@ -1,4 +1,4 @@
-import { ConfigFile, MutantSource, Reporter, RunConfig, type BaselineFailed, type Mutant, type ProgramLoadError, type ReportWriteError, type RunReport, type Scratch, type ScratchError, type TestRunner, type TestSpawnError } from "@mutant-cafe/core";
+import { ConfigFile, MutantList, MutantSource, Reporter, RunConfig, type BaselineFailed, type Mutant, type ProgramLoadError, ReportWriteError, type RunReport, type Scratch, type ScratchError, type TestRunner, type TestSpawnError } from "@mutant-cafe/core";
 import * as Console from "effect/Console";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -12,8 +12,10 @@ import * as Flag from "effect/cli/Flag";
 import { selectDiffScope } from "./Diff.ts";
 import { errorExitCode, reportExitCode } from "./ExitCode.ts";
 import { makeReporter, mutantLine } from "./Reporter.ts";
+import { markdownSummary } from "./Summary.ts";
 
-export class UsageError extends Schema.TaggedError<UsageError>()("UsageError", { message: Schema.String }) {}
+import { git, repositoryRoot, UsageError } from "./Git.ts";
+export { UsageError } from "./Git.ts";
 
 export type Run = (config: RunConfig, mutants: ReadonlyArray<Mutant>) => Effect.Effect<RunReport,
   BaselineFailed | ScratchError | TestSpawnError | ProgramLoadError | ReportWriteError,
@@ -22,6 +24,12 @@ export type Run = (config: RunConfig, mutants: ReadonlyArray<Mutant>) => Effect.
 const flags = {
   list: Flag.Boolean("list").pipe(Flag.withDefault(false), Flag.withDescription("List mutants and skipped function count without running tests")),
   inDiff: Flag.String("in-diff").pipe(Flag.optional, Flag.withDescription("Only mutate bodies overlapping this unified diff")),
+  inDiffRange: Flag.String("in-diff-range").pipe(Flag.optional, Flag.withDescription("Only mutate bodies overlapping git diff A...B or A..B; exclusive with --in-diff")),
+  maxMutants: Flag.Int("max-mutants").pipe(Flag.optional, Flag.withDescription("Keep first N selected mutants ordered by repository path, line, column, id; N >= 0")),
+  format: Flag.String("format").pipe(Flag.withDefault("text"), Flag.withDescription("Output format: text (default), json (--list only), or github (Markdown and GITHUB_STEP_SUMMARY)")),
+  summaryMd: Flag.String("summary-md").pipe(Flag.optional, Flag.withDescription("Write Markdown summary to this file")),
+  summaryMarker: Flag.String("summary-marker").pipe(Flag.withDefault("<!-- mutant.cafe -->"), Flag.withDescription("Override the first-line sticky-comment marker")),
+  advisory: Flag.Boolean("advisory").pipe(Flag.withDefault(false), Flag.withDescription("Exit 0 for outcomes and baseline failure; keep usage/internal errors")),
   include: Flag.String("file").pipe(Flag.atLeast(0), Flag.withDescription("Include source glob relative to package root; repeatable")),
   exclude: Flag.String("exclude").pipe(Flag.atLeast(0), Flag.withDescription("Exclude source glob; repeatable")),
   exportedOnly: Flag.Boolean("exported-only").pipe(Flag.withDefault(false), Flag.withDescription("Only exported binding paths, returned curried functions and Layer service methods; exclude local helpers")),
@@ -41,6 +49,19 @@ export const makeCommand = (options: {
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const root = path.resolve(options.root);
+  const range = Option.getOrUndefined(input.inDiffRange);
+  const inDiff = Option.getOrUndefined(input.inDiff);
+  const maxMutants = Option.getOrUndefined(input.maxMutants);
+  const summaryMd = Option.getOrUndefined(input.summaryMd);
+  if (range !== undefined && inDiff !== undefined) return yield* new UsageError({ message: "--in-diff-range and --in-diff are mutually exclusive" });
+  if (range !== undefined && (!/^[^\s.][^\s]*\.{2,3}[^\s.][^\s]*$/.test(range) || range.startsWith("-") || range.includes("...."))) {
+    return yield* new UsageError({ message: "--in-diff-range expects A...B or A..B" });
+  }
+  if (maxMutants !== undefined && (!Number.isSafeInteger(maxMutants) || maxMutants < 0)) return yield* new UsageError({ message: "--max-mutants must be a nonnegative safe integer" });
+  if (!["text", "json", "github"].includes(input.format) || (input.format === "json" && !input.list)) return yield* new UsageError({ message: "--format expects text, github, or json with --list" });
+  if (/[\r\n]/.test(input.summaryMarker)) return yield* new UsageError({ message: "--summary-marker must be one line" });
+  const gitRoot = range !== undefined ? yield* repositoryRoot(root) : yield* repositoryRoot(root).pipe(Effect.catch(() => Effect.succeed(root)));
+  const diffText = range === undefined ? undefined : yield* git(gitRoot, ["diff", "--no-ext-diff", "--no-color", range, "--"]);
   const configPath = path.join(root, "mutants.config.json");
   const fileConfig = (yield* fs.exists(configPath))
     ? yield* fs.readFileString(configPath).pipe(
@@ -48,7 +69,6 @@ export const makeCommand = (options: {
       Effect.mapError((error) => new UsageError({ message: `Invalid mutants.config.json: ${String(error)}` })),
     ) : {};
   const timeoutMs = Option.map(input.timeout, (seconds) => Math.ceil(seconds * 1000));
-  const inDiff = Option.getOrUndefined(input.inDiff);
   const config = yield* Schema.decodeEffect(RunConfig)({
     root,
     tsconfig: input.tsconfig,
@@ -73,25 +93,61 @@ export const makeCommand = (options: {
       ? new UsageError({ message: error.diagnostics.join("\n") }) : error)
   );
   const skipped = yield* source.notMutated(config);
-  const selected = inDiff === undefined ? { mutants: generated, notMutated: skipped }
-    : yield* selectDiffScope({ root, diffPath: inDiff, mutants: generated, notMutated: skipped });
-  const { mutants, notMutated } = selected;
-  if (input.list) {
-    for (const mutant of mutants) yield* Console.log(mutantLine(mutant, config.root, path));
-    const counts = new Map<string, number>();
-    for (const mutant of mutants) {
-      const file = path.relative(root, path.resolve(root, mutant.file));
-      counts.set(file, (counts.get(file) ?? 0) + 1);
+  const selected = inDiff === undefined && diffText === undefined ? { mutants: generated, notMutated: skipped }
+    : yield* selectDiffScope({ root, diffPath: inDiff ?? `git diff ${range}`, ...(diffText === undefined ? {} : { diffText }), mutants: generated, notMutated: skipped });
+  const relative = (mutant: Mutant) => path.relative(gitRoot, path.resolve(root, mutant.file)).replaceAll("\\", "/");
+  const compare = (a: string, b: string) => a < b ? -1 : a > b ? 1 : 0;
+  const ordered = [...selected.mutants].sort((a, b) => compare(relative(a), relative(b)) || a.span.start.line - b.span.start.line || a.span.start.column - b.span.start.column || compare(a.id, b.id));
+  const mutants = ordered.slice(0, maxMutants);
+  const notMutated = selected.notMutated;
+  const counts = { selected: ordered.length, run: 0, budgetSkipped: ordered.length - mutants.length };
+  const markdown = input.format === "github" || summaryMd !== undefined ? {
+    gitRoot, marker: input.summaryMarker, advisory: input.advisory, stdout: input.format === "github",
+    files: [...(summaryMd === undefined ? [] : [path.resolve(root, summaryMd)]),
+      ...(input.format === "github" && process.env.GITHUB_STEP_SUMMARY ? [process.env.GITHUB_STEP_SUMMARY] : [])],
+  } : undefined;
+  if (input.list && markdown !== undefined) {
+    const text = markdownSummary({ ...markdown, root, path, notMutated: notMutated.length,
+      report: { schemaVersion: 2, tool: "mutant.cafe", root, baseline: { durationMs: 0, testCommand: [] }, timeoutMs: 0, results: [], ...counts } });
+    for (const file of new Set(markdown.files)) yield* fs.writeFileString(file, text).pipe(
+      Effect.mapError(error => new ReportWriteError({ path: file, message: String(error) })));
+    if (markdown.stdout) {
+      yield* Console.log(text);
+      if (options.onExit !== undefined) yield* options.onExit(0);
+      return;
     }
-    for (const [file, count] of [...counts].sort(([a], [b]) => a.localeCompare(b))) yield* Console.log(`${file}: ${count} mutants`);
-    yield* Console.log(`${mutants.length} mutants total; ${notMutated.length} not mutated`);
+  }
+  if (input.list && input.format === "json") {
+    yield* Console.log(yield* Schema.encodeEffect(Schema.fromJsonString(MutantList))({ schemaVersion: 2, tool: "mutant.cafe", mutants, notMutated, counts }));
     if (options.onExit !== undefined) yield* options.onExit(0);
     return;
   }
-  const reporter = yield* makeReporter({ root, outDir: config.outDir, mutants, notMutated });
-  const report = yield* options.run(config, mutants).pipe(Effect.provideService(Reporter, reporter));
+  if (input.list) {
+    for (const mutant of mutants) yield* Console.log(mutantLine(mutant, config.root, path));
+    const perFile = new Map<string, number>();
+    for (const mutant of mutants) {
+      const file = path.relative(root, path.resolve(root, mutant.file));
+      perFile.set(file, (perFile.get(file) ?? 0) + 1);
+    }
+    for (const [file, count] of [...perFile].sort(([a], [b]) => a.localeCompare(b))) yield* Console.log(`${file}: ${count} mutants`);
+    yield* Console.log(`${mutants.length} mutants total; ${notMutated.length} not mutated; ${counts.selected} selected, 0 run, ${counts.budgetSkipped} budget-skipped`);
+    if (options.onExit !== undefined) yield* options.onExit(0);
+    return;
+  }
+  const reporter = yield* makeReporter({ root, outDir: config.outDir, mutants, notMutated, selected: counts.selected, budgetSkipped: counts.budgetSkipped, ...(markdown === undefined ? {} : { markdown }) });
+  const report = yield* options.run(config, mutants).pipe(Effect.provideService(Reporter, reporter),
+    Effect.catchTag("BaselineFailed", error => Effect.gen(function*() {
+      const failed: RunReport = { schemaVersion: 2, tool: "mutant.cafe", root,
+        baseline: { durationMs: 0, testCommand: error.command }, timeoutMs: config.timeoutMs ?? config.minimumTimeoutMs, results: [],
+        failure: `BaselineFailed: ${error.command.join(" ")}\n${error.output.slice(-8000)}` };
+      yield* reporter.write(failed);
+      if (!input.advisory) return yield* error;
+      if (markdown === undefined) yield* Console.log("Advisory: baseline failed; would exit 4 without --advisory.");
+      return failed;
+    })));
+  if (input.advisory && reportExitCode(report) !== 0 && markdown === undefined) yield* Console.log(`Advisory: would exit ${reportExitCode(report)} without --advisory.`);
   yield* reporter.write(report);
-  if (options.onExit !== undefined) yield* options.onExit(reportExitCode(report));
+  if (options.onExit !== undefined) yield* options.onExit(input.advisory ? 0 : reportExitCode(report));
 }));
 
 // The executable's runtime supplies core services. No engine or runner package is
@@ -103,7 +159,7 @@ export const runCli = Effect.fn("runCli")(function*(options: {
 }) {
   const code = yield* Ref.make(0);
   const command = makeCommand({ ...options, onExit: (value) => Ref.set(code, value) });
-  yield* Command.runWith(command, { version: "0.1.3" })(options.args).pipe(
+  yield* Command.runWith(command, { version: "0.1.4" })(options.args).pipe(
     Effect.catch((error) => Effect.gen(function*() {
       yield* Console.error(error._tag === "ProgramLoadError" ? `${error.tsconfig}:\n${error.diagnostics.join("\n")}`
         : error._tag === "BaselineFailed" ? `Baseline failed (${error.exitCode}): ${error.command.join(" ")}\n${error.output.slice(-8000)}`

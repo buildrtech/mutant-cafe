@@ -39,12 +39,78 @@ Run it from the package whose tests you want to check. In a monorepo that resolv
 | `--list` | print mutants, per-file counts, the total and the not-mutated count, then exit |
 | `--exported-only` | only exported binding paths, curried returns and Layer service methods; exclude local helpers |
 | `--in-diff <file>` | only mutants on lines a unified diff adds or changes |
+| `--in-diff-range <A...B or A..B>` | select from `git diff` run at the repository root; exclusive with `--in-diff` |
+| `--max-mutants <n>` | keep the first n selected mutants in repository path, line, column, id order |
+| `--format <text or json or github>` | text by default; JSON for `--list`; Markdown for GitHub |
+| `--summary-md <file>` | write the Markdown summary to a file |
+| `--summary-marker <text>` | override the first-line `<!-- mutant.cafe -->` marker |
+| `--advisory` | exit 0 for outcomes and baseline failure; usage and internal errors still fail |
 | `--file <glob>`, `--exclude <glob>` | choose source files (repeatable) |
 | `--jobs <n>` | scratch copies tested in parallel |
 | `--timeout <s>` | per-mutant test timeout; default 5× the baseline run, at least 20 s |
 | `--timeout-multiplier <x>`, `--minimum-test-timeout <s>` | tune that default |
 | `--output <dir>` | results directory, default `mutants.out` |
 | `--tsconfig <path>` | default `tsconfig.json` |
+
+## CI
+
+Use a git range to check changed bodies and a mutant budget to cap the work. The budget applies after file, diff and function selection. Ordering uses repository-relative file path (lexical, not locale-dependent), start line, column, then id. `--max-mutants 0` keeps none. Budget-skipped mutants are not outcomes.
+
+This advisory GitHub Actions job writes a step summary and updates one sticky PR comment. Install mutant-cafe as a dev dependency first. Replace `npm ci` with your package manager's install command if needed; run the mutation command from the package you want to test.
+
+```yaml
+name: Mutation advisory
+on: pull_request
+permissions:
+  contents: read
+  pull-requests: write
+jobs:
+  mutants:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: npm ci
+      - name: Check changed bodies
+        run: >-
+          npx --no-install mutant-cafe
+          --in-diff-range "origin/${{ github.base_ref }}...HEAD"
+          --max-mutants 40 --format github --advisory
+          --summary-md mutant-summary.md
+      - name: Update sticky comment
+        if: github.event.pull_request.head.repo.full_name == github.repository
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('node:fs');
+            const body = fs.readFileSync('mutant-summary.md', 'utf8');
+            const marker = '<!-- mutant.cafe -->';
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner, repo, issue_number
+            });
+            const previous = comments.find(comment =>
+              comment.user.type === 'Bot' && comment.body?.startsWith(marker)
+            );
+            if (previous) {
+              await github.rest.issues.updateComment({
+                owner, repo, comment_id: previous.id, body
+              });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
+```
+
+Fork PRs still get the step summary; the example only posts comments on same-repository PRs. Do not switch this job to `pull_request_target` to grant untrusted PR code a write token. If a job or matrix tests multiple packages, give each summary a distinct `--summary-marker` and match that marker in the comment step.
+
+`--format github` prints Markdown and writes the same content to `GITHUB_STEP_SUMMARY` when set. `--summary-md` also works with the default text output. The first line is `<!-- mutant.cafe -->` unless overridden. The summary counts all outcomes, lists up to 50 missed, timeout, untested and unreliable mutants with repository-root-relative paths, and says what would have failed without `--advisory`. Advisory mode does not hide bad arguments, bad refs, source errors or internal errors.
+
+For automation without running tests, `--list --format json` prints one JSON document: `schemaVersion`, `tool`, `mutants` (the same `Mutant` shape used by report results), `notMutated`, and `counts` with `selected`, `run` and `budgetSkipped`. `selected` is the count before the budget; `run` is zero for a list and the number of recorded outcomes for an execution. The published `MutantList` and `RunReport` schemas are exported by `@mutant-cafe/core` in this workspace. Reports keep schema version 2: `selected`, `run` and `budgetSkipped` are additive optional fields, so older v2 reports still decode.
 
 ## Outputs
 

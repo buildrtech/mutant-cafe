@@ -37,7 +37,8 @@ export const TestRunnerLive = Layer.effect(TestRunner, Effect.gen(function* () {
     const command = ["npx", "--no", "vitest", ...args, "--reporter=default", `--reporter=${reporter}`, "--bail", "1",
       ...(timeoutMs === undefined ? [] : ["--testTimeout", String(Math.max(1, Math.floor(timeoutMs / 2)))]),
       "--no-cache", "--no-fsModuleCache"];
-    if (timeoutMs === undefined) yield* Console.log(`Baseline command: ${command.join(" ")} (cwd: ${dir.path})`);
+    // Keep diagnostics off stdout so GitHub output is a Markdown document.
+    if (timeoutMs === undefined) yield* Console.error(`Baseline command: ${command.join(" ")} (cwd: ${dir.path})`);
     const started = yield* Clock.currentTimeMillis;
     const chunks: Array<string> = [];
     let exitCode = 1;

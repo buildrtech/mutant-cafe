@@ -89,13 +89,14 @@ export const parseDiff = (text: string, path: string) => Effect.try({
 export const selectDiffScope = Effect.fn("selectDiffScope")(function*(options: {
   readonly root: string;
   readonly diffPath: string;
+  readonly diffText?: string;
   readonly mutants: ReadonlyArray<Mutant>;
   readonly notMutated: ReadonlyArray<NotMutated>;
 }) {
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const diffPath = path.resolve(options.root, options.diffPath);
-  const text = yield* fs.readFileString(diffPath).pipe(Effect.mapError((error) => new DiffParseError({ path: diffPath, message: String(error) })));
+  const text = options.diffText ?? (yield* fs.readFileString(diffPath).pipe(Effect.mapError((error) => new DiffParseError({ path: diffPath, message: String(error) }))));
   const patches = yield* parseDiff(text, diffPath);
   const gitRoot = yield* Effect.scoped(Effect.gen(function* () {
     const handle = yield* ChildProcess.make("git", ["rev-parse", "--show-toplevel"], { cwd: options.root, stderr: "ignore" });
