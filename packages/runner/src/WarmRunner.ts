@@ -133,7 +133,7 @@ class Host {
       const exited = Effect.promise(() => self.exited);
       // The scope's next finalizer kills and verifies the entire owned tree,
       // even when the host exited but an escaped grandchild retained its pipes.
-      const result = yield* exited.pipe(Effect.timeout(500), Effect.result);
+      const result = yield* exited.pipe(Effect.interruptible, Effect.timeout(500), Effect.result);
       if (result._tag === "Failure") yield* Effect.sync(() => {
         // Native ChildProcess still owns this handle; unlike a bare saved PID,
         // kill() cannot target a PID that was reaped and reused.
@@ -161,7 +161,7 @@ const lifecycle = setupEffect({ schemas: { events: {
   }
 });
 
-export const openWarmRunner = Effect.fn("TestRunner.openWarm")(function* (dir: ScratchDir, onFallback: (reason: string) => void, options: { readonly selectionOnly?: boolean; readonly quiet?: boolean; readonly onRestart?: () => void; readonly onPoolReset?: () => void; readonly onBackstop?: (durationMs: number) => void; readonly warn?: (message: string) => Effect.Effect<void>; readonly decodeMessage?: typeof decodeWarmMessage } = {}) {
+export const openWarmRunner = Effect.fn("TestRunner.openWarm")(function* (dir: ScratchDir, onFallback: (reason: string) => void, options: { readonly selectionOnly?: boolean; readonly quiet?: boolean; readonly onRestart?: () => void; readonly onPoolReset?: () => void; readonly onBackstop?: (durationMs: number) => void; readonly processesSince?: number | undefined; readonly warn?: (message: string) => Effect.Effect<void>; readonly decodeMessage?: typeof decodeWarmMessage } = {}) {
   const fs = yield* FileSystem.FileSystem;
   const parentScope = yield* Scope.Scope;
   const temp = yield* fs.makeTempDirectoryScoped({ prefix: "mutant-warm-" });
@@ -172,7 +172,7 @@ export const openWarmRunner = Effect.fn("TestRunner.openWarm")(function* (dir: S
   const actor = yield* createEffectActor(lifecycle);
   let host: Host | undefined;
   const attempt = <A>(fn: () => Promise<A>) => Effect.tryPromise({ try: fn,
-    catch: error => new TestSpawnError({ command: ["vitest", "warm"], message: String(error), ...(error instanceof ReporterMessageError ? { kind: "reporter" as const } : {}) }) });
+    catch: error => new TestSpawnError({ command: ["vitest", "warm"], message: String(error), ...(error instanceof ReporterMessageError ? { kind: "reporter" as const } : {}) }) }).pipe(Effect.interruptible);
   const close = () => host === undefined ? Effect.void : host.close();
   const abortHost = (error: TestSpawnError) => Effect.gen(function* () {
     yield* send(actor, { type: "FAIL" });
@@ -183,7 +183,7 @@ export const openWarmRunner = Effect.fn("TestRunner.openWarm")(function* (dir: S
   const start = Effect.gen(function* () {
     const scope = yield* Scope.make();
     yield* Effect.addFinalizer(() => Scope.close(scope, Exit.succeed(undefined))).pipe(Effect.provideService(Scope.Scope, parentScope));
-    const tree = yield* acquireProcessTree(dir.path, options.onBackstop).pipe(Effect.provideService(Scope.Scope, scope), Effect.provideService(FileSystem.FileSystem, fs),
+    const tree = yield* acquireProcessTree(dir.path, options.onBackstop, options.processesSince).pipe(Effect.provideService(Scope.Scope, scope), Effect.provideService(FileSystem.FileSystem, fs),
       Effect.mapError(error => new TestSpawnError({ command: ["vitest", "warm"], message: String(error) })));
     const active = new Host(dir.path, script, reporter, tree, scope, options.selectionOnly === true, options.decodeMessage);
     host = active;
@@ -212,7 +212,7 @@ export const openWarmRunner = Effect.fn("TestRunner.openWarm")(function* (dir: S
   yield* start;
   const isCold = () => actor.getSnapshot().value === "cold";
   const invalidate = Effect.fn("Warm.invalidate")(function* (file: string) {
-    if (isCold()) return;
+    if (isCold() || actor.getSnapshot().value === "failed") return;
     if (actor.getSnapshot().value === "restarting") {
       // The caller restored the source before invalidating. Do not initialize a
       // replacement's config while the timed-out mutation is still on disk.
@@ -230,6 +230,7 @@ export const openWarmRunner = Effect.fn("TestRunner.openWarm")(function* (dir: S
     const pool = active.quiesce();
     const started = yield* attempt(() => pool.started).pipe(Effect.timeout(500), Effect.result);
     const clean = yield* active.tree.reap(active.child.pid === undefined ? [] : [active.child.pid], active.retained);
+    if (clean !== "clean" || started._tag === "Failure") return false;
     yield* attempt(() => pool.done).pipe(Effect.timeout(100), Effect.result);
     const settled = yield* attempt(() => pending).pipe(Effect.timeout(500), Effect.result);
     const health = settled._tag === "Success" ? yield* attempt(() => active.request({ type: "ping" })).pipe(Effect.timeout(500), Effect.result) : settled;
@@ -291,7 +292,12 @@ export const openWarmRunner = Effect.fn("TestRunner.openWarm")(function* (dir: S
     yield* Effect.sync(() => options.onPoolReset?.());
     active?.post({ type: "cancel" });
     if (active?.runPending && (yield* finish(active, active.runPending).pipe(Effect.orDie))) yield* send(actor, { type: "DONE" });
-    else yield* retire.pipe(Effect.orDie);
+    else {
+      yield* retire.pipe(Effect.orDie);
+      // A cancelled run must not start a fresh host from its restore finalizer.
+      yield* Effect.sync(() => onFallback("Interrupted run retired its unhealthy host"));
+      yield* send(actor, { type: "FALLBACK" });
+    }
   }))));
   const disable = Effect.gen(function* () {
     if (isCold()) return;

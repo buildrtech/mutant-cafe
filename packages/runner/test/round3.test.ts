@@ -26,7 +26,8 @@ const run = (settings: RunConfig, mutants: ReadonlyArray<Mutant>) => runMutants(
   Effect.provideService(MutantSource, source), Effect.provideService(Reporter, { progress: () => Effect.void, write: () => Effect.void }));
 const fixture = (code: string, check: string, options = "") => Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem;
-  const root = yield* fs.makeTempDirectoryScoped({ directory: `${workspace}/packages/runner/test/fixtures`, prefix: "round-three-" });
+  const root = yield* fs.makeTempDirectoryScoped({ prefix: "round-three-" });
+  yield* fs.symlink(`${workspace}/packages/runner/node_modules`, `${root}/node_modules`);
   yield* fs.makeDirectory(`${root}/src`);
   yield* fs.makeDirectory(`${root}/checks`);
   yield* fs.writeFileString(`${root}/package.json`, JSON.stringify({ type: "module", scripts: { test: "vitest run" } }));
@@ -107,8 +108,10 @@ describe("round three regression proof", () => {
 
   it.live("uses observed concurrency and preserves parity at Vitest's default worker count", () => Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem;
-    const root = yield* fs.makeTempDirectoryScoped({ directory: `${workspace}/packages/runner/test/fixtures`, prefix: "default-workers-" });
+    const root = yield* fs.makeTempDirectoryScoped({ prefix: "default-workers-" });
     yield* fs.copy(`${workspace}/packages/runner/test/fixtures/parallel`, root);
+    yield* fs.symlink(`${workspace}/packages/runner/node_modules`, `${root}/node_modules`);
+    yield* fs.writeFileString(`${root}/tsconfig.json`, JSON.stringify({ compilerOptions: { target: "ES2022", module: "NodeNext", moduleResolution: "NodeNext", allowImportingTsExtensions: true, noEmit: true }, include: ["src"] }));
     yield* fs.writeFileString(`${root}/vitest.config.ts`, 'export default { test: { include: ["checks/*.fixture.mjs"] } };');
     const original = yield* fs.readFileString(`${root}/src/value.ts`);
     const mutants = [replace(original, "Effect.succeed(1)", "Effect.succeed(2)", "wrong"), replace(original, "unused = () => true", "unused = () => false", "unused", "src/value.ts", "BooleanFlip")];

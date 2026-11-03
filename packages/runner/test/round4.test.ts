@@ -24,7 +24,8 @@ const code = "export const value = () => 1;";
 const mutant = (id: string, value: number): Mutant => ({ id, file: "src/value.ts", functionName: "value", returnType: "number", genre: "BooleanFlip", description: id, synthetic: false, span: { start: { line: 1, column: 1 }, end: { line: 1, column: 2 } }, replacement: { startOffset: code.indexOf("1"), endOffset: code.indexOf("1") + 1, text: String(value) } });
 const fixture = (test = 'import { it, expect } from "vitest"; import { value } from "../src/value.ts"; it("value", () => expect(value()).toBe(1));', options = "") => Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem;
-  const root = yield* fs.makeTempDirectoryScoped({ directory: `${workspace}/packages/runner/test/fixtures`, prefix: "round-four-" });
+  const root = yield* fs.makeTempDirectoryScoped({ prefix: "round-four-" });
+  yield* fs.symlink(`${workspace}/packages/runner/node_modules`, `${root}/node_modules`);
   yield* fs.makeDirectory(`${root}/src`); yield* fs.makeDirectory(`${root}/checks`);
   yield* fs.writeFileString(`${root}/package.json`, JSON.stringify({ type: "module", scripts: { test: "vitest run" } }));
   yield* fs.writeFileString(`${root}/tsconfig.json`, JSON.stringify({ compilerOptions: { target: "ES2022", module: "NodeNext", moduleResolution: "NodeNext", noEmit: true }, include: ["src"] }));
@@ -130,7 +131,7 @@ describe("round four correctness gates", () => {
 
   it.live("warns about unowned scratch argv without treating it as ownership", () => Effect.gen(function* () {
     const warnings: string[] = []; const original = yield* Console.Console;
-    const tree = yield* acquireProcessTree("/synthetic/scratch").pipe(Effect.provideService(ProcessInspector, { inspect: args => Effect.succeed({ stdout: args.includes("pid=,args=") ? "2147483000 /synthetic/scratch/child\n" : "2147483000 1 2147483000 S Tue Nov 3 00:00:00 2026\n" }) }));
+    const tree = yield* acquireProcessTree("/synthetic/scratch").pipe(Effect.provideService(ProcessInspector, { inspect: _args => Effect.succeed({ stdout: "2147483000 1 2147483000 S Tue Nov 3 00:00:00 2026 /synthetic/scratch/child\n" }) }));
     expect(yield* tree.reap([]).pipe(Effect.provideService(Console.Console, { ...original, warn: (...args: ReadonlyArray<unknown>) => { warnings.push(args.join(" ")); } }))).toBe("clean");
     expect(warnings.some(message => message.includes("unowned scratch-related process PIDs 2147483000") && message.includes("not signalled"))).toBe(true);
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)));

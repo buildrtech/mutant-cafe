@@ -40,7 +40,7 @@ const withPorts = <A, E, R>(effect: Effect.Effect<A, E, R>, reports: Array<RunRe
 
 const selectionFixture = Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem;
-  const dir = yield* fs.makeTempDirectoryScoped({ directory: root, prefix: "selection-" });
+  const dir = yield* fs.makeTempDirectoryScoped({ prefix: "selection-" });
   yield* fs.symlink(`${root}/node_modules`, `${dir}/node_modules`);
   yield* fs.makeDirectory(`${dir}/src`);
   yield* fs.makeDirectory(`${dir}/test`);

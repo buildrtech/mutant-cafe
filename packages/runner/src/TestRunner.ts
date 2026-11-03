@@ -31,6 +31,7 @@ export const TestRunnerLive = Layer.effect(TestRunner, Effect.gen(function* () {
   const backstopTotals = new Map<string, number>();
   const onBackstop = (dir: string) => (ms: number) => { backstopTotals.set(dir, (backstopTotals.get(dir) ?? 0) + ms); };
   const scopes = new Map<string, Scope.Scope>();
+  const openedAt = new Map<string, number>();
   const selectors = new Map<string, Effect.Success<ReturnType<typeof openWarmRunner>>>();
   let automaticMode: "pending" | "cold" | "warm" = "pending";
   let hostRestarts = 0;
@@ -64,7 +65,7 @@ export const TestRunnerLive = Layer.effect(TestRunner, Effect.gen(function* () {
     // Keep diagnostics off stdout so GitHub output is a Markdown document.
     if (timeoutMs === undefined) yield* Console.error(`Baseline command: ${command.join(" ")} (cwd: ${dir.path})`);
     const started = yield* Clock.currentTimeMillis;
-    const owned = yield* acquireProcessTree(dir.path, onBackstop(dir.path)).pipe(Effect.provideService(FileSystem.FileSystem, fs),
+    const owned = yield* acquireProcessTree(dir.path, onBackstop(dir.path), openedAt.get(dir.path)).pipe(Effect.provideService(FileSystem.FileSystem, fs),
       Effect.mapError(error => new TestSpawnError({ command, message: String(error) })));
     const chunks: Array<string> = [];
     let exitCode = 1;
@@ -141,14 +142,15 @@ export const TestRunnerLive = Layer.effect(TestRunner, Effect.gen(function* () {
     stats: Effect.sync(() => ({ hostRestarts, poolResets })),
     open: Effect.fn("TestRunner.open")(function* (dir: ScratchDir, cold: boolean, warm = false, mutants = 1) {
       scopes.set(dir.path, yield* Scope.Scope);
+      openedAt.set(dir.path, yield* Clock.currentTimeMillis);
       yield* Effect.addFinalizer(() => Effect.sync(() => {
-        sessions.delete(dir.path); selectors.delete(dir.path); auto.delete(dir.path); primers.delete(dir.path); scopes.delete(dir.path); backstopTotals.delete(dir.path);
+        sessions.delete(dir.path); selectors.delete(dir.path); auto.delete(dir.path); primers.delete(dir.path); scopes.delete(dir.path); backstopTotals.delete(dir.path); openedAt.delete(dir.path);
         if (scopes.size === 0) { warmDisabled = false; automaticMode = "pending"; hostRestarts = 0; poolResets = 0; warned = false; modeReason = undefined; }
       }));
       if (cold) modeReason = "Explicit --cold";
       if (cold || warmDisabled || (!warm && automaticMode === "cold")) return;
       const started = yield* Clock.currentTimeMillis;
-      const session = yield* openWarmRunner(dir, reason => { warmDisabled = true; modeReason = reason; }, { ...sessionOptions, quiet: !warm, warn, onBackstop: onBackstop(dir.path) }).pipe(Effect.provideService(FileSystem.FileSystem, fs), Effect.mapError(error => error._tag === "TestSpawnError" ? error : new TestSpawnError({ command: ["vitest", "warm"], message: String(error) })));
+      const session = yield* openWarmRunner(dir, reason => { warmDisabled = true; modeReason = reason; }, { ...sessionOptions, quiet: !warm, warn, onBackstop: onBackstop(dir.path), processesSince: openedAt.get(dir.path) }).pipe(Effect.provideService(FileSystem.FileSystem, fs), Effect.mapError(error => error._tag === "TestSpawnError" ? error : new TestSpawnError({ command: ["vitest", "warm"], message: String(error) })));
       sessions.set(dir.path, session);
       if (warmDisabled || (!warm && automaticMode === "cold")) { yield* session.disable; return; }
       if (warm) modeReason = "Explicit --warm; supported configuration";
@@ -163,7 +165,7 @@ export const TestRunnerLive = Layer.effect(TestRunner, Effect.gen(function* () {
       if (!selector) {
         const scope = scopes.get(dir.path);
         if (!scope) return undefined;
-        selector = yield* openWarmRunner(dir, () => {}, { quiet: true, selectionOnly: true, onBackstop: onBackstop(dir.path) }).pipe(Effect.provideService(FileSystem.FileSystem, fs),
+        selector = yield* openWarmRunner(dir, () => {}, { quiet: true, selectionOnly: true, onBackstop: onBackstop(dir.path), processesSince: openedAt.get(dir.path) }).pipe(Effect.provideService(FileSystem.FileSystem, fs),
           Effect.provideService(Scope.Scope, scope), Effect.mapError(error => error._tag === "TestSpawnError" ? error : new TestSpawnError({ command: ["vitest", "select"], message: String(error) })));
         selectors.set(dir.path, selector);
       }

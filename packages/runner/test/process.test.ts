@@ -22,12 +22,21 @@ const records = (proof: string): ReadonlyArray<Pid> => readFileSync(proof, "utf8
   return value._tag === "Some" ? [value.value] : [];
 });
 const birth = (pid: number, field = "lstart") => {
-  try { return execFileSync("ps", ["-p", String(pid), "-o", field + "="], { encoding: "utf8", timeout: 2000, env: { ...process.env, TZ: "UTC", LC_ALL: "C" }, stdio: ["ignore", "pipe", "ignore"] }).trim(); }
+  try { return execFileSync("ps", ["-p", String(pid), "-o", field + "="], { encoding: "utf8", timeout: 250, env: { ...process.env, TZ: "UTC", LC_ALL: "C" }, stdio: ["ignore", "pipe", "ignore"] }).trim(); }
   catch { return ""; }
 };
 const alive = (item: Pid) => {
   const identity = /^(\S+)\s+(.+)$/.exec(birth(item.pid, "stat=,lstart"));
   return identity !== null && !identity[1]!.startsWith("Z") && identity[2] === item.birth;
+};
+const survivorsOf = (items: ReadonlyArray<Pid>) => {
+  const deadline = performance.now() + 2500;
+  const survivors: Pid[] = [];
+  for (const item of new Map(items.map(item => [`${item.pid}:${item.birth}`, item])).values()) {
+    if (performance.now() >= deadline) throw new Error("Independent PID verification exceeded 2500 ms");
+    if (alive(item)) survivors.push(item);
+  }
+  return survivors;
 };
 const waitForEscape = (proof: string) => Effect.callback<void>(resume => {
   const check = () => { if (records(proof).some(item => item.kind === "escaped")) { observer.close(); resume(Effect.void); } };
@@ -38,7 +47,8 @@ const waitForEscape = (proof: string) => Effect.callback<void>(resume => {
 
 // This suite executes mutant fixtures. Run on the assigned mutation host only.
 for (const mode of ["cold", "warm"]) {
-  for (const scenario of ["busy", "escaped", "worker-timeout", "normal", "minimal-env", "unhandled", "cancel", "crash", "sigint"]) {
+  for (const scenario of ["busy", "escaped", "worker-timeout", "worker-timeout-interrupt", "normal", "minimal-env", "unhandled", "cancel", "crash", "sigint"]) {
+    if (mode === "cold" && scenario === "worker-timeout-interrupt") continue;
     it.live(`${mode}: reaps owned PIDs after ${scenario}, including new sessions`, () => Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
       const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
@@ -47,13 +57,16 @@ for (const mode of ["cold", "warm"]) {
       yield* fs.writeFileString(proof, "");
       // A failed proof must not itself leave the fixture's busy loops running.
       yield* Effect.addFinalizer(() => Effect.sync(() => {
-        for (const item of records(proof)) {
+        const deadline = performance.now() + 2500;
+        for (const item of new Map(records(proof).map(item => [`${item.pid}:${item.birth}`, item])).values()) {
+          if (performance.now() >= deadline) return false;
           if (item.pid === process.pid || !alive(item)) continue;
           try { process.kill(item.pid, "SIGKILL"); } catch { /* Already exited. Never signal a reused PID. */ }
         }
-      }));
+        return true;
+      }).pipe(Effect.flatMap(clean => clean ? Effect.void : Effect.logWarning("Proof cleanup reached its 2500 ms deadline; unverified PIDs were not signalled"))));
       const handle = yield* spawner.spawn(ChildProcess.make(process.execPath, [`${fixture}/driver.mjs`, mode, scenario, proof], {
-        cwd: fixture, detached: true, killSignal: "SIGINT", forceKillAfter: "10 seconds", stdin: "ignore", stdout: "pipe", stderr: "inherit"
+        cwd: fixture, detached: true, killSignal: "SIGINT", forceKillAfter: "3 seconds", stdin: "ignore", stdout: "pipe", stderr: "inherit"
       }));
       const output: string[] = [];
       const collected = yield* handle.stdout.pipe(Stream.decodeText(), Stream.runForEach(chunk => Effect.sync(() => { output.push(chunk); })), Effect.forkChild);
@@ -69,8 +82,12 @@ for (const mode of ["cold", "warm"]) {
       yield* Fiber.join(collected);
       if (scenario !== "sigint") {
         expect(code, output.join("")).toBe(0);
-        const metrics = yield* Schema.decodeEffect(Schema.fromJsonString(Schema.Struct({ hostRestarts: Schema.Int, poolResets: Schema.Int })))(yield* fs.readFileString(proof + ".summary.json"));
-        if (mode === "warm" && scenario !== "crash") { expect(metrics.hostRestarts).toBe(0); expect(metrics.poolResets).toBe(["busy", "escaped", "cancel"].includes(scenario) ? 1 : 0); }
+        const metrics = yield* Schema.decodeEffect(Schema.fromJsonString(Schema.Struct({ hostRestarts: Schema.Int, poolResets: Schema.Int, workerTimeoutMs: Schema.optional(Schema.Finite), interruptTeardownMs: Schema.optional(Schema.Finite) })))(yield* fs.readFileString(proof + ".summary.json"));
+        if (mode === "warm" && scenario !== "crash") { expect(metrics.hostRestarts).toBe(0); expect(metrics.poolResets).toBe(["busy", "escaped", "cancel", "worker-timeout-interrupt"].includes(scenario) ? 1 : 0); }
+      }
+      if (scenario === "worker-timeout" || scenario === "worker-timeout-interrupt") {
+        const timings = yield* Schema.decodeEffect(Schema.fromJsonString(Schema.Struct({ workerTimeoutMs: Schema.optional(Schema.Finite), interruptTeardownMs: Schema.optional(Schema.Finite) })))(yield* fs.readFileString(proof + ".summary.json"));
+        expect(timings[scenario === "worker-timeout" ? "workerTimeoutMs" : "interruptTeardownMs"]).toBeLessThan(scenario === "worker-timeout" ? 7000 : 5000);
       }
       expect(yield* handle.isRunning).toBe(false);
       const observed = records(proof);
@@ -81,7 +98,7 @@ for (const mode of ["cold", "warm"]) {
         expect(escaped.length).toBeGreaterThan(0);
         expect(escaped.every(item => item.pgid === item.pid)).toBe(true);
       }
-      expect(observed.filter(alive).map(item => item.pid)).toEqual([]);
+      expect(survivorsOf(observed).map(item => item.pid)).toEqual([]);
       const artifact = process.env.MUTANT_CAFE_PROCESS_PROOF;
       if (artifact) yield* fs.writeFileString(`${artifact}-${mode}-${scenario}.json`, JSON.stringify({ mode, scenario, driverPid: handle.pid, code, observed }, null, 2));
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)), 60_000);

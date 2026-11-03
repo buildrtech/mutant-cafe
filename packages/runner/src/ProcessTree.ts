@@ -24,8 +24,9 @@ const execute = promisify(execFile);
 const liveLedgers = new Set<string>();
 export const ProcessInspector = Context.Reference<{
   readonly inspect: (args: ReadonlyArray<string>) => Effect.Effect<{ readonly stdout: string }, TestSpawnError>;
+  readonly signal?: (pid: number, signal: "SIGSTOP" | "SIGKILL") => void;
 }>("mutant.cafe/ProcessInspector", { defaultValue: () => ({ inspect: args => Effect.tryPromise({
-  try: () => execute("ps", [...args], { encoding: "utf8", maxBuffer: 32 * 1024 * 1024, timeout: 5000, env: { PATH: process.env.PATH, LC_ALL: "C", TZ: "UTC" } }),
+  try: signal => execute("ps", [...args], { signal, encoding: "utf8", maxBuffer: 32 * 1024 * 1024, timeout: 400, env: { PATH: process.env.PATH, LC_ALL: "C", TZ: "UTC" } }),
   catch: () => new TestSpawnError({ command: ["ps"], message: "Cannot inspect owned test processes" })
 }) }) });
 const tokenKey = "MUTANT_CAFE_PROCESS_TOKEN";
@@ -97,14 +98,14 @@ syncBuiltinESMExports();
 
 const Record = Schema.Struct({ pid: Schema.Int, birth: Schema.String });
 type Record = typeof Record.Type;
-interface ProcessInfo extends Record { readonly ppid: number; readonly pgid: number; readonly state: string }
+interface ProcessInfo extends Record { readonly ppid: number; readonly pgid: number; readonly state: string; readonly argv: string }
 interface CleanupState {
   readonly pending: ReadonlyArray<ProcessInfo>;
   readonly round: number;
   readonly failure: string | undefined;
 }
 
-export const acquireProcessTree = Effect.fn("ProcessTree.acquire")(function* (scratch?: string, onBackstop?: (durationMs: number) => void) {
+export const acquireProcessTree = Effect.fn("ProcessTree.acquire")(function* (scratch?: string, onBackstop?: (durationMs: number) => void, processesSince?: number) {
   const fs = yield* FileSystem.FileSystem;
   const directory = yield* fs.makeTempDirectory({ prefix: "mutant-processes-" });
   const ledger = `${directory}/pids.jsonl`;
@@ -117,40 +118,60 @@ export const acquireProcessTree = Effect.fn("ProcessTree.acquire")(function* (sc
   const roots = new Set<number>();
   const command = ["vitest", "process-cleanup"];
   // Never include inspector output: it can contain environment values.
-  const { inspect } = yield* ProcessInspector;
+  const inspector = yield* ProcessInspector;
+  // The complete sweep, not each PID or retry, owns this deadline. Actor tasks
+  // must be interruptible too: stopping their host waits for invocation cleanup.
+  let deadline = Infinity;
+  let lastSnapshot: Map<number, ProcessInfo> | undefined;
+  let ledgerRows: ReadonlyArray<Record> = [];
+  const verified = new Map<number, ProcessInfo>();
+  const kill = inspector.signal ?? ((pid: number, signal: "SIGSTOP" | "SIGKILL") => { process.kill(pid, signal); });
+  const bounded = <A, E, R>(phase: string, effect: Effect.Effect<A, E, R>, limit = 1000) => Effect.suspend(() => {
+    const remaining = Math.min(limit, deadline - performance.now());
+    if (remaining <= 0) return Effect.fail(new TestSpawnError({ command, message: `Cleanup deadline exceeded during ${phase}` }));
+    return effect.pipe(Effect.interruptible, Effect.timeout(remaining), Effect.mapError(() => new TestSpawnError({ command, message: `Cleanup ${phase} failed or exceeded its ${Math.ceil(remaining)} ms budget` })));
+  });
+  const inspect = (args: ReadonlyArray<string>) => bounded("ps inspection", inspector.inspect(args), 400);
   const snapshot = Effect.gen(function* () {
-    const result = yield* inspect(["-A", "-o", "pid=,ppid=,pgid=,stat=,lstart="]);
+    const result = yield* inspect(["-A", "-ww", "-o", "pid=,ppid=,pgid=,stat=,lstart=,args="]);
     const found = new Map<number, ProcessInfo>();
     for (const line of result.stdout.split("\n")) {
-      const match = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(.+)$/.exec(line);
+      const match = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+((?:Sun|Mon|Tue|Wed|Thu|Fri|Sat)\s+\w{3}\s+\d+\s+\d{2}:\d{2}:\d{2}\s+\d{4})(?:\s+(.*))?$/.exec(line);
       if (!match) continue;
       const pid = Number(match[1]);
-      if (pid !== process.pid && !match[4]!.startsWith("Z")) found.set(pid, { pid, ppid: Number(match[2]), pgid: Number(match[3]), state: match[4]!, birth: match[5]!.trim() });
+      if (pid !== process.pid && !match[4]!.startsWith("Z")) found.set(pid, { pid, ppid: Number(match[2]), pgid: Number(match[3]), state: match[4]!, birth: match[5]!.trim(), argv: match[6] ?? "" });
     }
+    for (const [pid, item] of verified) if (found.get(pid)?.birth !== item.birth) verified.delete(pid);
+    lastSnapshot = found;
     return found;
   });
   const discover = (preserved: ReadonlySet<number>, retained: ReadonlyArray<Record>) => Effect.gen(function* () {
+    const registered = yield* fs.readFileString(ledger).pipe(Effect.mapError(() => new TestSpawnError({ command, message: "Cannot read the test process ownership ledger" })));
+    ledgerRows = registered.split("\n").flatMap(line => {
+      const parsed = Schema.decodeOption(Schema.fromJsonString(Record))(line);
+      return parsed._tag === "Some" ? [parsed.value] : [];
+    });
     const table = yield* snapshot;
     const keep = new Set(preserved);
     const subtrees = new Set(retained.filter(item => table.get(item.pid)?.birth === item.birth).map(item => item.pid));
     let keepAdded: boolean;
     do { keepAdded = false; for (const item of table.values()) if (subtrees.has(item.ppid) && !subtrees.has(item.pid)) { subtrees.add(item.pid); keepAdded = true; } } while (keepAdded);
     for (const pid of subtrees) keep.add(pid);
-    const registered = yield* fs.readFileString(ledger).pipe(Effect.mapError(() => new TestSpawnError({ command, message: "Cannot read the test process ownership ledger" })));
     const owned = new Set<number>();
+    const claim = (pid: number) => {
+      owned.add(pid);
+      const item = table.get(pid);
+      if (item && !keep.has(pid)) verified.set(pid, item);
+    };
     const uncertain = new Set<number>();
-    for (const line of registered.split("\n")) {
-      if (!line) continue;
-      const parsed = Schema.decodeOption(Schema.fromJsonString(Record))(line);
-      if (parsed._tag === "Some" && table.get(parsed.value.pid)?.birth === parsed.value.birth) owned.add(parsed.value.pid);
-    }
+    for (const item of ledgerRows) if (table.get(item.pid)?.birth === item.birth) claim(item.pid);
     // A child may have daemonized and lost its PPID before cleanup. Its inherited
     // unguessable label remains evidence of ownership even across setsid/exec.
     // This raw output is never logged, returned, or stored in the report.
     if (process.platform === "linux") {
       yield* Effect.forEach([...table.keys()], pid => fs.readFileString(`/proc/${pid}/environ`).pipe(
         Effect.catch(() => Effect.succeed("")), Effect.tap(environment => Effect.sync(() => {
-          if (environment.split("\0").includes(`${tokenKey}=${token}`)) owned.add(pid);
+          if (environment.split("\0").includes(`${tokenKey}=${token}`)) claim(pid);
         }))), { concurrency: 8, discard: true });
     } else {
       const labelled = yield* inspect(["axeww", "-o", "pid=,lstart=,command="]);
@@ -175,7 +196,7 @@ export const acquireProcessTree = Effect.fn("ProcessTree.acquire")(function* (sc
     let added: boolean;
     do {
       added = false;
-      for (const item of table.values()) if (owned.has(item.ppid) && !owned.has(item.pid)) { owned.add(item.pid); added = true; }
+      for (const item of table.values()) if (owned.has(item.ppid) && !owned.has(item.pid)) { claim(item.pid); added = true; }
     } while (added);
     // Darwin's ps output cannot distinguish a copied label inside an env value
     // from an actual key. A label alone must never authorize signalling another
@@ -191,9 +212,9 @@ export const acquireProcessTree = Effect.fn("ProcessTree.acquire")(function* (sc
       if (current.get(item.pid)?.birth !== item.birth) continue; // PID was reused: it is no longer ours.
       yield* Effect.sync(() => {
         try {
-          if (roots.has(item.pid) && current.get(item.pid)?.pgid === item.pid) process.kill(-item.pid, value);
+          if (roots.has(item.pid) && current.get(item.pid)?.pgid === item.pid) kill(-item.pid, value);
         } catch { /* The group may already be gone. Still check the PID. */ }
-        try { process.kill(item.pid, value); }
+        try { kill(item.pid, value); }
         catch { /* Verification below reports any survivor by PID. */ }
       });
     }
@@ -201,22 +222,23 @@ export const acquireProcessTree = Effect.fn("ProcessTree.acquire")(function* (sc
   // A scratch-path match nominates a survivor for warning, never for killing.
   const inspectUnowned = Effect.gen(function* () {
     if (!scratch) return;
-    const table = yield* snapshot;
+    const table = lastSnapshot ?? (yield* snapshot);
     const registered = yield* Effect.forEach([...liveLedgers], path => fs.readFileString(path).pipe(Effect.catch(() => Effect.succeed(""))));
     const known = new Set(registered.join("\n").split("\n").flatMap(line => {
       const parsed = Schema.decodeOption(Schema.fromJsonString(Record))(line);
       return parsed._tag === "Some" && table.get(parsed.value.pid)?.birth === parsed.value.birth ? [parsed.value.pid] : [];
     }));
     const candidates = new Set<number>();
-    const argv = yield* inspect(["-A", "-o", "pid=,args="]);
-    for (const line of argv.stdout.split("\n")) {
-      const row = /^\s*(\d+)\s+(.+)$/.exec(line);
-      if (row && row[2]!.includes(scratch)) candidates.add(Number(row[1]));
-    }
-    if (process.platform === "linux") yield* Effect.forEach([...table.keys()].filter(pid => !known.has(pid)), pid => fs.readLink(`/proc/${pid}/cwd`).pipe(
+    // A process older than this scratch session cannot have been started by its
+    // tests. Round down for ps's one-second birth precision. No signal uses this
+    // warning-only fence; Linux ownership-label discovery remains unchanged.
+    const since = processesSince === undefined ? -Infinity : Math.floor(processesSince / 1000) * 1000;
+    const possible = [...table.values()].filter(item => !known.has(item.pid) && (processesSince === undefined || Date.parse(item.birth + " UTC") >= since));
+    for (const item of possible) if (item.argv.includes(scratch)) candidates.add(item.pid);
+    if (process.platform === "linux") yield* Effect.forEach(possible.map(item => item.pid), pid => fs.readLink(`/proc/${pid}/cwd`).pipe(
       Effect.catch(() => Effect.succeed("")), Effect.tap(cwd => Effect.sync(() => { if (cwd === scratch || cwd.startsWith(scratch + "/")) candidates.add(pid); }))), { concurrency: 8, discard: true });
-    else if (process.platform === "darwin") {
-      const cwd = yield* Effect.tryPromise({ try: () => execute("lsof", ["-a", "-d", "cwd", "-Fpn"], { encoding: "utf8", timeout: 5000, maxBuffer: 32 * 1024 * 1024, env: { PATH: process.env.PATH, LC_ALL: "C" } }), catch: () => new TestSpawnError({ command: ["lsof"], message: "Cannot inspect scratch working directories" }) }).pipe(Effect.catch(() => Console.warn("Warning: cannot inspect scratch working directories; argv backstop remains active").pipe(Effect.as({ stdout: "" }))));
+    else if (process.platform === "darwin" && possible.length) {
+      const cwd = yield* Effect.tryPromise({ try: signal => execute("lsof", ["-a", "-d", "cwd", "-p", possible.map(item => item.pid).join(","), "-Fpn"], { signal, encoding: "utf8", timeout: 200, maxBuffer: 32 * 1024 * 1024, env: { PATH: process.env.PATH, LC_ALL: "C" } }), catch: () => new TestSpawnError({ command: ["lsof"], message: "Cannot inspect scratch working directories" }) }).pipe(Effect.catch(() => Console.warn("Warning: cannot inspect scratch working directories; argv backstop remains active").pipe(Effect.as({ stdout: "" }))));
       let pid = 0;
       for (const row of cwd.stdout.split("\n")) {
         if (row.startsWith("p")) pid = Number(row.slice(1));
@@ -228,7 +250,7 @@ export const acquireProcessTree = Effect.fn("ProcessTree.acquire")(function* (sc
   }).pipe(Effect.catch(() => Console.warn("Warning: cannot inspect unowned scratch-related survivors; no unverified PID was signalled")));
   const warnUnowned = Effect.gen(function* () {
     const started = yield* Clock.currentTimeMillis;
-    yield* inspectUnowned;
+    yield* bounded("scratch backstop", inspectUnowned, 200).pipe(Effect.catch(error => Console.warn(`Warning: ${error.message}; unowned PIDs were not signalled`)));
     const elapsed = Math.max(0, (yield* Clock.currentTimeMillis) - started);
     yield* Effect.sync(() => onBackstop?.(elapsed));
   });
@@ -236,10 +258,14 @@ export const acquireProcessTree = Effect.fn("ProcessTree.acquire")(function* (sc
   type Outcome = "clean" | "warning";
   let closed: Outcome | undefined;
   const sweep = (preserved: ReadonlyArray<number>, retained: ReadonlyArray<Record> = []) => Effect.scoped(Effect.gen(function* () {
+  deadline = performance.now() + 1500;
+  lastSnapshot = undefined;
+  ledgerRows = [];
+  verified.clear();
   const keep = new Set(preserved);
-  const discovering = createEffectLogic(() => discover(keep, retained).pipe(Effect.result));
-  const stopping = createEffectLogic(({ input }: { input: ReadonlyArray<ProcessInfo> }) => signal(input, "SIGSTOP").pipe(Effect.result));
-  const killing = createEffectLogic(({ input }: { input: ReadonlyArray<ProcessInfo> }) => signal(input, "SIGKILL").pipe(Effect.result));
+  const discovering = createEffectLogic(() => bounded("discovery", discover(keep, retained)).pipe(Effect.result));
+  const stopping = createEffectLogic(({ input }: { input: ReadonlyArray<ProcessInfo> }) => bounded("stop", signal(input, "SIGSTOP"), 400).pipe(Effect.result));
+  const killing = createEffectLogic(({ input }: { input: ReadonlyArray<ProcessInfo> }) => bounded("kill", signal(input, "SIGKILL"), 400).pipe(Effect.result));
   // tracking -> discovering -> stopping -> killing -> verifying -> closed.
   // A newly discovered descendant repeats stopping. Unverifiable ownership
   // warns rather than blocking the remaining mutation run.
@@ -270,7 +296,19 @@ export const acquireProcessTree = Effect.fn("ProcessTree.acquire")(function* (sc
   const actor = yield* createEffectActor(machine);
   yield* send(actor, { type: "CLOSE" });
   // @effect-diagnostics-next-line anyUnknownInErrorContext:off -- Inspection failures are machine outputs; join failures are unexpected actor defects.
-  const result = yield* join(actor).pipe(Effect.orDie);
+  const joined = yield* bounded("state machine", join(actor), 1300).pipe(Effect.result);
+  const result = joined._tag === "Success" ? joined.success : { ...actor.getSnapshot().context, failure: joined.failure.message };
+  if (result.failure) {
+    yield* Effect.sync(() => {
+      actor.stop();
+      // A deadline cannot abandon children already birth-matched in this sweep.
+      // No further inspection is required, and stale ledger-only PIDs never enter
+      // this set. Signal individual PIDs, not groups that may contain keepers.
+      for (const item of verified.values()) { try { kill(item.pid, "SIGKILL"); } catch { /* Warn below; exit could not be verified. */ } }
+    });
+    const unverified = [...new Set(ledgerRows.filter(item => !verified.has(item.pid) && !keep.has(item.pid)).map(item => item.pid))];
+    yield* Console.warn(`Warning: cleanup degraded; SIGKILL attempted for birth-verified PIDs ${[...verified.keys()].join(", ") || "none"}; exit unconfirmed; unverified ledger PIDs ${unverified.join(", ") || "none"} were not signalled`);
+  }
   yield* warnUnowned;
   if (result.failure) yield* Console.warn(`Warning: ${result.failure} (tracked PIDs ${(result.pending.length ? result.pending.map(item => item.pid) : [...roots]).join(", ")}); ownership ledger kept at ${ledger}; continuing without reusing the host`);
   return result.failure ? "warning" as const : "clean" as const;
@@ -281,7 +319,7 @@ export const acquireProcessTree = Effect.fn("ProcessTree.acquire")(function* (sc
   }));
   yield* Effect.addFinalizer(() => Effect.gen(function* () {
     yield* cleanup;
-    if (closed === "clean") yield* fs.remove(directory, { recursive: true }).pipe(
+    if (closed === "clean") yield* fs.remove(directory, { recursive: true }).pipe(Effect.interruptible, Effect.timeout(200),
       Effect.catch(error => Console.warn(`Warning: cannot remove process ledger directory: ${error.message}`)));
   }).pipe(Effect.ensuring(Effect.sync(() => { liveLedgers.delete(ledger); }))));
   const existing = process.env.NODE_OPTIONS ?? "";

@@ -12,6 +12,16 @@ export const ScratchLive = Layer.effect(Scratch, Effect.gen(function* () {
   const failure = (operation: string, location: string, error: { readonly message: string }) =>
     new ScratchError({ operation, path: location, message: error.message });
 
+  const skipVanished = (from: string, to: string) => <E extends PlatformError.PlatformError | ScratchError>(effect: Effect.Effect<void, E>) => effect.pipe(Effect.catch(error => {
+    if (error._tag !== "PlatformError" || error.reason._tag !== "NotFound") return Effect.fail(error);
+    return Effect.gen(function* () {
+      if (yield* fs.exists(from)) return yield* Effect.fail(error);
+      // Only our partial destination is removed, never a source entry.
+      yield* fs.remove(to, { recursive: true, force: true });
+      yield* Effect.logDebug("Scratch copy skipped a vanished source", { source: from });
+    });
+  }));
+
   return Scratch.of({
     acquire: Effect.fn("Scratch.acquire")(function* (root: string) {
       const source = path.resolve(root);
@@ -31,7 +41,7 @@ export const ScratchLive = Layer.effect(Scratch, Effect.gen(function* () {
       const temp = yield* Effect.acquireRelease(
         fs.makeTempDirectory({ prefix: "mutant-cafe-" }).pipe(
           Effect.mapError((error) => failure("create", source, error))),
-        (dir) => fs.remove(dir, { recursive: true }).pipe(Effect.orDie)
+        (dir) => fs.remove(dir, { recursive: true, force: true }).pipe(Effect.interruptible, Effect.timeout(2000), Effect.catch(error => Effect.logWarning(`Scratch removal did not complete within its cleanup budget: ${error.message}`, { path: dir })))
       );
       // Materialize source symlinks, except dependencies. No editable file in
       // the scratch tree may point back into the original checkout.
@@ -59,17 +69,19 @@ export const ScratchLive = Layer.effect(Scratch, Effect.gen(function* () {
                     if ([".vite", ".vite-temp", ".vitest", ".cache"].includes(name)) continue;
                     const dependency = path.join(from, name);
                     const destination = path.join(to, name);
-                    if (name.startsWith("@")) {
-                      yield* linkDependencies(dependency, destination);
-                      continue;
-                    }
-                    const realDependency = yield* fs.realPath(dependency);
-                    const rel = path.relative(copyRoot, realDependency);
-                    const inside = rel !== ".." && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel) && !rel.split(path.sep).includes("node_modules");
-                    yield* fs.symlink(inside ? path.join(temp, rel) : realDependency, destination);
+                    yield* Effect.gen(function* () {
+                      if (name.startsWith("@")) {
+                        yield* linkDependencies(dependency, destination);
+                        return;
+                      }
+                      const realDependency = yield* fs.realPath(dependency);
+                      const rel = path.relative(copyRoot, realDependency);
+                      const inside = rel !== ".." && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel) && !rel.split(path.sep).includes("node_modules");
+                      yield* fs.symlink(inside ? path.join(temp, rel) : realDependency, destination);
+                    }).pipe(skipVanished(dependency, destination));
                   }
                 });
-                yield* linkDependencies(src, dest);
+                yield* linkDependencies(src, dest).pipe(skipVanished(src, dest));
               } else {
                 yield* copy(src, dest, [...ancestors, real]);
               }
@@ -77,7 +89,7 @@ export const ScratchLive = Layer.effect(Scratch, Effect.gen(function* () {
           } else if (info.type === "File") {
             yield* fs.copyFile(from, to);
           }
-        }).pipe(Effect.mapError((error) => failure("copy", from, error)));
+        }).pipe(skipVanished(from, to), Effect.mapError((error) => failure("copy", from, error)));
       yield* copy(copyRoot, temp, []);
       const packageRoot = yield* fs.realPath(path.join(temp, path.relative(copyRoot, source))).pipe(
         Effect.mapError((error) => failure("resolve", source, error)));
