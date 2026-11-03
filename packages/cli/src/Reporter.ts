@@ -75,7 +75,7 @@ export const makeReporter = Effect.fn("makeReporter")(function*(options: {
   // Encode the actual core contract, not a second report shape.
   const encodedMutants = yield* Schema.encodeEffect(Schema.fromJsonString(Schema.Array(Mutant)))(options.mutants).pipe(Effect.mapError(writeError));
   yield* fs.writeFileString(path.join(dir, "mutants.json"), encodedMutants).pipe(Effect.mapError(writeError));
-  yield* fs.writeFileString(path.join(dir, "not-mutated.txt"), (options.notMutated ?? []).map(item => `${path.relative(options.root, item.file)}: ${item.functionName}: ${item.reason}\n`).join("")).pipe(Effect.mapError(writeError));
+  yield* fs.writeFileString(path.join(dir, "not-mutated.txt"), (options.notMutated ?? []).map(item => `${path.relative(options.root, item.file)}:${item.span?.start.line ?? 1}:${item.span?.start.column ?? 1}: ${item.functionName}: ${item.reason}\n`).join("")).pipe(Effect.mapError(writeError));
   yield* Effect.forEach(outcomes, (outcome) => fs.writeFileString(path.join(dir, `${outcome}.txt`), ""), { discard: true }).pipe(Effect.mapError(writeError));
   for (const mutant of options.mutants) {
     const original = yield* fs.readFileString(path.resolve(options.root, mutant.file)).pipe(Effect.mapError(writeError));

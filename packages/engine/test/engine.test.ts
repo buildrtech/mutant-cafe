@@ -9,6 +9,7 @@ import { describe, expect } from "vitest";
 import { it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
+import * as Result from "effect/Result";
 import * as Stream from "effect/Stream";
 import { MutantSource, type Mutant, type RunConfig } from "@mutant-cafe/core";
 import { makeMutantSource, makeTypeScriptOracle, MutantSourceLive } from "../src/index.ts";
@@ -54,6 +55,123 @@ function loadMutation<A = AccountModule>(mutant: Mutant) {
   });
 }
 
+describe("honest value coverage", () => {
+  const input = config("packages/engine/test/fixtures/honesty/tsconfig.json", { include: ["**/values.ts"] });
+
+  it.effect("isolates an unresolved typed call while analysing a bound generic method and its neighbours", () => Effect.gen(function* () {
+    const source = makeSource();
+    const all = { ...input, include: ["**/bound.ts", "**/unresolved.ts"] };
+    const mutants = yield* collect(source, all);
+    const bound = mutants.filter(mutant => mutant.functionName === "guardedInsert");
+    expect(bound.length).toBeGreaterThan(0);
+    expect(mutants.some(mutant => mutant.functionName === "healthy")).toBe(true);
+    for (const mutant of bound) expect((yield* source.checkViable(mutant)).diagnostics).toEqual([]);
+    const skipped = yield* source.notMutated(all);
+    const broken = skipped.find(item => item.functionName === "unresolved");
+    expect(broken?.file).toMatch(/unresolved\.ts$/);
+    expect(broken?.span?.start.line).toBe(3);
+    expect(broken?.reason).toContain("analysis failed: cannot resolve declaration for typed call missing");
+    expect(mutants.some(mutant => mutant.functionName === "unresolved")).toBe(false);
+  }), 30_000);
+
+  it.effect("covers both boolean recoveries, and exposes a one-sided assertion", () => Effect.gen(function* () {
+    const source = makeSource();
+    const mutants = yield* collect(source, input);
+    const results: boolean[] = [];
+    const weakOutcomes: string[] = [];
+    const weakTest = (exit: Exit.Exit<boolean, unknown>): void => {
+      if (Exit.isSuccess(exit)) expect(exit.value).toBe(false);
+    };
+    for (const mutant of mutants.filter(m => m.functionName === "service.allowed" && m.genre === "SwallowTag")) {
+      expect((yield* source.checkViable(mutant)).diagnostics).toEqual([]);
+      const module = yield* loadMutation<{ service: { allowed: (id: string) => Effect.Effect<boolean> } }>(mutant);
+      const exit = yield* Effect.exit(module.service.allowed("example"));
+      if (Exit.isSuccess(exit)) results.push(exit.value);
+      const weakResult = yield* Effect.result(Effect.try(() => weakTest(exit)));
+      weakOutcomes.push(Result.isFailure(weakResult) ? "caught" : "missed");
+    }
+    expect(results.sort()).toEqual([false, true]);
+    // Execute a one-sided assertion: it accepts false recovery and rejects true recovery.
+    expect(weakOutcomes.sort()).toEqual(["caught", "missed"]);
+    const modes: string[] = [];
+    for (const mutant of mutants.filter(m => m.functionName === "mode")) {
+      const module = yield* loadMutation<{ mode: (n: number) => string }>(mutant);
+      modes.push(module.mode(0));
+    }
+    expect(modes.sort()).toEqual(["a", "b", "c", "d", "e", "f", "g", "h"]);
+    const constants = mutants.filter(m => m.functionName === "always");
+    expect(constants).toHaveLength(1);
+    expect((yield* loadMutation<{ always: () => boolean }>(constants[0]!)).always()).toBe(false);
+    const generatorConstants = mutants.filter(m => m.functionName === "stable" && m.genre === "EffectSucceed");
+    expect(generatorConstants).toHaveLength(1);
+    const generator = yield* loadMutation<{ stable: () => Effect.Effect<boolean> }>(generatorConstants[0]!);
+    expect(yield* generator.stable()).toBe(false);
+  }).pipe(Effect.scoped), 30_000);
+
+  it.effect("bounds recursive Json to representatives and deduplicates collapsing values", () => Effect.gen(function* () {
+    const source = makeSource();
+    const mutants = yield* collect(source, input);
+    const json = mutants.filter(m => m.functionName === "json" && !m.description.endsWith("with _key"));
+    expect(json.length).toBeLessThanOrEqual(7);
+    const values: unknown[] = [];
+    for (const mutant of json) values.push((yield* loadMutation<{ json: (key: string) => unknown }>(mutant)).json("key"));
+    expect(new Set(values.map(value => JSON.stringify(value)))).toEqual(new Set([null, "", 0, false, [], {}, undefined].map(value => JSON.stringify(value))));
+    const collapsed: unknown[] = [];
+    for (const mutant of mutants.filter(m => m.functionName === "collapse")) collapsed.push((yield* loadMutation<{ collapse: () => unknown }>(mutant)).collapse());
+    expect(collapsed).toEqual([{ a: 0 }]);
+    const capped = (yield* source.notMutated(input)).find(item => item.functionName === "json");
+    expect(capped?.reason).toMatch(/\d+ more values not generated/);
+  }).pipe(Effect.scoped), 30_000);
+
+  it.effect("returns every assignable parameter, including branded and structural subtypes", () => Effect.gen(function* () {
+    const source = makeSource();
+    const mutants = yield* collect(source, input);
+    const branded = mutants.find(m => m.functionName === "shardId" && m.description.endsWith("with parent"));
+    expect(branded).toBeDefined();
+    if (branded) {
+      expect((yield* source.checkViable(branded)).diagnostics).toEqual([]);
+      const module = yield* loadMutation<{ shardId: (parent: string, n: number) => string }>(branded);
+      const original = yield* loadMutation<{ shardId: (parent: string, n: number) => string }>({ ...branded, replacement: { startOffset: 0, endOffset: 0, text: "" } });
+      const assertDerived = (derive: (parent: string, n: number) => string): void => expect(derive("parent", 2)).not.toBe("parent");
+      assertDerived(original.shardId);
+      expect(() => assertDerived(module.shardId)).toThrow();
+    }
+    for (const [name, parameter] of [["wider", "parent"], ["coordinates", "point"]]) {
+      const identity = mutants.find(m => m.functionName === name && m.description.endsWith(`with ${parameter}`));
+      expect(identity, name).toBeDefined();
+      if (identity) expect((yield* source.checkViable(identity)).diagnostics).toEqual([]);
+    }
+  }).pipe(Effect.scoped), 30_000);
+
+  it.effect("reports distinct real callbacks and unconstructible errors at their own locations", () => Effect.gen(function* () {
+    const source = makeSource();
+    const mutants = yield* collect(source, input);
+    const skipped = yield* source.notMutated(input);
+    const callbacks = skipped.filter(item => item.functionName.startsWith("label"));
+    expect(callbacks).toHaveLength(3);
+    expect(new Set(callbacks.map(item => JSON.stringify(item.span)))).toHaveLength(3);
+    for (const item of skipped) {
+      expect(item.span?.start.line).toBeGreaterThan(0);
+      expect(item.span?.start.column).toBeGreaterThan(0);
+      expect(item.reason).not.toContain("~effect/");
+    }
+    expect(callbacks.every(item => item.reason === "callback position (not mutated yet)")).toBe(true);
+    expect(skipped.some(item => item.functionName === "Id")).toBe(false);
+    expect(new Set(skipped.map(item => JSON.stringify(item))).size).toBe(skipped.length);
+    for (const [name, tag] of [["unavailable", "Hidden"], ["inferredUnavailable", "Hidden"], ["unbuildable", "NeedsCallback"]]) {
+      expect(skipped.find(item => item.functionName === name)?.reason).toContain(`cannot construct ${tag}:`);
+      const generated = mutants.filter(m => m.functionName === name);
+      expect(generated.filter(m => m.genre === "SwallowTag")).toHaveLength(2);
+      expect(generated.some(m => m.genre === "EffectDie")).toBe(true);
+      for (const mutant of generated) expect((yield* source.checkViable(mutant)).diagnostics, mutant.description).toEqual([]);
+    }
+    expect(mutants.some(m => m.functionName === "state")).toBe(true);
+    const stateMutant = mutants.find(m => m.functionName === "state")!;
+    expect((yield* source.checkViable(stateMutant)).diagnostics).toEqual([]);
+    expect(skipped.find(item => item.functionName === "factory")?.reason).toContain("return not synthesizable (field config); inner functions mutated");
+  }), 30_000);
+});
+
 describe("checker-directed mutation", () => {
   it.effect("keeps skips local to discovery and excludes local helpers from exported binding paths", () => Effect.gen(function* () {
     const oracle = makeTypeScriptOracle();
@@ -69,7 +187,7 @@ describe("checker-directed mutation", () => {
       expect(first.notMutated.find(item => item.functionName === name)?.reason).toContain("--exported-only");
     }
     for (const name of ["Greeter.layer.greet", "Greeter.layer.send", "parenthesized.<inner>", "blocked.<inner>", "curriedEffect.<inner>"]) expect(first.functions.some(fn => fn.name === name), name).toBe(true);
-    for (const name of ["callbacks", "argument"]) expect(second.notMutated.find(item => item.functionName === name)?.reason).toContain("unsupported function position");
+    for (const name of ["callbacks", "argument"]) expect(second.notMutated.find(item => item.functionName === `${name}.<callback>`)?.reason).toBe("callback position (not mutated yet)");
     const service = makeMutantSource(oracle);
     const curried = yield* collect(service, { ...input, functionFilter: ["parenthesized.<inner>", "blocked.<inner>", "curriedEffect.<inner>"] });
     expect(curried.length).toBeGreaterThan(6);
@@ -153,7 +271,10 @@ export const serviceFactory = () => {
     const skipped = yield* source.notMutated(input);
     expect(skipped.find(s => s.functionName === "generic")?.reason).toContain("generic");
     expect(skipped.find(s => s.functionName === "opaque")?.reason).toContain("field call");
-    expect(skipped.some(s => s.functionName === "genericElement")).toBe(true);
+    const elementIdentity = mutants.filter(m => m.functionName === "genericElement");
+    expect(elementIdentity).toHaveLength(1);
+    expect(elementIdentity[0]!.description).toContain("with xs");
+    expect((yield* source.checkViable(elementIdentity[0]!)).diagnostics).toEqual([]);
     expect(skipped.find(s => s.functionName === "reader.get")?.reason).toContain("generic");
     const restricted = yield* collect(source, { ...input, exportedOnly: true });
     expect(restricted.some(m => ["internal", "internalEffect", "untraced", "machine.guards.allowed"].includes(m.functionName))).toBe(false);

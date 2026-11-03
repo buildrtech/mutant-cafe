@@ -47,6 +47,17 @@ const selectionFixture = Effect.gen(function* () {
 });
 
 describe("real vitest mutation runs", () => {
+  it.effect("reports an empty selection without acquiring scratch or running a baseline", () => Effect.gen(function* () {
+    const reports: RunReport[] = [];
+    const result = yield* withPorts(runMutants(config(), Stream.empty), reports).pipe(
+      Effect.provideService(Scratch, { acquire: () => Effect.die("Empty selection copied a tree") }),
+      Effect.provideService(TestRunner, { baseline: () => Effect.die("Empty selection started a baseline"), runRelated: () => Effect.die("Empty selection started tests") }),
+    );
+    expect(result.results).toEqual([]);
+    expect(result.baseline).toEqual({ durationMs: 0, testCommand: [] });
+    expect(reports).toEqual([result]);
+  }).pipe(Effect.provide(NodeServices.layer)));
+
   for (const script of ["pnpm exec vitest", "npx vitest", "cross-env MODE=test vitest run", "vitest run && tsc --noEmit", "vitest --project unit"]) {
     it.live(`recognizes the Vitest wrapper ${script}`, () => Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
@@ -349,7 +360,7 @@ describe("real vitest mutation runs", () => {
       expect(report.results.map((result) => result.outcome)).toEqual(["caught", "missed"]);
     }).pipe(Effect.provide(live)), 30_000);
 
-  it.live("stops at a broken baseline without generating or testing mutants", () =>
+  it.live("selects mutants first but stops at a broken baseline without testing them", () =>
     Effect.gen(function* () {
       const scratch = yield* Scratch;
       const fs = yield* FileSystem.FileSystem;
@@ -362,7 +373,7 @@ describe("real vitest mutation runs", () => {
         ...source, generate: () => Stream.fromEffect(Effect.sync(() => { generated = true; return mutation(original, "unused", ""); }))
       }).pipe(Effect.flip);
       expect(result._tag).toBe("BaselineFailed");
-      expect(generated).toBe(false);
+      expect(generated).toBe(true);
       expect(reports).toHaveLength(1);
       expect(reports[0]?.failure).toContain("BaselineFailed");
       expect(reports[0]?.failure).toContain("vitest run");

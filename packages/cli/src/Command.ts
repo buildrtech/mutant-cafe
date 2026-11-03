@@ -135,7 +135,11 @@ export const makeCommand = (options: {
     return;
   }
   const reporter = yield* makeReporter({ root, outDir: config.outDir, mutants, notMutated, selected: counts.selected, budgetSkipped: counts.budgetSkipped, ...(markdown === undefined ? {} : { markdown }) });
-  const report = yield* options.run(config, mutants).pipe(Effect.provideService(Reporter, reporter),
+  // Selection is final here: no scratch tree or test process can add information when it is empty.
+  const report = yield* (mutants.length === 0
+    ? Effect.succeed<RunReport>({ schemaVersion: 2, tool: "mutant.cafe", root,
+      baseline: { durationMs: 0, testCommand: [] }, timeoutMs: 0, results: [] })
+    : options.run(config, mutants)).pipe(Effect.provideService(Reporter, reporter),
     Effect.catchTag("BaselineFailed", error => Effect.gen(function*() {
       const failed: RunReport = { schemaVersion: 2, tool: "mutant.cafe", root,
         baseline: { durationMs: 0, testCommand: error.command }, timeoutMs: config.timeoutMs ?? config.minimumTimeoutMs, results: [],
@@ -159,7 +163,7 @@ export const runCli = Effect.fn("runCli")(function*(options: {
 }) {
   const code = yield* Ref.make(0);
   const command = makeCommand({ ...options, onExit: (value) => Ref.set(code, value) });
-  yield* Command.runWith(command, { version: "0.1.4" })(options.args).pipe(
+  yield* Command.runWith(command, { version: "0.1.5" })(options.args).pipe(
     Effect.catch((error) => Effect.gen(function*() {
       yield* Console.error(error._tag === "ProgramLoadError" ? `${error.tsconfig}:\n${error.diagnostics.join("\n")}`
         : error._tag === "BaselineFailed" ? `Baseline failed (${error.exitCode}): ${error.command.join(" ")}\n${error.output.slice(-8000)}`

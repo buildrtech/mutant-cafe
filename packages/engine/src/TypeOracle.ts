@@ -5,15 +5,16 @@ export interface Value {
   readonly synthetic: boolean;
 }
 
-export interface TaggedValue extends Value {
-  readonly tag: string;
-}
+export type TaggedValue =
+  | (Value & { readonly tag: string; readonly reason?: never })
+  | { readonly tag: string; readonly reason: string; readonly text?: never; readonly synthetic?: never };
 
-export type ReturnShape =
+export type ReturnShape = (
   | { readonly kind: "Effect" | "Stream"; readonly values: ReadonlyArray<Value>; readonly errors: ReadonlyArray<TaggedValue> }
   | { readonly kind: "Option"; readonly values: ReadonlyArray<Value> }
   | { readonly kind: "Layer"; readonly errors: ReadonlyArray<TaggedValue> }
-  | { readonly kind: "Boolean" | "Literal" | "Void" | "Value"; readonly values: ReadonlyArray<Value> };
+  | { readonly kind: "Boolean" | "Literal" | "Void" | "Value"; readonly values: ReadonlyArray<Value> }
+) & { readonly omittedValues?: number };
 
 export interface MutableFunction {
   readonly file: string;
@@ -22,6 +23,9 @@ export interface MutableFunction {
   readonly displayReturnType: string;
   readonly equivalentValues: ReadonlyArray<string>;
   readonly skipReason?: string;
+  readonly notices?: ReadonlyArray<string>;
+  readonly functionSpan?: Mutant["span"];
+  readonly functionLike?: boolean;
   readonly span: Mutant["span"];
   readonly startOffset: number;
   readonly endOffset: number;

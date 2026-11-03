@@ -24,12 +24,31 @@ export function makeMutantSource(oracle: TypeOracle): MutantSource["Service"] {
       const discovered = oracle.discover(config);
       const notMutated: NotMutated[] = [...discovered.notMutated];
       const mutants: Mutant[] = [];
-      for (const fn of discovered.functions) {
-        const generated = [...generateFunction(fn)];
-        if (!generated.length) notMutated.push({ file: fn.file, functionName: fn.name, reason: fn.skipReason ?? `opaque return or no synthesizable value: ${fn.displayReturnType}` });
+      const failed = new Set<typeof discovered.functions[number]>();
+      const generatedFunctions = discovered.functions.map(fn => {
+        try { return { fn, generated: [...generateFunction(fn)] }; }
+        catch (error) {
+          failed.add(fn);
+          if (fn.functionLike !== false) notMutated.push({ file: fn.file, functionName: fn.name, span: fn.functionSpan ?? fn.span,
+            reason: `analysis failed: ${error instanceof Error ? error.message : String(error)}` });
+          return { fn, generated: [] };
+        }
+      });
+      for (const { fn, generated } of generatedFunctions) {
+        if (failed.has(fn)) continue;
+        if (fn.functionLike !== false) {
+          const reasons = [...(fn.notices ?? [])];
+          if (!generated.length && !reasons.length) reasons.push(fn.skipReason ?? `return not synthesizable (type ${fn.displayReturnType})`);
+          const innerMutated = !generated.length && generatedFunctions.some(({ fn: inner, generated }) => inner.file === fn.file && inner.startOffset > fn.startOffset
+            && inner.endOffset < fn.endOffset && generated.length > 0);
+          if (innerMutated && !generated.length) {
+            for (let i = 0; i < reasons.length; i++) if (reasons[i]!.startsWith("return not synthesizable")) reasons[i] += "; inner functions mutated";
+          }
+          if (reasons.length) notMutated.push({ file: fn.file, functionName: fn.name, span: fn.functionSpan ?? fn.span, reason: [...new Set(reasons)].join("; ") });
+        }
         mutants.push(...generated);
       }
-      return { mutants, notMutated };
+      return { mutants, notMutated: [...new Map(notMutated.map(item => [JSON.stringify(item), item])).values()] };
     },
     catch: (error) => loadError(config.tsconfig, error),
   });

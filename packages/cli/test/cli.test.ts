@@ -123,7 +123,7 @@ it.live("runs all coverage shapes and writes honest skips, with caught and misse
   }
   const skipped = yield* fs.readFileString(path.join(output, "report/not-mutated.txt"));
   expect(skipped).toContain("generic: generic");
-  expect(skipped).toContain("opaque: no synthesizable value for field call");
+  expect(skipped).toMatch(/src\/shapes\.ts:\d+:\d+: opaque: return not synthesizable \(field call\); inner functions mutated/);
   expect(logs).toContain("Baseline command:");
   expect(logs).toContain("not mutated");
 }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)), 300_000);
@@ -368,12 +368,12 @@ it.effect("flags win over config and timeout flags use seconds", () => Effect.ge
 it.effect("maps baseline failure, timeouts, unviable mutants and internal defects for CI", () => Effect.gen(function*() {
   const root = yield* project;
   const baselineFailure: Run = () => Effect.fail(new BaselineFailed({ exitCode: 1, output: "Failing original suite", command: ["vitest", "run"] }));
-  expect(yield* invoke(root, [], [], baselineFailure)).toBe(4);
+  expect(yield* invoke(root, [], [mutant()], baselineFailure)).toBe(4);
   const timeoutRun: Run = (config, mutants) => Effect.succeed({ ...report(config.root, mutants), results: report(config.root, mutants).results.map((result) => ({ ...result, outcome: "timeout" })) });
   expect(yield* invoke(root, [], [mutant()], timeoutRun)).toBe(3);
   const unviableRun: Run = (config, mutants) => Effect.succeed({ ...report(config.root, mutants), results: report(config.root, mutants).results.map((result) => ({ ...result, outcome: "unviable" })) });
   expect(yield* invoke(root, [], [mutant()], unviableRun)).toBe(0);
-  expect(yield* invoke(root, [], [], () => Effect.die("Unexpected engine defect"))).toBe(70);
+  expect(yield* invoke(root, [], [mutant()], () => Effect.die("Unexpected engine defect"))).toBe(70);
 }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)));
 
 it.effect("buffers a progress write failure and surfaces ReportWriteError at final write", () => Effect.gen(function*() {

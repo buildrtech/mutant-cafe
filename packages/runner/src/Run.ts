@@ -130,7 +130,7 @@ export const runMutants = Effect.fn("Runner.runMutants")(function* (
   const reporting = createEffectLogic(({ input }: { input: RunState }) => capture(
     input.reported ? Effect.void : reporter.write(report(input))
   ));
-  // copying -> baseline -> generating -> testing -> reporting -> done.
+  // generating -> (empty: reporting | copying -> baseline -> testing) -> reporting -> done.
   // Domain failures travel as actor outputs; completed results are events so
   // interruption can report the machine's current state, not a task-local array.
   const machine = setupEffect({
@@ -146,7 +146,7 @@ export const runMutants = Effect.fn("Runner.runMutants")(function* (
       failure: undefined, pool: undefined, pending: [], results: [], reported: false
     },
     output: ({ context }) => context,
-    initial: "copying",
+    initial: "generating",
     on: {
       CANCEL: { target: ".interrupted" },
       RESULT: ({ context, event }) => ({ context: { ...context, results: [...context.results, event.result] } })
@@ -158,13 +158,13 @@ export const runMutants = Effect.fn("Runner.runMutants")(function* (
       baseline: { invoke: {
         src: "baselining", input: ({ context }) => context.pool,
         onDone: ({ context, event }) => Result.isSuccess(event.output)
-          ? { target: "generating", context: { ...context, ...event.output.success } }
+          ? { target: "testing", context: { ...context, ...event.output.success } }
           : { target: "reporting", context: { ...context, failure: event.output.failure,
             baseline: event.output.failure._tag === "BaselineFailed" ? { durationMs: 0, testCommand: event.output.failure.command } : context.baseline
           } }
       } },
       generating: { invoke: { src: "generating", onDone: ({ context, event }) => Result.isSuccess(event.output)
-        ? { target: "testing", context: { ...context, pending: event.output.success } }
+        ? { target: event.output.success.length ? "copying" : "reporting", context: { ...context, pending: event.output.success } }
         : { target: "reporting", context: { ...context, failure: event.output.failure } } } },
       testing: { invoke: {
         src: "testing", input: ({ context, self }) => ({
