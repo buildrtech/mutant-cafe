@@ -8,8 +8,8 @@ import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
 
-export const mutantLine = (mutant: Mutant): string =>
-  `${mutant.file}:${mutant.span.start.line}:${mutant.span.start.column}: ${mutant.description}`;
+export const mutantLine = (mutant: Mutant, root: string, path: Path.Path): string =>
+  `${path.relative(root, path.resolve(root, mutant.file))}:${mutant.span.start.line}:${mutant.span.start.column}: ${mutant.description}`;
 
 const outcomes = ["caught", "missed", "timeout", "unviable"] as const;
 const jsonReport = Schema.encodeEffect(Schema.fromJsonString(RunReport));
@@ -83,13 +83,13 @@ export const makeReporter = Effect.fn("makeReporter")(function*(options: {
     yield* fs.writeFileString(path.join(dir, "diff", `${mutant.id}.diff`), unifiedDiff(mutant, original)).pipe(Effect.mapError(writeError));
   }
   const writeLists = (items: ReadonlyArray<MutantResult>) => Effect.forEach(outcomes, (outcome) => {
-    const lines = items.filter((result) => result.outcome === outcome).map((result) => mutantLine(result.mutant));
+    const lines = items.filter((result) => result.outcome === outcome).map((result) => mutantLine(result.mutant, options.root, path));
     return fs.writeFileString(path.join(dir, `${outcome}.txt`), lines.length === 0 ? "" : lines.join("\n") + "\n");
   }, { discard: true });
   const service = Reporter.of({
     progress: (result) => semaphore.withPermit(Effect.gen(function*() {
       results.push(result);
-      yield* Console.log(`${result.outcome} ${mutantLine(result.mutant)} (${result.durationMs}ms)`);
+      yield* Console.log(`${result.outcome} ${mutantLine(result.mutant, options.root, path)} (${result.durationMs}ms)`);
       yield* Effect.gen(function*() {
         if (!ids.has(result.mutant.id)) return yield* writeError("Progress result does not belong to this report");
         yield* writeLists(results);
