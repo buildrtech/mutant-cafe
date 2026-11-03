@@ -33,7 +33,8 @@ const flags = {
   include: Flag.String("file").pipe(Flag.atLeast(0), Flag.withDescription("Include source glob relative to package root; repeatable")),
   exclude: Flag.String("exclude").pipe(Flag.atLeast(0), Flag.withDescription("Exclude source glob; repeatable")),
   exportedOnly: Flag.Boolean("exported-only").pipe(Flag.withDefault(false), Flag.withDescription("Only exported binding paths, returned curried functions and Layer service methods; exclude local helpers")),
-  cold: Flag.Boolean("cold").pipe(Flag.withDefault(false), Flag.withDescription("Start a fresh Vitest process for every mutant")),
+  warm: Flag.Boolean("warm").pipe(Flag.withDefault(false), Flag.withDescription("Force a persistent Vitest instance instead of automatic selection")),
+  cold: Flag.Boolean("cold").pipe(Flag.withDefault(false), Flag.withDescription("Start a fresh Vitest process for each test execution")),
   jobs: Flag.Int("jobs").pipe(Flag.optional, Flag.withDescription("Concurrent scratch/test workers; default 1")),
   timeout: Flag.Finite("timeout").pipe(Flag.optional, Flag.withDescription("Absolute test timeout in seconds")),
   timeoutMultiplier: Flag.Finite("timeout-multiplier").pipe(Flag.optional, Flag.withDescription("Baseline duration multiplier; default 5")),
@@ -50,6 +51,7 @@ export const makeCommand = (options: {
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const root = path.resolve(options.root);
+  if (input.cold && input.warm) return yield* new UsageError({ message: "--warm and --cold are mutually exclusive" });
   const range = Option.getOrUndefined(input.inDiffRange);
   const inDiff = Option.getOrUndefined(input.inDiff);
   const maxMutants = Option.getOrUndefined(input.maxMutants);
@@ -79,6 +81,7 @@ export const makeCommand = (options: {
     functionFilter: fileConfig.functionFilter ?? [],
     ...(inDiff === undefined ? {} : { inDiff }),
     cold: input.cold,
+    warm: input.warm,
     jobs: Option.getOrElse(input.jobs, () => fileConfig.jobs ?? 1),
     ...(Option.isSome(timeoutMs) ? { timeoutMs: timeoutMs.value } : {}),
     timeoutMultiplier: Option.getOrElse(input.timeoutMultiplier, () => fileConfig.timeoutMultiplier ?? 5),

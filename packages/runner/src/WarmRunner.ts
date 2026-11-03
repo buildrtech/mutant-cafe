@@ -7,7 +7,7 @@ import * as Effect from "effect/Effect";
 import * as Console from "effect/Console";
 import * as FileSystem from "effect/FileSystem";
 import * as Schema from "effect/Schema";
-import { reporterSource, vitestHostSource } from "./VitestHost.ts";
+import { reporterSource, vitestHostSource, type ProbeOptions } from "./VitestHost.ts";
 
 const Message = Schema.Union([
   Schema.Struct({ type: Schema.Literal("ready") }),
@@ -15,11 +15,13 @@ const Message = Schema.Union([
   Schema.Struct({ type: Schema.Literal("collected") }),
   Schema.Struct({ type: Schema.Literal("failed") }),
   Schema.Struct({ type: Schema.Literal("selected"), files: Schema.Array(Schema.String) }),
+  Schema.Struct({ type: Schema.Literal("selection"), files: Schema.Array(Schema.String) }),
+  Schema.Struct({ type: Schema.Literal("probeLoaded") }),
   Schema.Struct({ type: Schema.Literal("fallback"), message: Schema.String }),
   Schema.Struct({ type: Schema.Literal("crash"), message: Schema.String }),
   Schema.Struct({ type: Schema.Literal("result"), status: Schema.Literals(["passed", "failed", "untested"]),
     testFiles: Schema.Array(Schema.String), testsCollected: Schema.Boolean,
-    testDurations: Schema.Record(Schema.String, Schema.Finite), testTimeouts: Schema.Record(Schema.String, Schema.Finite), crashed: Schema.Boolean })
+    testDurations: Schema.Record(Schema.String, Schema.Finite), testTimeouts: Schema.Record(Schema.String, Schema.Finite), testWorkers: Schema.Int, testConcurrency: Schema.Int, testFileDurations: Schema.Record(Schema.String, Schema.Finite), firstTestStart: Schema.Finite, probeSupported: Schema.Boolean, probeLoaded: Schema.Boolean, crashed: Schema.Boolean })
 ]);
 type Message = typeof Message.Type;
 
@@ -46,6 +48,7 @@ class Host {
         const message = Schema.decodeUnknownSync(Message)(value);
         if (message.type === "collected") { this.collected = true; return; }
         if (message.type === "failed") { this.failed = true; return; }
+        if (message.type === "probeLoaded") return;
         if (message.type === "selected") { this.testFiles = message.files; return; }
         const pending = this.pending;
         this.pending = undefined;
@@ -149,7 +152,7 @@ export const openWarmRunner = Effect.fn("TestRunner.openWarm")(function* (dir: S
     // A fresh host has no stale transforms. Never return a dirty graph to the pool.
     if (result._tag === "Failure") yield* restart;
   });
-  const run = Effect.fn("Warm.run")(function* (file: string | undefined, timeoutMs?: number, testTimeout?: number): Effect.fn.Return<TestRun | undefined, TestSpawnError> {
+  const run = Effect.fn("Warm.run")(function* (file: string | undefined, timeoutMs?: number, testTimeout?: number, probe?: ProbeOptions): Effect.fn.Return<TestRun | undefined, TestSpawnError> {
     if (isCold()) return undefined;
     const command = ["vitest", ...(file ? ["related", file, "--run"] : ["run"]), "--reporter=default"];
     for (let crash = 0; crash < 2; crash++) {
@@ -160,21 +163,23 @@ export const openWarmRunner = Effect.fn("TestRunner.openWarm")(function* (dir: S
       active.failed = false;
       active.testFiles = [];
       const started = yield* Clock.currentTimeMillis;
-      const pending = active.request({ type: "run", file, testTimeout });
+      const pending = active.request({ type: "run", file, testTimeout, probe });
       const response = attempt(() => pending);
       const result = yield* (timeoutMs === undefined ? response : response.pipe(Effect.timeout(timeoutMs))).pipe(Effect.result);
       if (result._tag === "Success" && result.success.type === "result" && !result.success.crashed) {
         yield* send(actor, { type: "DONE" });
-        return { ...result.success, command, output: active.output, durationMs: (yield* Clock.currentTimeMillis) - started };
+        return { ...result.success, startupMs: result.success.firstTestStart > 0 ? Math.max(0, Math.ceil(result.success.firstTestStart - started)) : 0,
+          command, output: active.output, durationMs: (yield* Clock.currentTimeMillis) - started };
       }
       if (result._tag === "Failure" && result.failure._tag === "TimeoutError") {
+        const failedAtDeadline = active.failed;
         yield* send(actor, { type: "CANCEL" });
         // cancelCurrentRun waits for the test: enforce a separate recovery grace.
         active.post({ type: "cancel" });
         const settled = yield* attempt(() => pending).pipe(Effect.timeout(500), Effect.result);
         if (settled._tag === "Success") yield* send(actor, { type: "DONE" });
         else yield* restart;
-        return { status: active.failed ? "failed" : "timedOut", command, output: active.output, durationMs: (yield* Clock.currentTimeMillis) - started,
+        return { status: failedAtDeadline ? "failed" : "timedOut", command, output: active.output, durationMs: (yield* Clock.currentTimeMillis) - started,
           testsCollected: active.collected, testFiles: active.testFiles };
       }
       if (crash === 0) {
@@ -198,5 +203,16 @@ export const openWarmRunner = Effect.fn("TestRunner.openWarm")(function* (dir: S
     // The owner is cancelling this lease; restore must not wait on its old RPC.
     yield* send(actor, { type: "FALLBACK" });
   }))));
-  return { run, invalidate };
+  const disable = Effect.gen(function* () {
+    yield* close();
+    yield* send(actor, { type: "FALLBACK" });
+  });
+  const select = Effect.fn("Warm.select")(function* (file: string) {
+    if (isCold()) return undefined;
+    const result = yield* attempt(() => host!.request({ type: "select", file })).pipe(Effect.timeout(30_000), Effect.result);
+    if (result._tag === "Success" && result.success.type === "selection") return result.success.files;
+    yield* restart;
+    return undefined;
+  });
+  return { run, invalidate, disable, select };
 });

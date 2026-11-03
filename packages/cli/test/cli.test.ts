@@ -346,16 +346,18 @@ it.effect("malformed diffs exit 6 without running tests or creating reports", ()
   expect(yield* fs.exists(`${root}/mutants.out`)).toBe(false);
 }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)));
 
-it.effect("--cold reaches the runner and warm is the default", () => Effect.gen(function* () {
+it.effect("forced modes reach the runner, default is auto, and conflicts are rejected", () => Effect.gen(function* () {
   const root = yield* project;
-  const modes: boolean[] = [];
+  const modes: Array<{ cold: boolean; warm: boolean }> = [];
   const run: Run = (config, mutants) => Effect.sync(() => {
-    modes.push(config.cold ?? false);
+    modes.push({ cold: config.cold ?? false, warm: config.warm ?? false });
     return report(config.root, mutants);
   });
   yield* invoke(root, ["--cold"], [mutant()], run);
+  yield* invoke(root, ["--warm"], [mutant()], run);
   yield* invoke(root, [], [mutant()], run);
-  expect(modes).toEqual([true, false]);
+  expect(yield* invoke(root, ["--cold", "--warm"], [mutant()], run)).toBe(1);
+  expect(modes).toEqual([{ cold: true, warm: false }, { cold: false, warm: true }, { cold: false, warm: false }]);
 }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)));
 
 it.effect("flags win over config and timeout flags use seconds", () => Effect.gen(function*() {

@@ -11,7 +11,7 @@ import type {
   ScratchError,
   TestSpawnError,
 } from "./Errors.ts";
-import type { Baseline, Mutant, MutantResult, NotMutated, RunReport } from "./Mutant.ts";
+import type { Baseline, Mutant, MutantResult, NotMutated, ReachabilityProbe, RunReport } from "./Mutant.ts";
 
 export type Viability =
   | { readonly viable: boolean; readonly diagnostics: ReadonlyArray<string>; readonly analysisFailed?: never }
@@ -30,6 +30,7 @@ export interface ScratchDir {
   readonly path: string;
   readonly apply: (mutant: Mutant) => Effect.Effect<void, ScratchError>;
   readonly revert: (mutant: Mutant) => Effect.Effect<void, ScratchError>;
+  readonly poison?: (mutant: Mutant, signal: string, token: string) => Effect.Effect<void, ScratchError>;
 }
 
 export class Scratch extends Context.Service<
@@ -50,13 +51,21 @@ export interface TestRun {
   readonly testFiles?: ReadonlyArray<string>;
   readonly testDurations?: Readonly<Record<string, number>>;
   readonly testTimeouts?: Readonly<Record<string, number>>;
+  readonly testWorkers?: number;
+  readonly testConcurrency?: number;
+  readonly testFileDurations?: Readonly<Record<string, number>>;
+  readonly startupMs?: number;
+  readonly probeSupported?: boolean;
+  readonly probeLoaded?: boolean;
 }
 
 export class TestRunner extends Context.Service<
   TestRunner,
   {
-    readonly open?: (dir: ScratchDir, cold: boolean) => Effect.Effect<void, TestSpawnError, Scope.Scope>;
+    readonly open?: (dir: ScratchDir, cold: boolean, warm?: boolean, mutants?: number) => Effect.Effect<void, TestSpawnError, Scope.Scope>;
     readonly invalidate?: (dir: ScratchDir, file: string) => Effect.Effect<void, TestSpawnError>;
+    readonly selectRelated?: (dir: ScratchDir, file: string) => Effect.Effect<ReadonlyArray<string> | undefined, TestSpawnError>;
+    readonly probeReachability?: (dir: ScratchDir, mutant: Mutant, timeoutMs: number) => Effect.Effect<ReachabilityProbe, ScratchError | TestSpawnError>;
     readonly baseline: (dir: ScratchDir, tsconfig?: string) => Effect.Effect<Baseline, BaselineFailed | TestSpawnError>;
     readonly runRelated: (
       dir: ScratchDir,

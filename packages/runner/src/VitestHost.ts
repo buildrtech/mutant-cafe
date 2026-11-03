@@ -1,10 +1,28 @@
 // Executed in the target project's Node process, not in the CLI's dependency graph.
 // API verified against Vitest 5.1.0. Unsupported API shapes use the cold adapter.
-export const reporterSource = (marker: string) => `
+export interface ProbeOptions { readonly token: string; readonly setupFile: string }
+
+export const reporterSource = (marker: string, probe?: ProbeOptions) => `
 import { relative } from "node:path";
 export default class {
-  files = []; collected = false; failed = false; durations = {}; timeouts = {};
+  files = []; collected = false; failed = false; durations = {}; timeouts = {}; workers = 0; concurrency = 0; fileDurations = {}; firstTestStart = 0; verdict = null;
+  constructor(token = ${JSON.stringify(probe?.token ?? null)}, setupFile = ${JSON.stringify(probe?.setupFile ?? null)}) { this.token = token; this.setupFile = setupFile; this.loaded = false; this.originals = []; }
+  onInit(ctx) {
+    if (!this.setupFile) return;
+    for (const config of new Set(ctx.projects.map(project => project.config))) {
+      this.originals.push([config, config.setupFiles]);
+      config.setupFiles = [this.setupFile, ...config.setupFiles];
+    }
+  }
+  restore() { for (const [config, setupFiles] of this.originals) config.setupFiles = setupFiles; this.originals = []; }
+  onUserConsoleLog(log) {
+    if (this.token && log.content.includes(this.token)) { this.loaded = true; process.send?.({ type: "probeLoaded" }); console.log(${JSON.stringify(marker + "probeLoaded")}); }
+  }
   onTestRunStart(specifications) {
+    this.probeSupported = specifications.every(spec => ["forks", "threads", "vmForks", "vmThreads"].includes(spec.pool) && spec.project.config.environment === "node");
+    console.log(${JSON.stringify(marker + "probeSupported:")} + JSON.stringify(this.probeSupported));
+    this.workers = Math.max(0, ...specifications.map(spec => spec.project.config.maxWorkers));
+    console.log(${JSON.stringify(marker + "workers:")} + this.workers);
     this.files = specifications.map(spec => relative(process.cwd(), spec.moduleId));
     process.send?.({ type: "selected", files: this.files });
     console.log(${JSON.stringify(marker + "selected:")} + JSON.stringify(this.files));
@@ -14,17 +32,34 @@ export default class {
     process.send?.({ type: "collected" });
     console.log(${JSON.stringify(marker + "collected")});
   }
+  onTestModuleEnd(module) {
+    const file = relative(process.cwd(), module.moduleId);
+    const timing = module.diagnostic();
+    this.fileDurations[file] = timing.duration + timing.collectDuration + timing.prepareDuration + timing.setupDuration + timing.environmentSetupDuration;
+    console.log(${JSON.stringify(marker + "fileDuration:")} + JSON.stringify({ file, duration: this.fileDurations[file] }));
+    this.concurrency = Math.max(this.concurrency, timing.concurrencyId ?? 0);
+    console.log(${JSON.stringify(marker + "concurrency:")} + this.concurrency);
+  }
   onTestCaseResult(test) {
     const state = test.result().state;
     if (state === "failed") { this.failed = true; process.send?.({ type: "failed" }); console.log(${JSON.stringify(marker + "failed")}); }
     if (state === "passed") {
+      const start = test.diagnostic()?.startTime ?? 0;
+      if (start > 0) this.firstTestStart = this.firstTestStart ? Math.min(this.firstTestStart, start) : start;
       const file = relative(process.cwd(), test.module.moduleId);
       this.durations[file] = Math.max(this.durations[file] ?? 0, test.diagnostic()?.duration ?? 0);
       this.timeouts[file] = Math.max(this.timeouts[file] ?? 0, test.options.timeout ?? 0);
-      console.log(${JSON.stringify(marker + "duration:")} + JSON.stringify({ file, duration: this.durations[file], timeout: this.timeouts[file] }));
+      console.log(${JSON.stringify(marker + "duration:")} + JSON.stringify({ file, duration: this.durations[file], timeout: this.timeouts[file], start: this.firstTestStart }));
     }
   }
-  onTestRunEnd() { if (!this.files.length) console.log(${JSON.stringify(marker + "empty")}); }
+  onTestRunEnd(modules, errors = [], state) {
+    this.verdict = state ?? null;
+    // Vitest's official run verdict also covers cancelled or pending modules.
+    // Parallel bail can omit case-result hooks and module-end results.
+    if ((state != null && state !== "passed") || errors.length) { this.failed = true; process.send?.({ type: "failed" }); console.log(${JSON.stringify(marker + "failed")}); }
+    if (!this.files.length) console.log(${JSON.stringify(marker + "empty")});
+    this.restore();
+  }
 }`;
 
 export const vitestHostSource = String.raw`
@@ -39,9 +74,8 @@ let reporter;
 try {
   const { createVitest } = await import(pathToFileURL(require.resolve("vitest/node")).href);
   if (typeof createVitest !== "function") throw new Error("createVitest is unavailable");
-  ctx = await createVitest({ root: process.cwd(), watch: false, cache: false, fsModuleCache: false,
-    // Scratch copies own parallelism; keep one pool worker per warm graph.
-    maxWorkers: 1, bail: 1, passWithNoTests: true, reporters: ["default", new Reporter()] });
+  ctx = await createVitest({ root: process.cwd(), run: true, watch: false, cache: false, fsModuleCache: false,
+    bail: 1, passWithNoTests: true, reporters: ["default", new Reporter()] });
   if (typeof ctx.runTestSpecifications !== "function" || typeof ctx.invalidateFile !== "function"
     || typeof ctx.cancelCurrentRun !== "function" || typeof ctx.getRelevantTestSpecifications !== "function") {
     throw new Error("installed Vitest does not expose the supported warm API");
@@ -84,8 +118,15 @@ process.on("message", async request => {
     if (request.type === "close") { await ctx.close(); process.exit(0); }
     if (request.type === "cancel") { await ctx.cancelCurrentRun("keyboard-input"); return; }
     if (request.type === "invalidate") { invalidate(request.file); process.send({ type: "invalidated" }); return; }
+    if (request.type === "select") {
+      ctx.config.related = [resolve(request.file)];
+      const specs = await ctx.getRelevantTestSpecifications();
+      process.send({ type: "selection", files: specs.map(spec => spec.moduleId) });
+      return;
+    }
     if (request.type !== "run") return;
-    reporter = new Reporter();
+    reporter = new Reporter(request.probe?.token ?? null, request.probe?.setupFile ?? null);
+    reporter.onInit(ctx);
     ctx.reporters = [...defaultReporters, reporter];
     ctx.config.related = request.file ? [resolve(request.file)] : undefined;
     if (request.testTimeout === undefined) delete ctx.configOverride.testTimeout;
@@ -94,14 +135,14 @@ process.on("message", async request => {
     // The shared adapter handles the full-suite fallback and remaining budget.
     const empty = specs.length === 0;
     const result = await ctx.runTestSpecifications(specs, !request.file);
-    // Vitest returns its retained state for ALL modules, including failures
-    // from the previous mutant in files not selected for this run.
-    const failed = reporter.failed || result.unhandledErrors.length > 0 || result.testModules.some(module =>
-      specs.some(spec => spec.moduleId === module.moduleId && spec.project === module.project) && module.state() === "failed");
+    if (!["passed", "failed", "interrupted"].includes(reporter.verdict)) throw new Error("installed Vitest does not expose the supported current-run verdict");
+    // Use the official current-run verdict, not retained module state. In a
+    // parallel bail, child failures can exist while the module stays pending.
+    const failed = reporter.failed || result.unhandledErrors.length > 0;
     process.send({ type: "result", status: failed ? "failed" : empty ? "untested" : "passed",
-      testFiles: reporter.files, testsCollected: reporter.collected, testDurations: reporter.durations, testTimeouts: reporter.timeouts,
+      testFiles: reporter.files, testsCollected: reporter.collected, testDurations: reporter.durations, testTimeouts: reporter.timeouts, testWorkers: reporter.workers, testConcurrency: reporter.concurrency, testFileDurations: reporter.fileDurations, firstTestStart: reporter.firstTestStart, probeSupported: reporter.probeSupported, probeLoaded: reporter.loaded,
       crashed: result.unhandledErrors.length > 0 });
     process.exitCode = 0;
-  } catch (error) { process.send({ type: "crash", message: String(error) }); }
+  } catch (error) { reporter?.restore(); process.send({ type: "crash", message: String(error) }); }
 });
 `;

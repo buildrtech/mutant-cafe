@@ -4,6 +4,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
 import type * as PlatformError from "effect/PlatformError";
+import { poisonInsertion } from "./Poison.ts";
 
 export const ScratchLive = Layer.effect(Scratch, Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem;
@@ -109,6 +110,13 @@ export const ScratchLive = Layer.effect(Scratch, Effect.gen(function* () {
           }
           yield* fs.writeFileString(location, original.slice(0, startOffset) + text + original.slice(endOffset));
         }, (effect, mutant) => effect.pipe(Effect.mapError((error) => failure("apply", mutant.file, error)))),
+        poison: Effect.fn("Scratch.poison")(function* (mutant: Mutant, signal: string, token: string) {
+          const location = yield* target(mutant);
+          const bytes = yield* fs.readFile(location).pipe(Effect.mapError(error => failure("probe", location, error)));
+          const original = new TextDecoder("utf-8", { ignoreBOM: true }).decode(bytes);
+          const insertion = poisonInsertion(original, signal, token);
+          yield* dir.apply({ ...mutant, replacement: { startOffset: insertion.offset, endOffset: insertion.offset, text: insertion.text } });
+        }),
         revert: Effect.fn("Scratch.revert")(function* (mutant: Mutant) {
           const location = yield* target(mutant);
           const bytes = originals.get(location);

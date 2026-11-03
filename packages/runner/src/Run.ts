@@ -1,5 +1,5 @@
 import {
-  MutantSource, MutantResult, NotMutated, Reporter, Scratch, TestRunner,
+  MutantSource, MutantResult, NotMutated, ReachabilityProbe, Reporter, Scratch, TestRunner,
   type Baseline, BaselineFailed, type Mutant,
   type ProgramLoadError, type ReportWriteError, type RunConfig, type RunReport,
   type ScratchDir, ScratchError, type TestSpawnError
@@ -31,6 +31,7 @@ interface RunState {
   readonly results: ReadonlyArray<MutantResult>;
   readonly reported: boolean;
   readonly notMutated: ReadonlyArray<NotMutated>;
+  readonly probes: ReadonlyArray<ReachabilityProbe>;
 }
 
 /** A separate actor owns each run. Its resources outlive invoked phase tasks. */
@@ -46,14 +47,14 @@ export const runMutants = Effect.fn("Runner.runMutants")(function* (
   const jobs = Math.max(1, Math.floor(config.jobs));
   const report = (state: RunState): RunReport => ({
     schemaVersion: 2, tool: "mutant.cafe", root: config.root,
-    baseline: state.baseline, timeoutMs: state.timeoutMs, results: state.results, notMutated: state.notMutated,
+    baseline: state.baseline, timeoutMs: state.timeoutMs, results: state.results, notMutated: state.notMutated, reachabilityProbes: state.probes,
     ...(state.failure === undefined ? {} : { failure: state.failure._tag === "BaselineFailed" ? `${state.failure._tag}: ${state.failure.command.join(" ")}\n${state.failure.output.slice(-8000)}` : String(state.failure) })
   });
   const capture = <A, R>(effect: Effect.Effect<A, RunError, R>) => Effect.result(effect);
-  const copying = createEffectLogic(() => capture(Effect.gen(function* () {
+  const copying = createEffectLogic(({ input }: { input: number }) => capture(Effect.gen(function* () {
     const acquire = Effect.gen(function* () {
       const dir = yield* scratch.acquire(config.root);
-      if (tests.open) yield* tests.open(dir, config.cold ?? false);
+      if (tests.open) yield* tests.open(dir, config.cold ?? false, config.warm ?? false, input);
       return dir;
     }).pipe(Effect.mapError(error => error._tag === "ScratchError" ? error : new ScratchError({ operation: "warm runner", path: config.root, message: String(error) })));
     const pool = yield* Pool.make({ acquire, size: jobs }).pipe(
@@ -76,14 +77,42 @@ export const runMutants = Effect.fn("Runner.runMutants")(function* (
     readonly state: RunState;
     readonly record: (result: MutantResult) => Effect.Effect<void>;
     readonly skip: (entry: NotMutated) => Effect.Effect<void>;
+    readonly probe: (entry: ReachabilityProbe) => Effect.Effect<void>;
   } }) => capture(Effect.gen(function* () {
     const dirs = input.state.pool?.value;
     if (dirs === undefined) return yield* Effect.die("Missing scratch pool");
+    const unreachable = new Map<string, ReachabilityProbe>();
+    const selectRelated = tests.selectRelated;
+    const probeReachability = tests.probeReachability;
+    if (input.state.baseline.probeSupported && selectRelated && probeReachability) {
+      const seen = new Set<string>();
+      const builtTests = input.state.baseline.unreliable?.flatMap(issue => issue.kind === "built" ? issue.testFiles : []) ?? [];
+      for (const mutant of input.state.pending) {
+        const file = path.isAbsolute(mutant.file) ? path.relative(config.root, mutant.file) : mutant.file;
+        if (seen.has(file)) continue;
+        seen.add(file);
+        if (unreliableFor(input.state.baseline, file, builtTests).length) continue;
+        const probe = yield* Effect.scoped(Effect.gen(function* () {
+          const dir = yield* Pool.get(dirs);
+          if (!dir.poison) return undefined;
+          const files = yield* selectRelated(dir, file);
+          if (files === undefined || files.length) return undefined;
+          return yield* probeReachability(dir, { ...mutant, file }, input.state.timeoutMs);
+        }));
+        if (probe) {
+          yield* input.probe(probe);
+          if (probe.status === "unreachable") unreachable.set(file, probe);
+        }
+      }
+    }
     // Measure the original related selection once per file before applying any
     // mutant. Slow unrelated tests must not manufacture a caught never mutant.
     const neverBudgets = new Map<string, number>();
     const neverLimits = new Map<string, number>();
+    const neverBases = new Map<string, number>();
+    const neverAllowances = new Map<string, number>();
     for (const mutant of input.state.pending) {
+      if (unreachable.has(path.isAbsolute(mutant.file) ? path.relative(config.root, mutant.file) : mutant.file)) continue;
       if (mutant.genre !== "EffectNever" || neverBudgets.has(mutant.file) || unreliableFor(input.state.baseline, path.isAbsolute(mutant.file) ? path.relative(config.root, mutant.file) : mutant.file).length > 0) continue;
       const measured = yield* Effect.scoped(Effect.gen(function* () {
         const dir = yield* Pool.get(dirs);
@@ -92,9 +121,17 @@ export const runMutants = Effect.fn("Runner.runMutants")(function* (
       if (measured.status === "failed" || measured.status === "timedOut") {
         return yield* new BaselineFailed({ exitCode: 1, output: measured.output, command: measured.command });
       }
-      const slowest = Math.max(0, ...Object.values(measured.testDurations ?? input.state.baseline.testDurations ?? {}));
+      const baseline = input.state.baseline;
+      const files = measured.testFiles ?? Object.keys(measured.testDurations ?? baseline.testDurations ?? {});
+      // The clean baseline owns timings. The related probe selects files only;
+      // its imposed test timeout must not become an alleged explicit override.
+      const slowest = Math.max(0, ...files.map(file => baseline.testDurations?.[file] ?? measured.testDurations?.[file] ?? 0));
+      const relatedDuration = baseline.testFileDurations === undefined ? baseline.durationMs :
+        files.reduce((sum, file) => sum + (baseline.testFileDurations?.[file] ?? 0), 0);
+      neverAllowances.set(mutant.file, Math.ceil(relatedDuration) + (baseline.startupMs ?? 0));
+      neverBases.set(mutant.file, slowest);
       neverBudgets.set(mutant.file, Math.max(2_000, config.neverTimeoutMs, Math.ceil(slowest * config.timeoutMultiplier)));
-      neverLimits.set(mutant.file, Math.max(0, ...Object.values(measured.testTimeouts ?? {})));
+      neverLimits.set(mutant.file, Math.max(0, ...files.map(file => baseline.testTimeouts?.[file] ?? 0)));
     }
     yield* Stream.fromIterable(input.state.pending).pipe(
       Stream.mapEffect((mutant) => Effect.scoped(Effect.gen(function* () {
@@ -114,9 +151,17 @@ export const runMutants = Effect.fn("Runner.runMutants")(function* (
           yield* reporter.progress(result);
           return;
         }
+        const cached = unreachable.get(localFile);
+        if (cached) {
+          const result: MutantResult = { mutant, outcome: "untested", durationMs: 0, testCommand: [],
+            diagnostics: ["The full-suite module-load probe passed without loading this file"] };
+          yield* input.record(result);
+          yield* reporter.progress(result);
+          return;
+        }
         const dir = yield* Pool.get(dirs);
         const testTimeoutMs = mutant.genre === "EffectNever" ? neverBudgets.get(mutant.file)! : undefined;
-        const timeoutMs = testTimeoutMs === undefined ? input.state.timeoutMs : Math.max(testTimeoutMs, neverLimits.get(mutant.file) ?? 0) + input.state.baseline.durationMs;
+        const timeoutMs = testTimeoutMs === undefined ? input.state.timeoutMs : Math.max(testTimeoutMs, neverLimits.get(mutant.file) ?? 0) + (neverAllowances.get(mutant.file) ?? 0);
         const run = yield* Effect.acquireUseRelease(
           dir.apply(mutant),
           () => Effect.gen(function* () {
@@ -137,6 +182,10 @@ export const runMutants = Effect.fn("Runner.runMutants")(function* (
             : run.status === "failed" ? "caught" : run.status === "untested" ? "untested" : "missed",
           durationMs: run.durationMs,
           timeoutMs: testTimeoutMs ?? timeoutMs,
+          outerTimeoutMs: timeoutMs,
+          ...(testTimeoutMs === undefined ? {} : { hangBudgetBaseMs: neverBases.get(mutant.file) }),
+          testWorkers: run.testWorkers,
+          testConcurrency: run.testConcurrency,
           testCommand: run.command,
           diagnostics: selectedIssues.map(issue => issue.reason),
           ...(run.output === "" ? {} : { output: run.output })
@@ -156,24 +205,25 @@ export const runMutants = Effect.fn("Runner.runMutants")(function* (
   const machine = setupEffect({
     schemas: {
       context: types<RunState>(),
-      events: { CANCEL: Schema.Struct({}), RESULT: Schema.Struct({ result: MutantResult }), SKIP: Schema.Struct({ entry: NotMutated }) }
+      events: { CANCEL: Schema.Struct({}), RESULT: Schema.Struct({ result: MutantResult }), SKIP: Schema.Struct({ entry: NotMutated }), PROBE: Schema.Struct({ entry: ReachabilityProbe }) }
     },
     actors: { copying, baselining, generating, testing, reporting }
   }).createMachine({
     context: {
       baseline: { durationMs: 0, testCommand: [] },
       timeoutMs: config.timeoutMs ?? config.minimumTimeoutMs,
-      failure: undefined, pool: undefined, pending: [], results: [], reported: false, notMutated: []
+      failure: undefined, pool: undefined, pending: [], results: [], reported: false, notMutated: [], probes: []
     },
     output: ({ context }) => context,
     initial: "generating",
     on: {
       CANCEL: { target: ".interrupted" },
+      PROBE: ({ context, event }) => ({ context: { ...context, probes: [...context.probes, event.entry] } }),
       SKIP: ({ context, event }) => ({ context: { ...context, notMutated: [...new Map([...context.notMutated, event.entry].map(entry => [JSON.stringify(entry), entry])).values()] } }),
       RESULT: ({ context, event }) => ({ context: { ...context, results: [...context.results, event.result] } })
     },
     states: {
-      copying: { invoke: { src: "copying", onDone: ({ context, event }) => Result.isSuccess(event.output)
+      copying: { invoke: { src: "copying", input: ({ context }) => context.pending.length, onDone: ({ context, event }) => Result.isSuccess(event.output)
         ? { target: "baseline", context: { ...context, pool: event.output.success } }
         : { target: "failed", context: { ...context, failure: event.output.failure } } } },
       baseline: { invoke: {
@@ -193,7 +243,8 @@ export const runMutants = Effect.fn("Runner.runMutants")(function* (
           // Queue completion before progress can trigger CANCEL. The parent's
           // FIFO mailbox commits this result before handling that cancellation.
           record: (result) => send(self, { type: "RESULT", result }),
-          skip: (entry) => send(self, { type: "SKIP", entry })
+          skip: (entry) => send(self, { type: "SKIP", entry }),
+          probe: (entry) => send(self, { type: "PROBE", entry })
         }),
         onDone: ({ context, event }) => ({ target: "reporting", context: {
           ...context, failure: Result.isFailure(event.output) ? event.output.failure : context.failure
