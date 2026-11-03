@@ -1,134 +1,183 @@
 import {
-  MutantSource, Reporter, Scratch, TestRunner,
-  type Baseline, type BaselineFailed, type Mutant, type MutantResult,
+  MutantSource, MutantResult, Reporter, Scratch, TestRunner,
+  type Baseline, type BaselineFailed, type Mutant,
   type ProgramLoadError, type ReportWriteError, type RunConfig, type RunReport,
   type ScratchDir, type ScratchError, type TestSpawnError
 } from "@mutant-cafe/core";
 import { createEffectActor, createEffectLogic, join, send, setupEffect } from "@xstate/effect";
+import { types } from "xstate";
 import * as Effect from "effect/Effect";
 import * as Pool from "effect/Pool";
 import * as Path from "effect/Path";
-import * as NodePath from "@effect/platform-node/NodePath";
+import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 
 type RunError = BaselineFailed | ScratchError | TestSpawnError | ProgramLoadError | ReportWriteError;
+// XState freezes plain context objects in development. A pool is a live
+// resource, not immutable run data; keep its internals behind a class handle.
+class ScratchPool {
+  readonly value: Pool.Pool<ScratchDir, ScratchError>;
+  constructor(value: Pool.Pool<ScratchDir, ScratchError>) { this.value = value; }
+}
+interface RunState {
+  readonly baseline: Baseline;
+  readonly timeoutMs: number;
+  readonly failure: RunError | undefined;
+  readonly pool: ScratchPool | undefined;
+  readonly pending: ReadonlyArray<Mutant>;
+  readonly results: ReadonlyArray<MutantResult>;
+  readonly reported: boolean;
+}
 
 /** A separate actor owns each run. Its resources outlive invoked phase tasks. */
 export const runMutants = Effect.fn("Runner.runMutants")(function* (
   config: RunConfig, mutants?: Stream.Stream<Mutant, ProgramLoadError>
 ) {
-    const scratch = yield* Scratch;
-    const tests = yield* TestRunner;
-    const source = yield* MutantSource;
-    const reporter = yield* Reporter;
-    const scope = yield* Scope.Scope;
-    const path = yield* Path.Path.pipe(Effect.provide(NodePath.layer));
-    const jobs = Math.max(1, Math.floor(config.jobs));
-    let baseline: Baseline = { durationMs: 0, testCommand: [] };
-    let timeoutMs = config.timeoutMs ?? config.minimumTimeoutMs;
-    let failure: RunError | undefined;
-    let pool: Pool.Pool<ScratchDir, ScratchError> | undefined;
-    let pending: ReadonlyArray<Mutant> = [];
-    const results: Array<MutantResult> = [];
-    let reported = false;
-    const report = (): RunReport => ({ schemaVersion: 1, tool: "mutant.cafe", root: config.root, baseline, timeoutMs, results: [...results] });
-    const capture = <A, R>(effect: Effect.Effect<A, RunError, R>) => effect.pipe(
-      Effect.as(true),
-      Effect.catch((error) => Effect.sync(() => { failure = error; return false; }))
-    );
-    const copying = createEffectLogic(() => capture(Effect.gen(function* () {
-      pool = yield* Pool.make({ acquire: scratch.acquire(config.root), size: jobs }).pipe(
-        Effect.provideService(Scope.Scope, scope));
-      // Force the first acquisition in the copying phase. The pool owns the
-      // tree; this short lease does not reserve a worker during later tests.
-      yield* Effect.scoped(Pool.get(pool));
-    })));
-    const baselining = createEffectLogic(() => capture(Effect.gen(function* () {
-      if (pool === undefined) return yield* Effect.die("Missing scratch pool");
-      const dirs = pool;
-      baseline = yield* Effect.scoped(Effect.gen(function* () {
-        const dir = yield* Pool.get(dirs);
-        return yield* tests.baseline(dir);
-      }));
-      timeoutMs = config.timeoutMs ?? Math.max(config.minimumTimeoutMs, Math.ceil(config.timeoutMultiplier * baseline.durationMs));
-    })));
-    const generating = createEffectLogic(() => capture(Effect.gen(function* () {
-      pending = yield* Stream.runCollect(mutants ?? source.generate(config));
-    })));
-    const testing = createEffectLogic(() => capture(Effect.gen(function* () {
-      if (pool === undefined) return yield* Effect.die("Missing scratch pool");
-      const dirs = pool;
-      yield* Stream.fromIterable(pending).pipe(
-        Stream.mapEffect((mutant) => Effect.scoped(Effect.gen(function* () {
-          const viability = yield* source.checkViable(mutant);
-          if (!viability.viable) {
-            const result: MutantResult = { mutant, outcome: "unviable", durationMs: 0, testCommand: [], diagnostics: viability.diagnostics };
-            results.push(result);
-            yield* reporter.progress(result);
-            return;
-          }
-          const dir = yield* Pool.get(dirs);
-          const run = yield* Effect.acquireUseRelease(
-            dir.apply(mutant),
-            () => tests.runRelated(dir, path.isAbsolute(mutant.file) ? path.relative(config.root, mutant.file) : mutant.file, mutant.genre === "EffectNever" ? config.neverTimeoutMs : timeoutMs),
-            // A dirty directory must never return to the pool, even on cancel.
-            () => dir.revert(mutant).pipe(Effect.orDie)
-          );
-          const result: MutantResult = {
-            mutant,
-            // Effect.never is meant to hang: a test that waits on it and times out noticed the mutant.
-            outcome: run.status === "timedOut" ? (mutant.genre === "EffectNever" ? "caught" : "timeout") : run.status === "failed" ? "caught" : "missed",
-            durationMs: run.durationMs,
-            testCommand: run.command,
-            diagnostics: [],
-            ...(run.output === "" ? {} : { output: run.output })
-          };
-          results.push(result);
-          yield* reporter.progress(result);
-        })), { concurrency: jobs }),
-        Stream.runDrain
-      );
-    })));
-    const reporting = createEffectLogic(() => capture(Effect.gen(function* () {
-      if (!reported) {
-        yield* reporter.write(report());
-        reported = true;
-      }
-    })));
-    // Tasks return success/failure as data. Domain errors do not leak into
-    // XState's unknown actor-error channel; the caller receives them below.
-    const machine = setupEffect({
-      schemas: { events: { CANCEL: Schema.Struct({}) } },
-      actors: { copying, baselining, generating, testing, reporting }
-    }).createMachine({
-      initial: "copying",
-      on: { CANCEL: { target: ".interrupted" } },
-      states: {
-        copying: { invoke: { src: "copying", onDone: ({ event }) => ({ target: event.output ? "baseline" : "failed" }) } },
-        baseline: { invoke: { src: "baselining", onDone: ({ event }) => ({ target: event.output ? "generating" : failure?._tag === "BaselineFailed" ? "baselineFailed" : "failed" }) } },
-        generating: { invoke: { src: "generating", onDone: ({ event }) => ({ target: event.output ? "testing" : "reporting" }) } },
-        testing: { invoke: { src: "testing", onDone: { target: "reporting" } } },
-        reporting: { invoke: { src: "reporting", onDone: { target: "done" } } },
-        interrupted: { invoke: { src: "reporting", onDone: { target: "done" } } },
-        baselineFailed: { type: "final" },
-        failed: { type: "final" },
-        done: { type: "final" }
-      }
-    });
-    // Close the actor host before the outer pool scope. Stopping an invocation
-    // requests interruption; host release waits for its process/revert finalizers.
-    yield* Effect.scoped(Effect.gen(function* () {
-      const actor = yield* createEffectActor(machine);
-      // Domain failures are task outputs; only unexpected actor defects reach join.
-      // @effect-diagnostics-next-line anyUnknownInErrorContext:off -- Domain errors are captured above.
-      yield* join(actor).pipe(Effect.orDie, Effect.onInterrupt(() => Effect.gen(function* () {
-        yield* send(actor, { type: "CANCEL" });
-        // @effect-diagnostics-next-line anyUnknownInErrorContext:off -- Wait for the partial report before releasing the actor host.
-        yield* join(actor).pipe(Effect.orDie);
-      })));
+  const scratch = yield* Scratch;
+  const tests = yield* TestRunner;
+  const source = yield* MutantSource;
+  const reporter = yield* Reporter;
+  const scope = yield* Scope.Scope;
+  const path = yield* Path.Path;
+  const jobs = Math.max(1, Math.floor(config.jobs));
+  const report = (state: RunState): RunReport => ({
+    schemaVersion: 1, tool: "mutant.cafe", root: config.root,
+    baseline: state.baseline, timeoutMs: state.timeoutMs, results: state.results
+  });
+  const capture = <A, R>(effect: Effect.Effect<A, RunError, R>) => Effect.result(effect);
+  const copying = createEffectLogic(() => capture(Effect.gen(function* () {
+    const pool = yield* Pool.make({ acquire: scratch.acquire(config.root), size: jobs }).pipe(
+      Effect.provideService(Scope.Scope, scope));
+    // Force the first acquisition in the copying phase. The pool owns the
+    // tree; this short lease does not reserve a worker during later tests.
+    yield* Effect.scoped(Pool.get(pool));
+    return new ScratchPool(pool);
+  })));
+  const baselining = createEffectLogic(({ input }: { input: ScratchPool | undefined }) => capture(Effect.gen(function* () {
+    if (input === undefined) return yield* Effect.die("Missing scratch pool");
+    const baseline = yield* Effect.scoped(Effect.gen(function* () {
+      const dir = yield* Pool.get(input.value);
+      return yield* tests.baseline(dir);
     }));
-    if (failure !== undefined) return yield* Effect.fail(failure);
-    return report();
+    return { baseline, timeoutMs: config.timeoutMs ?? Math.max(config.minimumTimeoutMs, Math.ceil(config.timeoutMultiplier * baseline.durationMs)) };
+  })));
+  const generating = createEffectLogic(() => capture(Stream.runCollect(mutants ?? source.generate(config))));
+  const testing = createEffectLogic(({ input }: { input: {
+    readonly state: RunState;
+    readonly record: (result: MutantResult) => Effect.Effect<void>;
+  } }) => capture(Effect.gen(function* () {
+    const dirs = input.state.pool?.value;
+    if (dirs === undefined) return yield* Effect.die("Missing scratch pool");
+    yield* Stream.fromIterable(input.state.pending).pipe(
+      Stream.mapEffect((mutant) => Effect.scoped(Effect.gen(function* () {
+        const viability = yield* source.checkViable(mutant);
+        if (!viability.viable) {
+          const result: MutantResult = { mutant, outcome: "unviable", durationMs: 0, testCommand: [], diagnostics: viability.diagnostics };
+          yield* input.record(result);
+          yield* reporter.progress(result);
+          return;
+        }
+        const dir = yield* Pool.get(dirs);
+        const run = yield* Effect.acquireUseRelease(
+          dir.apply(mutant),
+          () => tests.runRelated(dir, path.isAbsolute(mutant.file) ? path.relative(config.root, mutant.file) : mutant.file, mutant.genre === "EffectNever" ? config.neverTimeoutMs : input.state.timeoutMs),
+          // A dirty directory must never return to the pool, even on cancel.
+          () => dir.revert(mutant).pipe(Effect.orDie)
+        );
+        const result: MutantResult = {
+          mutant,
+          // Effect.never is meant to hang: a test that waits on it and times out noticed the mutant.
+          outcome: run.status === "timedOut" ? (mutant.genre === "EffectNever" ? "caught" : "timeout") : run.status === "failed" ? "caught" : "missed",
+          durationMs: run.durationMs,
+          testCommand: run.command,
+          diagnostics: [],
+          ...(run.output === "" ? {} : { output: run.output })
+        };
+        yield* input.record(result);
+        yield* reporter.progress(result);
+      })), { concurrency: jobs }),
+      Stream.runDrain
+    );
+  })));
+  const reporting = createEffectLogic(({ input }: { input: RunState }) => capture(
+    input.reported ? Effect.void : reporter.write(report(input))
+  ));
+  // copying -> baseline -> generating -> testing -> reporting -> done.
+  // Domain failures travel as actor outputs; completed results are events so
+  // interruption can report the machine's current state, not a task-local array.
+  const machine = setupEffect({
+    schemas: {
+      context: types<RunState>(),
+      events: { CANCEL: Schema.Struct({}), RESULT: Schema.Struct({ result: MutantResult }) }
+    },
+    actors: { copying, baselining, generating, testing, reporting }
+  }).createMachine({
+    context: {
+      baseline: { durationMs: 0, testCommand: [] },
+      timeoutMs: config.timeoutMs ?? config.minimumTimeoutMs,
+      failure: undefined, pool: undefined, pending: [], results: [], reported: false
+    },
+    output: ({ context }) => context,
+    initial: "copying",
+    on: {
+      CANCEL: { target: ".interrupted" },
+      RESULT: ({ context, event }) => ({ context: { ...context, results: [...context.results, event.result] } })
+    },
+    states: {
+      copying: { invoke: { src: "copying", onDone: ({ context, event }) => Result.isSuccess(event.output)
+        ? { target: "baseline", context: { ...context, pool: event.output.success } }
+        : { target: "failed", context: { ...context, failure: event.output.failure } } } },
+      baseline: { invoke: {
+        src: "baselining", input: ({ context }) => context.pool,
+        onDone: ({ context, event }) => Result.isSuccess(event.output)
+          ? { target: "generating", context: { ...context, ...event.output.success } }
+          : { target: event.output.failure._tag === "BaselineFailed" ? "baselineFailed" : "failed", context: { ...context, failure: event.output.failure } }
+      } },
+      generating: { invoke: { src: "generating", onDone: ({ context, event }) => Result.isSuccess(event.output)
+        ? { target: "testing", context: { ...context, pending: event.output.success } }
+        : { target: "reporting", context: { ...context, failure: event.output.failure } } } },
+      testing: { invoke: {
+        src: "testing", input: ({ context, self }) => ({
+          state: context,
+          // Queue completion before progress can trigger CANCEL. The parent's
+          // FIFO mailbox commits this result before handling that cancellation.
+          record: (result) => send(self, { type: "RESULT", result })
+        }),
+        onDone: ({ context, event }) => ({ target: "reporting", context: {
+          ...context, failure: Result.isFailure(event.output) ? event.output.failure : context.failure
+        } })
+      } },
+      reporting: { invoke: {
+        src: "reporting", input: ({ context }) => context,
+        onDone: ({ context, event }) => ({ target: "done", context: {
+          ...context, reported: Result.isSuccess(event.output), failure: Result.isFailure(event.output) ? event.output.failure : context.failure
+        } })
+      } },
+      interrupted: { invoke: {
+        src: "reporting", input: ({ context }) => context,
+        onDone: ({ context, event }) => ({ target: "done", context: {
+          ...context, reported: Result.isSuccess(event.output), failure: Result.isFailure(event.output) ? event.output.failure : context.failure
+        } })
+      } },
+      baselineFailed: { type: "final" },
+      failed: { type: "final" },
+      done: { type: "final" }
+    }
+  });
+  // Close the actor host before the outer pool scope. Stopping an invocation
+  // requests interruption; host release waits for its process/revert finalizers.
+  const state = yield* Effect.scoped(Effect.gen(function* () {
+    const actor = yield* createEffectActor(machine);
+    // Domain failures are task outputs; only unexpected actor defects reach join.
+    // @effect-diagnostics-next-line anyUnknownInErrorContext:off -- Domain errors are captured above.
+    return yield* join(actor).pipe(Effect.orDie, Effect.onInterrupt(() => Effect.gen(function* () {
+      yield* send(actor, { type: "CANCEL" });
+      // @effect-diagnostics-next-line anyUnknownInErrorContext:off -- Wait for the partial report before releasing the actor host.
+      yield* join(actor).pipe(Effect.orDie);
+    })));
+  }));
+  if (state.failure !== undefined) return yield* state.failure;
+  return report(state);
 }, Effect.scoped);

@@ -7,11 +7,11 @@ import type { MutableFunction, Value } from "./TypeOracle.ts";
 /** Pure generation over the oracle's compiler-independent description. */
 export function* generateFunction(fn: MutableFunction): Generator<Mutant> {
   const api = fn.api;
-  const candidate = (genre: Genre, expression: string, value: Value = { text: "", synthetic: false }, detail = ""): Mutant => {
+  const candidate = (genre: Genre, expression: string, value: Value = { text: "", synthetic: false }, description = expression): Mutant => {
     const text = fn.block
       ? `{ return ${fn.generator ? "yield* " : ""}${expression}; }`
       : `(${expression})`;
-    return makeMutant(fn, genre, text, value.synthetic, detail);
+    return makeMutant(fn, genre, text, value.synthetic, description);
   };
   const shape = fn.shape;
   switch (shape.kind) {
@@ -23,7 +23,7 @@ export function* generateFunction(fn: MutableFunction): Generator<Mutant> {
       const fail = api("Effect", "fail");
       const catchTag = api("Effect", "catchTag");
       for (const error of shape.errors) {
-        if (fail) yield candidate("EffectFail", `${fail}(${error.text})`, error, error.tag);
+        if (fail) yield candidate("EffectFail", `${fail}(${error.text})`, error);
         const value = shape.values[0];
         const die = api("Effect", "die");
         const recovery = value && succeed ? `${succeed}(${value.text})`
@@ -34,7 +34,7 @@ export function* generateFunction(fn: MutableFunction): Generator<Mutant> {
           const original = fn.generator
             ? gen && `((): ${fn.returnType} => ${gen}(function* () ${fn.original}))()`
             : fn.block ? `((): ${fn.returnType} => ${fn.original})()` : `((): ${fn.returnType} => (${fn.original}))()`;
-          if (original) yield candidate("SwallowTag", `${original}.pipe(${catchTag}(${JSON.stringify(error.tag)}, () => ${recovery}))`, value, value ? error.tag : `${error.tag}; die: no value of A`);
+          if (original) yield candidate("SwallowTag", `${original}.pipe(${catchTag}(${JSON.stringify(error.tag)}, () => ${recovery}))`, value, `body.pipe(${catchTag}(${JSON.stringify(error.tag)}, () => ${recovery}))`);
         }
       }
       const die = api("Effect", "die");
@@ -56,19 +56,19 @@ export function* generateFunction(fn: MutableFunction): Generator<Mutant> {
       const fail = api("Stream", "fail");
       if (empty) yield candidate("StreamEmpty", empty);
       if (make) for (const value of shape.values) yield candidate("StreamOne", `${make}(${value.text})`, value);
-      if (fail) for (const error of shape.errors) yield candidate("StreamFail", `${fail}(${error.text})`, error, error.tag);
+      if (fail) for (const error of shape.errors) yield candidate("StreamFail", `${fail}(${error.text})`, error);
       break;
     }
     case "Layer": {
       const layer = api("Layer", "effect");
       const fail = api("Effect", "fail");
       if (layer && fail && shape.service) {
-        for (const error of shape.errors) yield candidate("LayerFail", `${layer}(${shape.service}, ${fail}(${error.text}))`, error, error.tag);
+        for (const error of shape.errors) yield candidate("LayerFail", `${layer}(${shape.service}, ${fail}(${error.text}))`, error);
       }
       break;
     }
     case "Void":
-      yield makeMutant(fn, "FnValue", "{}", false, "");
+      yield makeMutant(fn, "FnValue", "{}", false, "an empty body");
       break;
     default: {
       const genre = shape.kind === "Boolean" ? "BooleanFlip" : shape.kind === "Literal" ? "LiteralCycle" : "FnValue";
@@ -80,12 +80,12 @@ export function* generateFunction(fn: MutableFunction): Generator<Mutant> {
   }
 }
 
-function makeMutant(fn: MutableFunction, genre: Genre, text: string, synthetic: boolean, detail: string): Mutant {
+function makeMutant(fn: MutableFunction, genre: Genre, text: string, synthetic: boolean, description: string): Mutant {
   const replacement = { startOffset: fn.startOffset, endOffset: fn.endOffset, text };
   const id = createHash("sha256").update(JSON.stringify([fn.file, fn.span, genre, text])).digest("hex").slice(0, 24);
   return {
     id, file: fn.file, functionName: fn.name, returnType: fn.returnType, genre,
-    description: `${genre}${detail ? `(${detail})` : ""} in ${fn.name}`,
+    description: `replace ${fn.name} -> ${fn.returnType} with ${description}`,
     span: fn.span, replacement, synthetic,
   };
 }

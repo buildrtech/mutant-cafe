@@ -17,7 +17,7 @@ export class UsageError extends Schema.TaggedError<UsageError>()("UsageError", {
 
 export type Run = (config: RunConfig, mutants: ReadonlyArray<Mutant>) => Effect.Effect<RunReport,
   BaselineFailed | ScratchError | TestSpawnError | ProgramLoadError | ReportWriteError,
-  MutantSource | Scratch | TestRunner | Reporter>;
+  MutantSource | Scratch | TestRunner | Reporter | Path.Path>;
 
 const flags = {
   list: Flag.Boolean("list").pipe(Flag.withDefault(false)),
@@ -69,7 +69,7 @@ export const makeCommand = (options: {
   const generated = yield* Stream.runCollect(source.generate(config));
   const mutants = inDiff === undefined ? generated : yield* selectInDiff({ root, diffPath: inDiff, mutants: generated });
   if (input.list) {
-    for (const mutant of mutants) yield* Console.log(mutantLine(mutant));
+    for (const mutant of mutants) yield* Console.log(mutantLine(mutant, config.root, path));
     if (options.onExit !== undefined) yield* options.onExit(0);
     return;
   }
@@ -88,7 +88,7 @@ export const runCli = Effect.fn("runCli")(function*(options: {
 }) {
   const code = yield* Ref.make(0);
   const command = makeCommand({ ...options, onExit: (value) => Ref.set(code, value) });
-  yield* Command.runWith(command, { version: "0.0.0" })(options.args).pipe(
+  yield* Command.runWith(command, { version: "0.1.0" })(options.args).pipe(
     Effect.catch((error) => Effect.gen(function*() {
       yield* Console.error(String(error));
       yield* Ref.set(code, errorExitCode(error));

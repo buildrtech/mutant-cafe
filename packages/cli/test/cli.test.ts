@@ -1,13 +1,15 @@
 import { it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { BaselineFailed, MutantSource, Reporter, Scratch, TestRunner, type Mutant, type RunReport } from "@mutant-cafe/core";
+import { BaselineFailed, MutantSource, Reporter, Scratch, TestRunner, RunReport, type Mutant } from "@mutant-cafe/core";
 import * as Effect from "effect/Effect";
 import * as Result from "effect/Result";
+import * as Schema from "effect/Schema";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import * as Stream from "effect/Stream";
 import * as ChildProcess from "effect/process/ChildProcess";
 import { expect } from "vitest";
+import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 import { runCli, type Run } from "../src/Command.ts";
 import { makeReporter } from "../src/Reporter.ts";
 import { reportExitCode } from "../src/ExitCode.ts";
@@ -40,6 +42,36 @@ const project = Effect.gen(function*() {
   yield* fs.writeFileString(`${root}/account.ts`, "export const isEmpty = () => true;\n");
   return root;
 });
+
+it.live("the real CLI reports three distinct missed mutants with root-relative clickable paths", () => Effect.gen(function* () {
+  const fs = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+  const root = path.resolve(import.meta.dirname, "../../../fixtures/tagged-errors");
+  const output = yield* fs.makeTempDirectoryScoped({ prefix: "mutant-cli-e2e-" });
+  const handle = yield* spawner.spawn(ChildProcess.make(process.execPath, [
+    path.resolve(import.meta.dirname, "../src/bin.ts"), "--jobs", "2", "--output", path.join(output, "report")
+  ], { cwd: root }));
+  const [stdout, stderr, exit] = yield* Effect.all([
+    Stream.mkString(Stream.decodeText(handle.stdout)),
+    Stream.mkString(Stream.decodeText(handle.stderr)),
+    handle.exitCode
+  ], { concurrency: "unbounded" });
+  expect(Number(exit), stderr).toBe(2);
+  const lines = (yield* fs.readFileString(path.join(output, "report/missed.txt"))).trim().split("\n");
+  expect(lines).toHaveLength(3);
+  expect(new Set(lines).size).toBe(3);
+  for (const line of lines) {
+    expect(line).toMatch(/^src\/account\.ts:\d+:\d+: replace /);
+    expect(stdout).toContain(line);
+    expect(line).not.toContain(root);
+  }
+  const report = yield* Schema.decodeEffect(Schema.fromJsonString(RunReport))(
+    yield* fs.readFileString(path.join(output, "report/outcomes.json"))
+  );
+  expect(report.results.filter((result) => result.outcome === "caught")).toHaveLength(6);
+  expect(report.results.every((result) => path.isAbsolute(result.mutant.file))).toBe(true);
+}).pipe(Effect.scoped, Effect.provide(NodeServices.layer)), 60_000);
 
 it.effect("writes missed output, returns CI failure, and rotates the previous run", () => Effect.gen(function*() {
   const fs = yield* FileSystem.FileSystem;

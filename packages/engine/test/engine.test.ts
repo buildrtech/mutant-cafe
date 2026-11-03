@@ -47,6 +47,22 @@ function loadMutation<A = AccountModule>(mutant: Mutant) {
 }
 
 describe("checker-directed mutation", () => {
+  it.effect("gives every generated mutant a distinct description within its function", () => Effect.gen(function* () {
+    const source = makeSource();
+    for (const input of [fixture, extra]) {
+      const mutants = yield* collect(source, input);
+      expect(mutants.length).toBeGreaterThan(0);
+      const functions = new Map<string, Set<string>>();
+      for (const mutant of mutants) {
+        const key = JSON.stringify([mutant.file, mutant.functionName, mutant.span]);
+        const descriptions = functions.get(key) ?? new Set<string>();
+        expect(descriptions.has(mutant.description), mutant.description).toBe(false);
+        descriptions.add(mutant.description);
+        functions.set(key, descriptions);
+      }
+    }
+  }));
+
   it.effect("swallows precisely the two declared errors while preserving the other path", () => Effect.gen(function* () {
     const source = makeSource();
     const mutants = yield* collect(source, fixture);
