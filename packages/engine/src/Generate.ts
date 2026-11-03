@@ -4,8 +4,10 @@ import { createHash } from "node:crypto";
 import type { Genre, Mutant } from "@mutant-cafe/core";
 import type { MutableFunction, Value } from "./TypeOracle.ts";
 
-/** Pure generation over the oracle's compiler-independent description. */
-export function* generateFunction(fn: MutableFunction): Generator<Mutant> {
+/** Generate from the oracle description; deferred compiler checks stay behind its port. */
+export function* generateFunction(fn: MutableFunction): Generator<Mutant, string | undefined> {
+  const issue = fn.generationIssue?.();
+  if (issue) return issue;
   const api = fn.api;
   const candidate = (genre: Genre, expression: string, value: Value = { text: "", synthetic: false }, description = expression): Mutant => {
     // A return annotation on the inner function preserves the public inferred
@@ -17,19 +19,23 @@ export function* generateFunction(fn: MutableFunction): Generator<Mutant> {
     return makeMutant(fn, genre, text, value.synthetic, description);
   };
   const shape = fn.shape;
+  const fits = (value: Value): boolean => new TextEncoder().encode(value.text).byteLength <= 2048;
+  const values = "values" in shape ? shape.values.filter(fits) : [];
   switch (shape.kind) {
     case "Effect": {
       const succeed = api("Effect", "succeed");
       if (succeed) {
-        for (const value of shape.values) {
+        for (const value of values) {
           if (!fn.equivalentValues.includes(value.text) && !(fn.generator && value.text === fn.literal)) yield candidate("EffectSucceed", `${succeed}(${value.text})`, value);
         }
       }
       const fail = api("Effect", "fail");
       const catchTag = api("Effect", "catchTag");
       for (const error of shape.errors) {
-        if (fail && error.reason === undefined) yield candidate("EffectFail", `${fail}(${error.text})`, error, `${fail}(${error.text}) [${error.synthetic ? "synthetic tag cast" : "constructed error"}]`);
-        const recoveries: ReadonlyArray<Value | undefined> = shape.values.length ? shape.values : [undefined];
+        if (fail && fits(error)) yield candidate("EffectFail", `${fail}(${error.text})`, error, `${fail}(${error.text}) [${error.synthetic ? "synthetic tag cast" : "constructed error"}]`);
+        const recoveries: ReadonlyArray<Value | undefined> = values.length
+          ? shape.enumerateRecoveries ? values : values.slice(0, 1)
+          : [undefined];
         // Evaluate the original body, rather than replacing its error path with an unconditional failure.
         const gen = api("Effect", "gen");
         const original = fn.generator
@@ -54,7 +60,7 @@ export function* generateFunction(fn: MutableFunction): Generator<Mutant> {
       const none = api("Option", "none");
       const some = api("Option", "some");
       if (none) yield candidate("OptionNone", `${none}()`);
-      if (some) for (const value of shape.values) yield candidate("OptionSome", `${some}(${value.text})`, value);
+      if (some) for (const value of values) yield candidate("OptionSome", `${some}(${value.text})`, value);
       break;
     }
     case "Stream": {
@@ -62,8 +68,8 @@ export function* generateFunction(fn: MutableFunction): Generator<Mutant> {
       const make = api("Stream", "make");
       const fail = api("Stream", "fail");
       if (empty) yield candidate("StreamEmpty", empty);
-      if (make) for (const value of shape.values) yield candidate("StreamOne", `${make}(${value.text})`, value);
-      if (fail) for (const error of shape.errors) if (error.reason === undefined) yield candidate("StreamFail", `${fail}(${error.text})`, error);
+      if (make) for (const value of values) yield candidate("StreamOne", `${make}(${value.text})`, value);
+      if (fail) for (const error of shape.errors) if (fits(error)) yield candidate("StreamFail", `${fail}(${error.text})`, error);
       break;
     }
     case "Layer": {
@@ -74,7 +80,7 @@ export function* generateFunction(fn: MutableFunction): Generator<Mutant> {
       if (layer && fail) {
         // Layer output is contravariant. Let the pinned return type infer the
         // complete output context, not just the first service found in the body.
-        for (const error of shape.errors) if (error.reason === undefined) yield candidate("LayerFail", `${layer}(${fail}(${error.text}))`, error);
+        for (const error of shape.errors) if (fits(error)) yield candidate("LayerFail", `${layer}(${fail}(${error.text}))`, error);
       }
       break;
     }
@@ -83,7 +89,7 @@ export function* generateFunction(fn: MutableFunction): Generator<Mutant> {
       break;
     default: {
       const genre = shape.kind === "Boolean" ? "BooleanFlip" : shape.kind === "Literal" ? "LiteralCycle" : "FnValue";
-      for (const value of shape.values) {
+      for (const value of values) {
         if (value.text === fn.literal) continue;
         yield candidate(genre, value.text, value);
       }

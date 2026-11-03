@@ -75,7 +75,7 @@ export const makeReporter = Effect.fn("makeReporter")(function*(options: {
   // Encode the actual core contract, not a second report shape.
   const encodedMutants = yield* Schema.encodeEffect(Schema.fromJsonString(Schema.Array(Mutant)))(options.mutants).pipe(Effect.mapError(writeError));
   yield* fs.writeFileString(path.join(dir, "mutants.json"), encodedMutants).pipe(Effect.mapError(writeError));
-  yield* fs.writeFileString(path.join(dir, "not-mutated.txt"), (options.notMutated ?? []).map(item => `${path.relative(options.root, item.file)}:${item.span?.start.line ?? 1}:${item.span?.start.column ?? 1}: ${item.functionName}: ${item.reason}\n`).join("")).pipe(Effect.mapError(writeError));
+  yield* fs.writeFileString(path.join(dir, "not-mutated.txt"), (options.notMutated ?? []).map(item => `${path.relative(options.root, item.file)}:${item.span?.start.line ?? "?"}:${item.span?.start.column ?? "?"}: ${item.functionName}: ${item.reason}\n`).join("")).pipe(Effect.mapError(writeError));
   yield* Effect.forEach(outcomes, (outcome) => fs.writeFileString(path.join(dir, `${outcome}.txt`), ""), { discard: true }).pipe(Effect.mapError(writeError));
   for (const mutant of options.mutants) {
     const original = yield* fs.readFileString(path.resolve(options.root, mutant.file)).pipe(Effect.mapError(writeError));
@@ -102,7 +102,9 @@ export const makeReporter = Effect.fn("makeReporter")(function*(options: {
     })),
     write: (report) => semaphore.withPermit(Effect.gen(function*() {
       if (pendingError !== undefined) return yield* pendingError;
-      const counted: RunReport = { ...report, selected: options.selected ?? options.mutants.length,
+      const notMutated = [...new Map([...(options.notMutated ?? []), ...(report.notMutated ?? [])].map(item => [JSON.stringify(item), item])).values()];
+      yield* fs.writeFileString(path.join(dir, "not-mutated.txt"), notMutated.map(item => `${path.relative(options.root, item.file)}:${item.span?.start.line ?? "?"}:${item.span?.start.column ?? "?"}: ${item.functionName}: ${item.reason}\n`).join("")).pipe(Effect.mapError(writeError));
+      const counted: RunReport = { ...report, notMutated, selected: options.selected ?? options.mutants.length,
         run: report.results.length, budgetSkipped: options.budgetSkipped ?? 0 };
       const encoded = yield* jsonReport(counted).pipe(Effect.mapError(writeError));
       yield* fs.writeFileString(path.join(dir, "outcomes.json.tmp"), encoded).pipe(Effect.mapError(writeError));
@@ -115,7 +117,7 @@ export const makeReporter = Effect.fn("makeReporter")(function*(options: {
       // The runner writes on completion or interrupt and the CLI writes again
       // as the owner of the final report; files are idempotent, the summary prints once.
       if (options.markdown !== undefined) {
-        const markdown = markdownSummary({ ...options.markdown, root: options.root, path, report: counted, notMutated: options.notMutated?.length ?? 0 });
+        const markdown = markdownSummary({ ...options.markdown, root: options.root, path, report: counted, notMutated: notMutated.length });
         for (const file of new Set(options.markdown.files)) {
           yield* fs.writeFileString(file, markdown).pipe(Effect.mapError(error => new ReportWriteError({ path: file, message: String(error) })));
         }
@@ -125,7 +127,7 @@ export const makeReporter = Effect.fn("makeReporter")(function*(options: {
       summarized = true;
       if (report.results.some(result => result.outcome === "unreliable")) yield* Console.warn("Unreliable: the configured Vitest run cannot see all tests. See unreliable.txt and per-mutant diagnostics; these are not missed mutants.");
       const elapsed = (yield* Clock.currentTimeMillis) - started;
-      if (!options.markdown?.stdout) yield* Console.log(countsLine(counted, options.notMutated?.length ?? 0) + `; ${(elapsed / 1000).toFixed(2)}s`);
+      if (!options.markdown?.stdout) yield* Console.log(countsLine(counted, notMutated.length) + `; ${(elapsed / 1000).toFixed(2)}s`);
       if (options.markdown === undefined && report.failure !== undefined) yield* Console.warn(report.failure);
     })),
   });

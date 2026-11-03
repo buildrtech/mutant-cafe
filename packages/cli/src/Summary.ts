@@ -28,7 +28,7 @@ export const markdownSummary = (options: {
   return [options.marker, countsLine(report, options.notMutated), "",
     ...(report.failure === undefined ? [] : [`Failure: ${cell(report.failure)}`, ""]),
     options.advisory ? `Advisory: would exit ${exit} without --advisory.` : `Exit code: ${exit}.`, "",
-    ...(rows.length ? ["| File:line | Function | Description | Outcome |", "| --- | --- | --- | --- |"] : ["No actionable mutants."]),
+    ...(rows.length ? ["| File:line | Function | Description | Outcome |", "| --- | --- | --- | --- |"] : report.failure === undefined ? ["No actionable mutants."] : []),
     ...rows.slice(0, 50).map(({ mutant, outcome }) => `| ${cell(path.relative(options.gitRoot, path.resolve(options.root, mutant.file)).replaceAll("\\", "/"))}:${mutant.span.start.line} | ${cell(mutant.functionName)} | ${cell(mutant.description)} | ${outcome} |`),
     ...(rows.length > 50 ? ["", `and ${rows.length - 50} more`] : []), "",
   ].join("\n");

@@ -2,7 +2,6 @@ import { it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { BaselineFailed, MutantList, MutantSource, Reporter, RunReport, Scratch, TestRunner, type Mutant } from "@mutant-cafe/core";
 import * as Effect from "effect/Effect";
-import * as Clock from "effect/Clock";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
@@ -55,10 +54,11 @@ it.effect("budgets after selection in path/line/column/id order and never create
     expect(output.results.map(result => result.mutant.id)).toEqual(["first", "a", "b"]);
     expect({ selected: output.selected, run: output.run, budgetSkipped: output.budgetSkipped }).toEqual({ selected: 5, run: 3, budgetSkipped: 2 });
   }
-  expect(yield* invoke(root, ["--max-mutants", "0"], items)).toBe(0);
+  expect(yield* invoke(root, ["--max-mutants", "0"], items, () => Effect.die("Zero budget invoked the runner"))).toBe(0);
   const zero = yield* Schema.decodeEffect(Schema.fromJsonString(RunReport))(yield* fs.readFileString(`${root}/mutants.out/outcomes.json`));
   expect(zero.results).toEqual([]);
   expect(zero.budgetSkipped).toBe(5);
+  expect(zero.baseline.testCommand).toEqual([]);
   for (const args of [["--max-mutants", "-1"], ["--format", "wrong"], ["--format", "json"], ["--in-diff", "a", "--in-diff-range", "HEAD~1...HEAD"]]) expect(yield* invoke(root, args, items)).toBe(1);
 }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)));
 
@@ -67,18 +67,16 @@ it.live("a range outside function bodies skips Vitest and writes an empty report
   const root = yield* fs.makeTempDirectoryScoped({ prefix: "mutant-empty-range-" });
   yield* fs.writeFileString(`${root}/package.json`, JSON.stringify({ type: "module", scripts: { test: "vitest run" } }));
   yield* fs.writeFileString(`${root}/tsconfig.json`, JSON.stringify({ compilerOptions: { strict: true, noEmit: true }, include: ["value.ts"] }));
-  yield* fs.writeFileString(`${root}/vitest.config.ts`, 'import { appendFileSync } from "node:fs"; appendFileSync("vitest-started", "yes"); export default { test: { maxWorkers: 1 } };');
-  yield* fs.writeFileString(`${root}/value.test.ts`, 'import { it } from "vitest"; it("slow baseline", () => new Promise(resolve => setTimeout(resolve, 10_000)));');
+  yield* fs.writeFileString(`${root}/vitest.config.ts`, `import { appendFileSync } from "node:fs"; appendFileSync(${JSON.stringify(`${root}/vitest-started`)}, "yes"); export default { test: { maxWorkers: 1 } };`);
+  yield* fs.writeFileString(`${root}/value.test.ts`, 'import { it } from "vitest"; it("baseline executes", () => {});');
   const fixture = `${import.meta.dirname}/../../../fixtures/tagged-errors`;
   yield* fs.symlink(`${fixture}/node_modules`, `${root}/node_modules`);
   yield* fs.writeFileString(`${root}/value.ts`, "// first comment\nexport const value = (n: number): boolean => n > 0;\n");
   for (const args of [["init", "--quiet"], ["add", "."], ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.test", "commit", "--quiet", "-m", "before"]]) expect((yield* spawn(root, "git", args)).code).toBe(0);
   yield* fs.writeFileString(`${root}/value.ts`, "// changed comment\nexport const value = (n: number): boolean => n > 0;\n");
   for (const args of [["add", "value.ts"], ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.test", "commit", "--quiet", "-m", "comment"]]) expect((yield* spawn(root, "git", args)).code).toBe(0);
-  const started = yield* Clock.currentTimeMillis;
   const result = yield* cli(root, ["--jobs", "1", "--in-diff-range", "HEAD~1...HEAD", "--summary-md", "summary.md"]);
   expect(result.code, result.stderr).toBe(0);
-  expect((yield* Clock.currentTimeMillis) - started).toBeLessThan(5_000);
   expect(yield* fs.exists(`${root}/vitest-started`)).toBe(false);
   const output = yield* Schema.decodeEffect(Schema.fromJsonString(RunReport))(yield* fs.readFileString(`${root}/mutants.out/outcomes.json`));
   expect(output.baseline.testCommand).toEqual([]);
@@ -86,6 +84,11 @@ it.live("a range outside function bodies skips Vitest and writes an empty report
   expect(output.results).toEqual([]);
   expect(output.run).toBe(0);
   expect(yield* fs.readFileString(`${root}/summary.md`)).toContain("No actionable mutants.");
+  expect(result.stderr).toContain("0 mutants selected (0 before budget); cause: range");
+  const budget = yield* cli(root, ["--jobs", "1", "--max-mutants", "0"]);
+  expect(budget.code, budget.stderr).toBe(0);
+  expect(budget.stderr).toContain("0 mutants selected (2 before budget); cause: budget");
+  expect(yield* fs.exists(`${root}/vitest-started`)).toBe(false);
 }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)), 20_000);
 
 it.live("real two-file budget runs three mutants in repeatable order", () => Effect.gen(function*() {
@@ -135,6 +138,19 @@ it.live("JSON list is one published-schema document with the text ids and budget
   expect(text.stdout).toContain("9 selected, 0 run, 6 budget-skipped");
 }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)), 20_000);
 
+it.effect("reports unknown locations honestly and merges runtime analysis skips", () => Effect.gen(function*() {
+  const fs = yield* FileSystem.FileSystem;
+  const root = yield* project;
+  const run: Run = () => Effect.succeed({ ...report(root, []), notMutated: [{ file: `${root}/account.ts`, functionName: "answer", span: item("one").span, reason: "analysis failed: compiler declaration missing" }] });
+  expect(yield* invoke(root, [], [item("one")], run)).toBe(0);
+  const lines = yield* fs.readFileString(`${root}/mutants.out/not-mutated.txt`);
+  expect(lines).toContain("account.ts:?:?: generic: unsupported");
+  expect(lines).toContain("account.ts:1:1: answer: analysis failed:");
+  const output = yield* Schema.decodeEffect(Schema.fromJsonString(RunReport))(yield* fs.readFileString(`${root}/mutants.out/outcomes.json`));
+  expect(output.notMutated).toHaveLength(2);
+  expect(output.results).toEqual([]);
+}).pipe(Effect.scoped, Effect.provide(NodeServices.layer)));
+
 it.effect("Markdown uses the repository root, escapes cells and writes the requested marker", () => Effect.gen(function*() {
   const fs = yield* FileSystem.FileSystem;
   const root = yield* project;
@@ -178,6 +194,7 @@ it.effect("advisory keeps usage and internal errors but reports baseline failure
   const md = yield* fs.readFileString(`${root}/baseline.md`);
   expect(md).toContain("BaselineFailed");
   expect(md).toContain("known baseline failure");
+  expect(md).not.toContain("No actionable mutants.");
   expect(md).toContain("would exit 4");
   expect(yield* invoke(root, ["--advisory", "--bad-flag"], [])).toBe(1);
   expect(yield* invoke(root, ["--advisory"], [item("m")], () => Effect.die("internal"))).toBe(70);

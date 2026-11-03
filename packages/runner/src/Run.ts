@@ -1,5 +1,5 @@
 import {
-  MutantSource, MutantResult, Reporter, Scratch, TestRunner,
+  MutantSource, MutantResult, NotMutated, Reporter, Scratch, TestRunner,
   type Baseline, BaselineFailed, type Mutant,
   type ProgramLoadError, type ReportWriteError, type RunConfig, type RunReport,
   type ScratchDir, type ScratchError, type TestSpawnError
@@ -30,6 +30,7 @@ interface RunState {
   readonly pending: ReadonlyArray<Mutant>;
   readonly results: ReadonlyArray<MutantResult>;
   readonly reported: boolean;
+  readonly notMutated: ReadonlyArray<NotMutated>;
 }
 
 /** A separate actor owns each run. Its resources outlive invoked phase tasks. */
@@ -45,7 +46,7 @@ export const runMutants = Effect.fn("Runner.runMutants")(function* (
   const jobs = Math.max(1, Math.floor(config.jobs));
   const report = (state: RunState): RunReport => ({
     schemaVersion: 2, tool: "mutant.cafe", root: config.root,
-    baseline: state.baseline, timeoutMs: state.timeoutMs, results: state.results,
+    baseline: state.baseline, timeoutMs: state.timeoutMs, results: state.results, notMutated: state.notMutated,
     ...(state.failure === undefined ? {} : { failure: state.failure._tag === "BaselineFailed" ? `${state.failure._tag}: ${state.failure.command.join(" ")}\n${state.failure.output.slice(-8000)}` : String(state.failure) })
   });
   const capture = <A, R>(effect: Effect.Effect<A, RunError, R>) => Effect.result(effect);
@@ -69,6 +70,7 @@ export const runMutants = Effect.fn("Runner.runMutants")(function* (
   const testing = createEffectLogic(({ input }: { input: {
     readonly state: RunState;
     readonly record: (result: MutantResult) => Effect.Effect<void>;
+    readonly skip: (entry: NotMutated) => Effect.Effect<void>;
   } }) => capture(Effect.gen(function* () {
     const dirs = input.state.pool?.value;
     if (dirs === undefined) return yield* Effect.die("Missing scratch pool");
@@ -89,6 +91,7 @@ export const runMutants = Effect.fn("Runner.runMutants")(function* (
     yield* Stream.fromIterable(input.state.pending).pipe(
       Stream.mapEffect((mutant) => Effect.scoped(Effect.gen(function* () {
         const viability = yield* source.checkViable(mutant);
+        if (viability.analysisFailed) { yield* input.skip(viability.analysisFailed); return; }
         if (!viability.viable) {
           const result: MutantResult = { mutant, outcome: "unviable", durationMs: 0, testCommand: [], diagnostics: viability.diagnostics };
           yield* input.record(result);
@@ -136,19 +139,20 @@ export const runMutants = Effect.fn("Runner.runMutants")(function* (
   const machine = setupEffect({
     schemas: {
       context: types<RunState>(),
-      events: { CANCEL: Schema.Struct({}), RESULT: Schema.Struct({ result: MutantResult }) }
+      events: { CANCEL: Schema.Struct({}), RESULT: Schema.Struct({ result: MutantResult }), SKIP: Schema.Struct({ entry: NotMutated }) }
     },
     actors: { copying, baselining, generating, testing, reporting }
   }).createMachine({
     context: {
       baseline: { durationMs: 0, testCommand: [] },
       timeoutMs: config.timeoutMs ?? config.minimumTimeoutMs,
-      failure: undefined, pool: undefined, pending: [], results: [], reported: false
+      failure: undefined, pool: undefined, pending: [], results: [], reported: false, notMutated: []
     },
     output: ({ context }) => context,
     initial: "generating",
     on: {
       CANCEL: { target: ".interrupted" },
+      SKIP: ({ context, event }) => ({ context: { ...context, notMutated: [...new Map([...context.notMutated, event.entry].map(entry => [JSON.stringify(entry), entry])).values()] } }),
       RESULT: ({ context, event }) => ({ context: { ...context, results: [...context.results, event.result] } })
     },
     states: {
@@ -171,7 +175,8 @@ export const runMutants = Effect.fn("Runner.runMutants")(function* (
           state: context,
           // Queue completion before progress can trigger CANCEL. The parent's
           // FIFO mailbox commits this result before handling that cancellation.
-          record: (result) => send(self, { type: "RESULT", result })
+          record: (result) => send(self, { type: "RESULT", result }),
+          skip: (entry) => send(self, { type: "SKIP", entry })
         }),
         onDone: ({ context, event }) => ({ target: "reporting", context: {
           ...context, failure: Result.isFailure(event.output) ? event.output.failure : context.failure

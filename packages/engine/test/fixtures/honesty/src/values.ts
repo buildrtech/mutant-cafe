@@ -23,7 +23,9 @@ export const unavailable = (): Effect.Effect<boolean, HiddenError> => hidden();
 export const inferredUnavailable = () => hidden();
 class NeedsCallback extends Data.TaggedError("NeedsCallback")<{ readonly use: () => void }> {}
 export const unbuildable = (): Effect.Effect<boolean, NeedsCallback> => Effect.fail(new NeedsCallback({ use: () => {} }));
-const State = Schema.Struct({ context: Schema.Struct({ nested: Schema.Struct({ entry: Schema.Struct({ detail: Schema.Struct({ title: Schema.String, active: Schema.Boolean }) }) }) }), state: Schema.Literals(["idle", "active"]) });
-export const state = (): typeof State.Type => ({ context: { nested: { entry: { detail: { title: "ready", active: true } } } }, state: "active" });
-export const factory = (): { config: { run: () => void }; guards: { allowed: () => boolean } } => ({ config: { run: () => {} }, guards: { allowed: () => true } });
+const DeepState = Schema.Struct({ context: Schema.Struct({ nested: Schema.Struct({ entry: Schema.Struct({ detail: Schema.Struct({ title: Schema.String, active: Schema.Boolean }) }) }) }), state: Schema.Literals(["idle", "active"]) });
+export const deepState = (): typeof DeepState.Type => ({ context: { nested: { entry: { detail: { title: "ready", active: true } } } }, state: "active" });
+const State = Schema.Struct({ context: Schema.Struct({ title: Schema.String, active: Schema.Boolean }), state: Schema.Literals(["idle", "active"]) });
+export const state = (): typeof State.Type => ({ context: { title: "ready", active: true }, state: "active" });
+export const factory = (): { config: { run: () => void }; guards: { allowed: (n: number) => boolean } } => ({ config: { run: () => {} }, guards: { allowed: (n: number) => n > 0 } });
 export const attempt = () => Effect.try({ try: () => "ok", catch: () => new Conflict() });

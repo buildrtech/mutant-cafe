@@ -70,7 +70,29 @@ describe("honest value coverage", () => {
     const broken = skipped.find(item => item.functionName === "unresolved");
     expect(broken?.file).toMatch(/unresolved\.ts$/);
     expect(broken?.span?.start.line).toBe(3);
-    expect(broken?.reason).toContain("analysis failed: cannot resolve declaration for typed call missing");
+    expect(broken?.reason).toMatch(/^analysis failed:/);
+    // Inspect the actual checker result: this call has a signature but no declaration.
+    const parsed = ts.getParsedCommandLineOfConfigFile(resolve(root, all.tsconfig), {}, { ...ts.sys, onUnRecoverableConfigFileDiagnostic: diagnostic => { throw new Error(String(diagnostic.code)); } })!;
+    const program = ts.createProgram(parsed.fileNames, parsed.options);
+    const checker = program.getTypeChecker();
+    const unresolved = program.getSourceFiles().find(file => file.fileName.endsWith("/honesty/src/unresolved.ts"))!;
+    let declaration: ts.SignatureDeclaration | ts.JSDocSignature | undefined;
+    let found = false;
+    const inspect = (node: ts.Node): void => {
+      if (ts.isCallExpression(node) && node.typeArguments?.length) {
+        const signature = checker.getResolvedSignature(node);
+        expect(signature).toBeDefined();
+        declaration = signature?.declaration;
+        found = true;
+      }
+      ts.forEachChild(node, inspect);
+    };
+    inspect(unresolved);
+    expect(found).toBe(true);
+    expect(declaration).toBeUndefined();
+    const discovered = makeTypeScriptOracle().discover(all);
+    expect(discovered.functions.some(fn => fn.name === "unresolved")).toBe(true);
+    expect(discovered.notMutated.some(item => item.functionName === "unresolved")).toBe(false);
     expect(mutants.some(mutant => mutant.functionName === "unresolved")).toBe(false);
   }), 30_000);
 
@@ -157,6 +179,8 @@ describe("honest value coverage", () => {
     }
     expect(callbacks.every(item => item.reason === "callback position (not mutated yet)")).toBe(true);
     expect(skipped.some(item => item.functionName === "Id")).toBe(false);
+    expect(mutants.some(item => item.functionName === "label")).toBe(true);
+    expect(skipped.find(item => item.functionName === "attempt.catch")).toBeDefined();
     expect(new Set(skipped.map(item => JSON.stringify(item))).size).toBe(skipped.length);
     for (const [name, tag] of [["unavailable", "Hidden"], ["inferredUnavailable", "Hidden"], ["unbuildable", "NeedsCallback"]]) {
       expect(skipped.find(item => item.functionName === name)?.reason).toContain(`cannot construct ${tag}:`);
@@ -169,7 +193,80 @@ describe("honest value coverage", () => {
     const stateMutant = mutants.find(m => m.functionName === "state")!;
     expect((yield* source.checkViable(stateMutant)).diagnostics).toEqual([]);
     expect(skipped.find(item => item.functionName === "factory")?.reason).toContain("return not synthesizable (field config); inner functions mutated");
+    expect(mutants.some(item => item.functionName === "factory.guards.allowed")).toBe(true);
+    expect(skipped.find(item => item.functionName === "deepState")?.reason).toContain("depth limit (4)");
   }), 30_000);
+});
+
+describe("round-two honesty regressions", () => {
+  const input = config("packages/engine/test/fixtures/honesty/tsconfig.json");
+
+  it.effect("keeps Layer builds, synthetic failures, notices and initializer-located exclusions", () => Effect.gen(function* () {
+    const source = makeSource();
+    const selected = { ...input, include: ["**/layers.ts"] };
+    const mutants = yield* collect(source, selected);
+    for (const name of ["configLayer", "memoryLayer", "combined"]) {
+      const variants = mutants.filter(item => item.functionName === name);
+      expect(variants.map(item => item.genre).sort()).toEqual(["LayerDie", "LayerFail"]);
+      for (const mutant of variants) expect((yield* source.checkViable(mutant)).diagnostics, mutant.description).toEqual([]);
+    }
+    expect(mutants.filter(item => item.functionName === "controlLayer").map(item => item.genre)).toEqual(["LayerDie"]);
+    const skipped = yield* source.notMutated(selected);
+    expect(skipped.find(item => item.functionName === "combined")?.reason).toBe("cannot construct ReadProblem: field call");
+    expect(skipped.find(item => item.functionName === "combined")?.span).toEqual(mutants.find(item => item.functionName === "combined")?.span);
+    expect(skipped.find(item => item.functionName === "excludedLayer")?.reason).toContain("@mutants-skip");
+    expect((yield* source.notMutated({ ...selected, exportedOnly: true })).find(item => item.functionName === "internalLayer")?.reason).toContain("--exported-only");
+    expect((yield* source.notMutated({ ...selected, functionFilter: ["configLayer"] })).find(item => item.functionName === "combined")?.reason).toContain("function filter");
+    const broken = { ...input, include: ["**/layer-hole.ts", "**/bound.ts"] };
+    const discovered = makeTypeScriptOracle().discover(broken);
+    expect(discovered.functions.some(fn => fn.name === "holeLayer" && fn.shape.kind === "Layer")).toBe(true);
+    expect(discovered.notMutated.some(item => item.functionName === "holeLayer")).toBe(false);
+    expect((yield* source.notMutated(broken)).find(item => item.functionName === "holeLayer")?.reason).toMatch(/^analysis failed:/);
+    expect((yield* collect(source, broken)).some(item => item.functionName === "healthy")).toBe(true);
+  }), 30_000);
+
+  it.effect("bounds expanding types and wide text, prioritizes the original discriminant, and caps large recoveries", () => Effect.gen(function* () {
+    const source = makeSource();
+    const selected = { ...input, include: ["**/limits.ts"] };
+    const mutants = yield* collect(source, selected);
+    const skipped = yield* source.notMutated(selected);
+    expect(mutants.some(item => ["recursive", "wide"].includes(item.functionName))).toBe(false);
+    expect(skipped.find(item => item.functionName === "recursive")?.reason).toContain("depth limit (4)");
+    expect(skipped.find(item => item.functionName === "wide")?.reason).toContain("2048 bytes");
+    const variants: string[] = [];
+    for (const mutant of mutants.filter(item => item.functionName === "diagnostic")) {
+      const module = yield* loadMutation<{ diagnostic: (flag: boolean) => { kind: string; message: string } }>(mutant);
+      const result = module.diagnostic(true);
+      variants.push(result.kind);
+      expect(result.message).toBe("");
+    }
+    expect(variants).toEqual(["K9", "K0", "K1", "K2", "K3", "K4"]);
+    expect(skipped.find(item => item.functionName === "diagnostic")?.reason).toContain("4 more values not generated");
+    expect(mutants.filter(item => item.functionName === "nine")).toHaveLength(6);
+    expect(skipped.find(item => item.functionName === "nine")?.reason).toContain("3 more values not generated");
+    const literals: string[] = [];
+    for (const mutant of mutants.filter(item => item.functionName === "literal")) literals.push((yield* loadMutation<{ literal: () => string }>(mutant)).literal());
+    expect(literals.sort()).toEqual(["a", "c"]);
+    expect(mutants.filter(item => item.functionName === "many" && item.genre === "SwallowTag")).toHaveLength(2);
+    expect(mutants.filter(item => item.functionName === "four" && item.genre === "SwallowTag")).toHaveLength(8);
+    for (const name of ["numeric", "text", "struct"]) expect(mutants.filter(item => item.functionName === name && item.genre === "SwallowTag")).toHaveLength(2);
+    expect(skipped.some(item => item.functionName.startsWith("excluded.<callback>"))).toBe(false);
+    const filtered = yield* source.notMutated({ ...selected, functionFilter: ["diagnostic"] });
+    expect(filtered.some(item => item.functionName === "internal.<callback>")).toBe(false);
+    const exported = yield* source.notMutated({ ...selected, exportedOnly: true });
+    expect(exported.some(item => item.functionName === "internal.<callback>")).toBe(false);
+  }).pipe(Effect.scoped), 30_000);
+
+  it.effect("represents a real declaration-less viability hole as a located skip, not unviable", () => Effect.gen(function* () {
+    const source = makeSource();
+    const [mutant] = yield* collect(source, { ...input, include: ["**/viability.ts"] });
+    expect(mutant).toBeDefined();
+    const broken = { ...mutant!, replacement: { ...mutant!.replacement, text: "dynamic<boolean>()" } };
+    const result = yield* source.checkViable(broken);
+    expect(result.analysisFailed?.reason).toMatch(/^analysis failed:/);
+    expect(result.analysisFailed?.span).toEqual(mutant!.span);
+    expect(result.diagnostics).toEqual([]);
+  }));
 });
 
 describe("checker-directed mutation", () => {

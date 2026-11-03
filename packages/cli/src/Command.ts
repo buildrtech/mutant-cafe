@@ -101,6 +101,12 @@ export const makeCommand = (options: {
   const mutants = ordered.slice(0, maxMutants);
   const notMutated = selected.notMutated;
   const counts = { selected: ordered.length, run: 0, budgetSkipped: ordered.length - mutants.length };
+  if (mutants.length === 0) {
+    const cause = ordered.length > 0 ? "budget" : range !== undefined ? "range"
+      : inDiff !== undefined || diffText !== undefined ? "diff"
+      : config.functionFilter.length || config.exportedOnly ? "filter" : "file selection";
+    yield* Console.error(`0 mutants selected (${counts.selected} before budget); cause: ${cause}. Baseline skipped.`);
+  }
   const markdown = input.format === "github" || summaryMd !== undefined ? {
     gitRoot, marker: input.summaryMarker, advisory: input.advisory, stdout: input.format === "github",
     files: [...(summaryMd === undefined ? [] : [path.resolve(root, summaryMd)]),

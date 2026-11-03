@@ -10,6 +10,7 @@ import * as Fiber from "effect/Fiber";
 import * as ChildProcess from "effect/process/ChildProcess";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 
+import { makeMutantSource, makeTypeScriptOracle } from "../../engine/src/index.ts";
 import { preflight } from "../src/Preflight.ts";
 import { runMutants, ScratchLive, TestRunnerLive } from "../src/index.ts";
 
@@ -47,6 +48,31 @@ const selectionFixture = Effect.gen(function* () {
 });
 
 describe("real vitest mutation runs", () => {
+  it.effect("records a real compiler viability hole without creating an unviable outcome", () => Effect.gen(function* () {
+    const source = makeMutantSource(makeTypeScriptOracle());
+    const input = { ...config(root), tsconfig: "../../packages/engine/test/fixtures/honesty/tsconfig.json", include: ["**/viability.ts"] };
+    // The fixture sits outside tagged-errors, so discovery uses the workspace as its root.
+    const workspace = decodeURIComponent(new URL("../../../", import.meta.url).pathname).replace(/\/$/, "");
+    const selected = { ...input, root: workspace, tsconfig: "packages/engine/test/fixtures/honesty/tsconfig.json" };
+    const [original] = yield* Stream.runCollect(source.generate(selected));
+    expect(original).toBeDefined();
+    const mutant = { ...original!, replacement: { ...original!.replacement, text: "dynamic<boolean>()" } };
+    const reports: RunReport[] = [];
+    let progressed = false;
+    const report = yield* runMutants(selected, Stream.make(mutant)).pipe(
+      Effect.provideService(MutantSource, source),
+      Effect.provideService(Reporter, { progress: () => Effect.sync(() => { progressed = true; }), write: report => Effect.sync(() => { reports.push(report); }) }),
+      Effect.provideService(Scratch, { acquire: () => Effect.succeed({ path: workspace, apply: () => Effect.void, revert: () => Effect.void }) }),
+      Effect.provideService(TestRunner, { baseline: () => Effect.succeed({ durationMs: 1, testCommand: [] }), runRelated: () => Effect.die("Compiler hole must not run tests") }),
+    );
+    expect(progressed).toBe(false);
+    expect(report.results).toEqual([]);
+    expect(report.notMutated).toHaveLength(1);
+    expect(report.notMutated![0]!.reason).toMatch(/^analysis failed:/);
+    expect(report.notMutated![0]!.span).toEqual(mutant.span);
+    expect(reports).toHaveLength(1);
+  }).pipe(Effect.provide(NodeServices.layer)));
+
   it.effect("reports an empty selection without acquiring scratch or running a baseline", () => Effect.gen(function* () {
     const reports: RunReport[] = [];
     const result = yield* withPorts(runMutants(config(), Stream.empty), reports).pipe(

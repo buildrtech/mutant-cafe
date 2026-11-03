@@ -113,5 +113,6 @@ export const RunReport = Schema.Struct({
   timeoutMs: Schema.Int,
   results: Schema.Array(MutantResult),
   failure: Schema.optional(Schema.String),
+  notMutated: Schema.optional(Schema.Array(NotMutated)),
 });
 export type RunReport = typeof RunReport.Type;
