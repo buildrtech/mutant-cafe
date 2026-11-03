@@ -65,10 +65,12 @@ export function* generateFunction(fn: MutableFunction): Generator<Mutant> {
       break;
     }
     case "Layer": {
-      const layer = api("Layer", "effect");
+      const layer = api("Layer", "effectContext");
       const fail = api("Effect", "fail");
       if (layer && fail && shape.service) {
-        for (const error of shape.errors) yield candidate("LayerFail", `${layer}(${shape.service}, ${fail}(${error.text}))`, error);
+        // Layer output is contravariant. Let the pinned return type infer the
+        // complete output context, not just the first service found in the body.
+        for (const error of shape.errors) yield candidate("LayerFail", `${layer}(${fail}(${error.text}))`, error);
       }
       break;
     }

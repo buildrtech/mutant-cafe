@@ -74,6 +74,27 @@ it.live("the real CLI reports three distinct missed mutants with root-relative c
   expect(report.results.every((result) => path.isAbsolute(result.mutant.file))).toBe(true);
 }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)), 60_000);
 
+it.live("the real CLI catches a viable multi-service layer failure", () => Effect.gen(function* () {
+  const fs = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const root = path.resolve(import.meta.dirname, "../../engine/test/fixtures/viability");
+  const output = yield* fs.makeTempDirectoryScoped({ prefix: "multi-layer-e2e-" });
+  const handle = yield* ChildProcess.make(process.execPath, [
+    path.resolve(import.meta.dirname, "../src/bin.ts"), "--file", "src/layers.ts", "--output", path.join(output, "report"),
+  ], { cwd: root });
+  const [logs, code] = yield* Effect.all([
+    Stream.mkString(Stream.decodeText(handle.all)), handle.exitCode,
+  ], { concurrency: "unbounded" });
+  expect(Number(code), logs).toBe(0);
+  const report = yield* Schema.decodeEffect(Schema.fromJsonString(RunReport))(
+    yield* fs.readFileString(path.join(output, "report/outcomes.json")),
+  );
+  expect(report.results).toHaveLength(1);
+  expect(report.results[0]?.mutant.genre).toBe("LayerFail");
+  expect(report.results[0]?.outcome, logs).toBe("caught");
+  expect(report.results[0]?.diagnostics).toEqual([]);
+}).pipe(Effect.scoped, Effect.provide(NodeServices.layer)), 30_000);
+
 it.effect("writes missed output, returns CI failure, and rotates the previous run", () => Effect.gen(function*() {
   const fs = yield* FileSystem.FileSystem;
   const root = yield* project;

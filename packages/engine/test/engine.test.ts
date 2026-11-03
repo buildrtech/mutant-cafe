@@ -101,6 +101,15 @@ describe("checker-directed mutation", () => {
     expect(selected.map(m => [m.id, m.replacement])).toEqual(mutants.filter(m => m.file.endsWith("/advanced.ts")).map(m => [m.id, m.replacement]));
   }), 30_000);
 
+  it.effect("keeps a failing multi-service layer viable", () => Effect.gen(function* () {
+    const source = makeSource();
+    const mutants = yield* collect(source, config("packages/engine/test/fixtures/viability/tsconfig.json", { functionFilter: ["services"] }));
+    expect(mutants).toHaveLength(1);
+    const mutant = mutants[0]!;
+    expect(mutant.genre).toBe("LayerFail");
+    expect((yield* source.checkViable(mutant)).diagnostics).toEqual([]);
+  }));
+
   it.effect("gives every generated mutant a distinct description within its function", () => Effect.gen(function* () {
     const source = makeSource();
     for (const input of [fixture, extra]) {
