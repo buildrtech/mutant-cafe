@@ -31,7 +31,7 @@ const program = Effect.gen(function* () {
   const directories = new Set();
   const rawInspector = yield* ProcessInspector;
   let delayCleanup = false; let delayed = false; let inspectionPasses = 0;
-  let interruptTeardownMs; let workerTimeoutMs;
+  let interruptTeardownMs; let workerTimeoutMs; let busyRunMs;
   const inspector = { inspect: args => delayCleanup && !delayed && inspectionPasses++ > 0 ? Effect.gen(function* () {
     delayed = true;
     appendFileSync(proof, JSON.stringify({ kind: "cleanup-stalled" }) + "\n");
@@ -73,9 +73,15 @@ const program = Effect.gen(function* () {
         yield* escaped.pipe(Effect.timeout(10_000));
         yield* Fiber.interrupt(fiber);
       } else {
+        if (scenario === "busy") appendFileSync(proof, JSON.stringify({ kind: "busy-run-started" }) + "\n");
         const started = performance.now();
         const result = yield* (scenario === "worker-timeout" ? run.pipe(Effect.timeout(7000)) : run);
         if (scenario === "worker-timeout") workerTimeoutMs = performance.now() - started;
+        if (scenario === "busy") {
+          busyRunMs = performance.now() - started;
+          appendFileSync(proof, JSON.stringify({ kind: "busy-run-completed", busyRunMs }) + "\n");
+          if (busyRunMs >= 15_000) throw new Error(`Busy run and cleanup exceeded 15s: ${busyRunMs} ms`);
+        }
         if (scenario !== "sigint" && result.status !== (["normal", "minimal-env"].includes(scenario) ? "passed" : ["crash", "worker-timeout", "unhandled"].includes(scenario) ? "failed" : "timedOut")) throw new Error(`Unexpected fixture status: ${result.status}; ${result.output}`);
         if (mode === "warm" && scenario !== "crash" && result.hostPid !== baseline.hostPid) throw new Error("Healthy warm instance was restarted");
       }
@@ -88,7 +94,7 @@ const program = Effect.gen(function* () {
       if (control.status !== "passed") throw new Error(`Next-mutant control failed: ${control.status}; ${control.output}`);
       if (mode === "warm" && scenario !== "crash" && control.hostPid !== baseline.hostPid) throw new Error("Next mutant lost the warm host");
     }), () => dir.revert(mutant).pipe(Effect.andThen(() => tests.invalidate(dir, mutant.file)), Effect.orDie));
-    return { ...(yield* tests.stats), ...(interruptTeardownMs === undefined ? {} : { interruptTeardownMs }), ...(workerTimeoutMs === undefined ? {} : { workerTimeoutMs }) };
+    return { ...(yield* tests.stats), ...(interruptTeardownMs === undefined ? {} : { interruptTeardownMs }), ...(workerTimeoutMs === undefined ? {} : { workerTimeoutMs }), ...(busyRunMs === undefined ? {} : { busyRunMs }) };
   }).pipe(Effect.provide(Layer.mergeAll(ScratchLive, TestRunnerLive)), Effect.provideService(FileSystem.FileSystem, tracked), Effect.provideService(ProcessInspector, inspector)));
   yield* fs.writeFileString(proof + ".summary.json", JSON.stringify(metrics));
   console.log("process-cleanup:finished");

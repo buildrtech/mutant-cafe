@@ -1,5 +1,6 @@
 import { Scratch, ScratchError, type Mutant, type ScratchDir } from "@mutant-cafe/core";
 import * as Effect from "effect/Effect";
+import * as Console from "effect/Console";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
@@ -15,7 +16,9 @@ export const ScratchLive = Layer.effect(Scratch, Effect.gen(function* () {
   const skipVanished = (from: string, to: string) => <E extends PlatformError.PlatformError | ScratchError>(effect: Effect.Effect<void, E>) => effect.pipe(Effect.catch(error => {
     if (error._tag !== "PlatformError" || error.reason._tag !== "NotFound") return Effect.fail(error);
     return Effect.gen(function* () {
-      if (yield* fs.exists(from)) return yield* Effect.fail(error);
+      const entry = yield* fs.lstat(from).pipe(Effect.result);
+      if (entry._tag === "Success") return yield* Effect.fail(error); // Includes dangling symlinks: the source entry still exists.
+      if (entry.failure.reason._tag !== "NotFound") return yield* Effect.fail(entry.failure);
       // Only our partial destination is removed, never a source entry.
       yield* fs.remove(to, { recursive: true, force: true });
       yield* Effect.logDebug("Scratch copy skipped a vanished source", { source: from });
@@ -41,7 +44,7 @@ export const ScratchLive = Layer.effect(Scratch, Effect.gen(function* () {
       const temp = yield* Effect.acquireRelease(
         fs.makeTempDirectory({ prefix: "mutant-cafe-" }).pipe(
           Effect.mapError((error) => failure("create", source, error))),
-        (dir) => fs.remove(dir, { recursive: true, force: true }).pipe(Effect.interruptible, Effect.timeout(2000), Effect.catch(error => Effect.logWarning(`Scratch removal did not complete within its cleanup budget: ${error.message}`, { path: dir })))
+        (dir) => fs.remove(dir, { recursive: true, force: true }).pipe(Effect.interruptible, Effect.timeout(30_000), Effect.catch(error => Console.warn(`Warning: scratch removal did not complete within its cleanup budget: ${error.message}`, { path: dir })))
       );
       // Materialize source symlinks, except dependencies. No editable file in
       // the scratch tree may point back into the original checkout.

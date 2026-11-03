@@ -294,7 +294,7 @@ describe("real vitest mutation runs", () => {
     const dir = yield* selectionFixture;
     yield* fs.remove(`${dir.path}/node_modules`);
     yield* fs.makeDirectory(`${dir.path}/node_modules`);
-    for (const name of ["vitest", "effect"]) yield* fs.symlink(yield* fs.realPath(`${root}/node_modules/${name}`), `${dir.path}/node_modules/${name}`);
+    for (const name of [".bin", "vitest", "effect"]) yield* fs.symlink(yield* fs.realPath(`${root}/node_modules/${name}`), `${dir.path}/node_modules/${name}`);
     yield* fs.symlink(dir.path, `${dir.path}/node_modules/self-fixture`);
     yield* fs.writeFileString(`${dir.path}/package.json`, JSON.stringify({ name: "self-fixture", type: "module", main: "./src/self.ts", scripts: { test: "vitest run" } }));
     const original = "export const value = () => true;";

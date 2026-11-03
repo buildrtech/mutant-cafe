@@ -6,7 +6,7 @@ import { value } from "../src/value.ts";
 
 const proof = process.env.MUTANT_CAFE_PID_PROOF;
 const inspect = (pid, field) => {
-  try { return execFileSync("ps", ["-p", String(pid), "-o", field + "="], { encoding: "utf8", env: { ...process.env, TZ: "UTC", LC_ALL: "C" }, stdio: ["ignore", "pipe", "ignore"] }).trim(); }
+  try { return execFileSync("ps", ["-p", String(pid), "-o", field + "="], { encoding: "utf8", timeout: 2000, env: { ...process.env, TZ: "UTC", LC_ALL: "C" }, stdio: ["ignore", "pipe", "ignore"] }).trim(); }
   catch { return ""; }
 };
 const record = (pid, kind) => appendFileSync(proof, JSON.stringify({ pid, kind, birth: inspect(pid, "lstart"), pgid: Number(inspect(pid, "pgid")) }) + "\n");
@@ -34,14 +34,14 @@ it("checks the value without leaving a worker behind", async () => {
   let parent = Number(inspect(process.pid, "ppid"));
   while (parent > 1) {
     let labelled = "";
-    try { labelled = execFileSync("ps", ["eww", "-p", String(parent), "-o", "command="], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }); } catch {}
+    try { labelled = execFileSync("ps", ["eww", "-p", String(parent), "-o", "command="], { encoding: "utf8", timeout: 2000, stdio: ["ignore", "pipe", "ignore"] }); } catch {}
     if (!labelled.includes("MUTANT_CAFE_PROCESS_TOKEN=" + process.env.MUTANT_CAFE_PROCESS_TOKEN)) break;
     record(parent, "ancestor");
     parent = Number(inspect(parent, "ppid"));
   }
   if (mode === 7) {
     const cursor = readFileSync(proof).length;
-    const escapedCode = `const fs = require("node:fs"), cp = require("node:child_process"); if (Object.keys(process.env).filter(key => !key.startsWith("__CF_")).length) throw new Error("explicit env changed"); const pid = process.pid; const inspect = field => cp.execFileSync("ps", ["-p", String(pid), "-o", field + "="], { encoding: "utf8", env: { TZ: "UTC", LC_ALL: "C" } }).trim(); fs.appendFileSync(${JSON.stringify(proof)}, JSON.stringify({ pid, kind: "escaped", birth: inspect("lstart"), pgid: Number(inspect("pgid")) }) + "\\n"); while (true) {}`;
+    const escapedCode = `const fs = require("node:fs"), cp = require("node:child_process"); if (Object.keys(process.env).filter(key => !key.startsWith("__CF_")).length) throw new Error("explicit env changed"); const pid = process.pid; const inspect = field => cp.execFileSync("ps", ["-p", String(pid), "-o", field + "="], { encoding: "utf8", timeout: 2000, env: { TZ: "UTC", LC_ALL: "C" } }).trim(); fs.appendFileSync(${JSON.stringify(proof)}, JSON.stringify({ pid, kind: "escaped", birth: inspect("lstart"), pgid: Number(inspect("pgid")) }) + "\\n"); while (true) {}`;
     // The env-less parent has no preload. Its env-less child must be found
     // through the live PPID chain, not a label or a grandchild ledger record.
     const code = escapedCode.replace('kind: "escaped"', 'kind: "middle"').replace("while (true) {}", `const child = cp.spawn(process.execPath, ["-e", ${JSON.stringify(escapedCode)}], { detached: true, stdio: "ignore", env: {} }); child.unref(); while (true) {}`);
@@ -52,7 +52,7 @@ it("checks the value without leaving a worker behind", async () => {
   }
   if ([2, 3, 4, 5].includes(mode)) {
     const shared = `const fs = require("node:fs"), cp = require("node:child_process"); const proof = ${JSON.stringify(proof)};
-      const inspect = field => cp.execFileSync("ps", ["-p", String(process.pid), "-o", field + "="], { encoding: "utf8", env: { ...process.env, TZ: "UTC", LC_ALL: "C" }, stdio: ["ignore", "pipe", "ignore"] }).trim();
+      const inspect = field => cp.execFileSync("ps", ["-p", String(process.pid), "-o", field + "="], { encoding: "utf8", timeout: 2000, env: { ...process.env, TZ: "UTC", LC_ALL: "C" }, stdio: ["ignore", "pipe", "ignore"] }).trim();
       const record = kind => fs.appendFileSync(proof, JSON.stringify({ pid: process.pid, kind, birth: inspect("lstart"), pgid: Number(inspect("pgid")) }) + "\\n");`;
     const escaped = shared + 'record("escaped"); while (true) {}';
     const middle = shared + `record("middle"); const child = cp.spawn(process.execPath, ["-e", ${JSON.stringify(escaped)}], { detached: true, stdio: "ignore" }); child.unref();`;

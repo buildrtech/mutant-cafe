@@ -55,6 +55,10 @@ for (const mode of ["cold", "warm"]) {
       const directory = yield* fs.makeTempDirectoryScoped({ prefix: "mutant-pid-proof-" });
       const proof = `${directory}/pids.jsonl`;
       yield* fs.writeFileString(proof, "");
+      const artifact = process.env.MUTANT_CAFE_PROCESS_PROOF;
+      // Preserve stage markers and identities even when the controller times out.
+      // Registered before the reaper so evidence is captured after its cleanup.
+      yield* Effect.addFinalizer(() => artifact ? fs.readFileString(proof).pipe(Effect.flatMap(text => fs.writeFileString(`${artifact}-${mode}-${scenario}.jsonl`, text)), Effect.orDie) : Effect.void);
       // A failed proof must not itself leave the fixture's busy loops running.
       yield* Effect.addFinalizer(() => Effect.sync(() => {
         const deadline = performance.now() + 2500;
@@ -89,6 +93,10 @@ for (const mode of ["cold", "warm"]) {
         const timings = yield* Schema.decodeEffect(Schema.fromJsonString(Schema.Struct({ workerTimeoutMs: Schema.optional(Schema.Finite), interruptTeardownMs: Schema.optional(Schema.Finite) })))(yield* fs.readFileString(proof + ".summary.json"));
         expect(timings[scenario === "worker-timeout" ? "workerTimeoutMs" : "interruptTeardownMs"]).toBeLessThan(scenario === "worker-timeout" ? 7000 : 5000);
       }
+      if (scenario === "busy") {
+        const timings = yield* Schema.decodeEffect(Schema.fromJsonString(Schema.Struct({ busyRunMs: Schema.Finite })))(yield* fs.readFileString(proof + ".summary.json"));
+        expect(timings.busyRunMs).toBeLessThan(15_000);
+      }
       expect(yield* handle.isRunning).toBe(false);
       const observed = records(proof);
       expect(observed.some(item => item.kind === "worker")).toBe(true);
@@ -99,7 +107,6 @@ for (const mode of ["cold", "warm"]) {
         expect(escaped.every(item => item.pgid === item.pid)).toBe(true);
       }
       expect(survivorsOf(observed).map(item => item.pid)).toEqual([]);
-      const artifact = process.env.MUTANT_CAFE_PROCESS_PROOF;
       if (artifact) yield* fs.writeFileString(`${artifact}-${mode}-${scenario}.json`, JSON.stringify({ mode, scenario, driverPid: handle.pid, code, observed }, null, 2));
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)), 60_000);
   }

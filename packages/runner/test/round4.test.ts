@@ -25,7 +25,7 @@ const mutant = (id: string, value: number): Mutant => ({ id, file: "src/value.ts
 const fixture = (test = 'import { it, expect } from "vitest"; import { value } from "../src/value.ts"; it("value", () => expect(value()).toBe(1));', options = "") => Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem;
   const root = yield* fs.makeTempDirectoryScoped({ prefix: "round-four-" });
-  yield* fs.symlink(`${workspace}/packages/runner/node_modules`, `${root}/node_modules`);
+  yield* fs.symlink(`${workspace}/fixtures/tagged-errors/node_modules`, `${root}/node_modules`);
   yield* fs.makeDirectory(`${root}/src`); yield* fs.makeDirectory(`${root}/checks`);
   yield* fs.writeFileString(`${root}/package.json`, JSON.stringify({ type: "module", scripts: { test: "vitest run" } }));
   yield* fs.writeFileString(`${root}/tsconfig.json`, JSON.stringify({ compilerOptions: { target: "ES2022", module: "NodeNext", moduleResolution: "NodeNext", noEmit: true }, include: ["src"] }));

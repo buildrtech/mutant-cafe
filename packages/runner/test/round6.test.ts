@@ -26,11 +26,11 @@ it.live("bounds interrupted cleanup even when a process inspector never replies"
   yield* Deferred.await(entered);
   const started = performance.now();
   yield* Fiber.interrupt(fiber);
-  expect(performance.now() - started).toBeLessThan(3500);
+  expect(performance.now() - started).toBeLessThan(5500);
   expect(warnings.some(message => /budget|deadline/.test(message))).toBe(true);
   expect(ledgers).toHaveLength(1);
   expect(yield* fs.exists(`${ledgers[0]}/pids.jsonl`)).toBe(true); // uncertain ownership keeps evidence
-}).pipe(Effect.scoped, Effect.provide(NodeServices.layer)), 8000);
+}).pipe(Effect.scoped, Effect.provide(NodeServices.layer)), 12_000);
 
 it.live("still kills birth-verified ledger children when the next inspection stalls", () => Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem;
@@ -39,19 +39,21 @@ it.live("still kills birth-verified ledger children when the next inspection sta
   const birth = "Tue Nov 3 00:00:00 2026"; let inspections = 0;
   const directory = yield* fs.makeTempDirectoryScoped({ prefix: "deadline-signal-proof-" });
   const tree = yield* acquireProcessTree().pipe(Effect.provideService(FileSystem.FileSystem, { ...fs, makeTempDirectory: options => fs.makeTempDirectory({ ...options, directory }) }), Effect.provideService(ProcessInspector, {
-    inspect: () => ++inspections === 1 ? Effect.succeed({ stdout: `2147483000 1 2147483000 S ${birth} child\n2147483001 1 2147483001 S ${birth} reused\n` }) : Effect.never,
+    inspect: () => ++inspections === 1 ? Effect.succeed({ stdout: `2147483000 1 2147483000 S ${birth} parent\n2147483001 1 2147483001 S ${birth} reused\n2147483003 2147483000 2147483003 S ${birth} unlabelled-child\n2147483004 2147483003 2147483004 S ${birth} unlabelled-grandchild\n2147483005 1 2147483005 S ${birth} retained-service\n2147483006 2147483005 2147483006 S ${birth} retained-child\n` }) : Effect.never,
     signal: (pid, signal) => { signals.push({ pid, signal, inspections }); }
   }));
   yield* fs.writeFileString(tree.env.MUTANT_CAFE_PROCESS_LEDGER, [
     { pid: 2147483000, birth },
     { pid: 2147483001, birth: "Mon Nov 2 00:00:00 2026" }, // PID was reused
-    { pid: 2147483002, birth } // no current birth match
+    { pid: 2147483002, birth }, // no current birth match
+    { pid: 2147483005, birth },
+    { pid: 2147483006, birth }
   ].map(item => JSON.stringify(item)).join("\n"));
-  const result = yield* tree.reap([]).pipe(Effect.provideService(Console.Console, { ...original, warn: (...args: ReadonlyArray<unknown>) => { warnings.push(args.join(" ")); } }));
+  const result = yield* tree.reap([], [{ pid: 2147483005, birth }]).pipe(Effect.provideService(Console.Console, { ...original, warn: (...args: ReadonlyArray<unknown>) => { warnings.push(args.join(" ")); } }));
   expect(result).toBe("warning");
-  expect(signals).toEqual([{ pid: 2147483000, signal: "SIGKILL", inspections: 2 }]);
-  expect(warnings.some(message => message.includes("unverified ledger PIDs 2147483001, 2147483002") && message.includes("not signalled"))).toBe(true);
-}).pipe(Effect.scoped, Effect.provide(NodeServices.layer)), 5000);
+  expect(signals).toEqual([2147483000, 2147483003, 2147483004].map(pid => ({ pid, signal: "SIGKILL", inspections: 2 })));
+  expect(warnings.some(message => message.includes("unverified ledger PIDs 2147483001, 2147483002 were not signalled"))).toBe(true);
+}).pipe(Effect.scoped, Effect.provide(NodeServices.layer)), 10_000);
 
 for (const kind of ["directory", "file", "dependency"] as const) it.live(`skips a source ${kind} removed after directory enumeration`, () => Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem;

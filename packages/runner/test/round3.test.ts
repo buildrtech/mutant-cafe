@@ -27,7 +27,7 @@ const run = (settings: RunConfig, mutants: ReadonlyArray<Mutant>) => runMutants(
 const fixture = (code: string, check: string, options = "") => Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem;
   const root = yield* fs.makeTempDirectoryScoped({ prefix: "round-three-" });
-  yield* fs.symlink(`${workspace}/packages/runner/node_modules`, `${root}/node_modules`);
+  yield* fs.symlink(`${workspace}/fixtures/tagged-errors/node_modules`, `${root}/node_modules`);
   yield* fs.makeDirectory(`${root}/src`);
   yield* fs.makeDirectory(`${root}/checks`);
   yield* fs.writeFileString(`${root}/package.json`, JSON.stringify({ type: "module", scripts: { test: "vitest run" } }));
@@ -110,7 +110,7 @@ describe("round three regression proof", () => {
     const fs = yield* FileSystem.FileSystem;
     const root = yield* fs.makeTempDirectoryScoped({ prefix: "default-workers-" });
     yield* fs.copy(`${workspace}/packages/runner/test/fixtures/parallel`, root);
-    yield* fs.symlink(`${workspace}/packages/runner/node_modules`, `${root}/node_modules`);
+    yield* fs.symlink(`${workspace}/fixtures/tagged-errors/node_modules`, `${root}/node_modules`);
     yield* fs.writeFileString(`${root}/tsconfig.json`, JSON.stringify({ compilerOptions: { target: "ES2022", module: "NodeNext", moduleResolution: "NodeNext", allowImportingTsExtensions: true, noEmit: true }, include: ["src"] }));
     yield* fs.writeFileString(`${root}/vitest.config.ts`, 'export default { test: { include: ["checks/*.fixture.mjs"] } };');
     const original = yield* fs.readFileString(`${root}/src/value.ts`);
