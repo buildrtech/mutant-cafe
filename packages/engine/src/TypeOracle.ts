@@ -19,6 +19,8 @@ export interface MutableFunction {
   readonly file: string;
   readonly name: string;
   readonly returnType: string;
+  readonly displayReturnType: string;
+  readonly equivalentValues: ReadonlyArray<string>;
   readonly span: Mutant["span"];
   readonly startOffset: number;
   readonly endOffset: number;

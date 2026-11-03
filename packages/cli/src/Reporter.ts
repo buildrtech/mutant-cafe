@@ -7,35 +7,22 @@ import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
+import { unifiedDiff } from "./UnifiedDiff.ts";
 
 export const mutantLine = (mutant: Mutant, root: string, path: Path.Path): string =>
-  `${path.relative(root, path.resolve(root, mutant.file))}:${mutant.span.start.line}:${mutant.span.start.column}: ${mutant.description}`;
+  `${path.relative(root, path.resolve(root, mutant.file))}:${mutant.span.start.line}:${mutant.span.start.column}: ${mutant.description.replace(mutant.returnType, shortType(mutant.displayReturnType ?? mutant.returnType))} [${mutant.id}]`;
 
-const outcomes = ["caught", "missed", "timeout", "unviable"] as const;
+const shortType = (text: string): string => {
+  const line = text.replace(/\s+/g, " ");
+  return line.length > 80 ? line.slice(0, 79) + "…" : line;
+};
+
+const outcomes = ["caught", "missed", "timeout", "unviable", "untested"] as const;
 const jsonReport = Schema.encodeEffect(Schema.fromJsonString(RunReport));
 const logText = (result: MutantResult): string => [
   ...("output" in result && typeof result.output === "string" ? [result.output] : []),
   ...result.diagnostics,
 ].join("\n");
-
-// A whole-file hunk is deliberately used: it is a valid patch even for replacements
-// spanning many lines, and it preserves the no-final-newline marker on both sides.
-const unifiedDiff = (mutant: Mutant, original: string): string => {
-  const replacement = mutant.replacement;
-  const modified = original.slice(0, replacement.startOffset) + replacement.text + original.slice(replacement.endOffset);
-  const body = (text: string, prefix: string): ReadonlyArray<string> => {
-    if (text === "") return [];
-    const lines = text.split("\n");
-    if (lines.at(-1) === "") lines.pop();
-    const result = lines.map((line) => prefix + line);
-    if (!text.endsWith("\n")) result.push("\\ No newline at end of file");
-    return result;
-  };
-  const count = (text: string) => text === "" ? 0 : text.split("\n").length - (text.endsWith("\n") ? 1 : 0);
-  const oldCount = count(original);
-  const newCount = count(modified);
-  return [`--- a/${mutant.file}`, `+++ b/${mutant.file}`, `@@ -${oldCount === 0 ? 0 : 1},${oldCount} +${newCount === 0 ? 0 : 1},${newCount} @@`, ...body(original, "-"), ...body(modified, "+"), ""].join("\n");
-};
 
 export const makeReporter = Effect.fn("makeReporter")(function*(options: {
   readonly root: string;
@@ -80,7 +67,7 @@ export const makeReporter = Effect.fn("makeReporter")(function*(options: {
   yield* Effect.forEach(outcomes, (outcome) => fs.writeFileString(path.join(dir, `${outcome}.txt`), ""), { discard: true }).pipe(Effect.mapError(writeError));
   for (const mutant of options.mutants) {
     const original = yield* fs.readFileString(path.resolve(options.root, mutant.file)).pipe(Effect.mapError(writeError));
-    yield* fs.writeFileString(path.join(dir, "diff", `${mutant.id}.diff`), unifiedDiff(mutant, original)).pipe(Effect.mapError(writeError));
+    yield* fs.writeFileString(path.join(dir, "diff", `${mutant.id}.diff`), unifiedDiff(original, original.slice(0, mutant.replacement.startOffset) + mutant.replacement.text + original.slice(mutant.replacement.endOffset), path.relative(options.root, path.resolve(options.root, mutant.file)).replaceAll("\\", "/"))).pipe(Effect.mapError(writeError));
   }
   const writeLists = (items: ReadonlyArray<MutantResult>) => Effect.forEach(outcomes, (outcome) => {
     const lines = items.filter((result) => result.outcome === outcome).map((result) => mutantLine(result.mutant, options.root, path));

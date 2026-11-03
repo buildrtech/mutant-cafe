@@ -33,7 +33,7 @@ The command operates on `root` (normally the current working directory):
 | --- | --- |
 | `--list` | Print selected mutants without testing or writing reports |
 | `--in-diff <file>` | Select spans intersecting added lines; validate the diff's new side against the tree |
-| `--file <glob>` | Include glob, repeatable; default `**/*.ts`, `**/*.tsx` |
+| `--file <glob>` | Include glob, repeatable; default `**/*.{ts,tsx}` |
 | `--exclude <glob>` | Exclude glob, repeatable |
 | `--jobs <integer>` | Positive worker count, default 1 |
 | `--timeout <seconds>` | Positive absolute timeout, converted to milliseconds |
@@ -45,12 +45,16 @@ The command operates on `root` (normally the current working directory):
 Optional `mutants.config.json` is decoded with core `ConfigFile`. Supplied flags
 win. Array flags replace, rather than append to, the corresponding config array.
 `functionFilter` is read from the config file; `minimumTimeoutMs` there is in
-milliseconds. The internal `neverTimeoutMs` default is 1000 ms.
+milliseconds. The internal `neverTimeoutMs` floor is 1000 ms; the actual budget
+uses the measured unmutated related-run duration × the multiplier. Include globs
+that match no source files exit 1 and name each unmatched glob.
 
 Text unified diffs (including git headers, multiple files/hunks, additions,
 deletions and missing final newlines) are checked for consistent hunk counts and
 new-side text. Deleted files select no mutants. Empty diffs select nothing.
-Binary patches are not supported. Paths escaping the project root are rejected.
+Binary patches are not supported. Paths resolve from the Git toplevel, with a
+cwd-relative fallback for `--relative` diffs and outside Git. Paths escaping the
+repository root are rejected.
 
 ## Report lifecycle
 
@@ -64,8 +68,11 @@ Binary patches are not supported. Paths escaping the project root are rejected.
 - Schema-encode all selected mutants to `mutants.json` before execution.
 - Write valid unified patches to `diff/<id>.diff` against the original source.
   Mutant IDs must be unique safe filenames.
-- Write `logs/<id>.log` and the four outcome lists as results arrive. Lines in
-  lists are `file:line:col: description`. Progress writes are serialized.
+- Write `logs/<id>.log` and the five outcome lists, including `untested.txt`, as
+  results arrive. Lines are `file:line:col: description [id]`. Declared return types
+  are preferred; inferred display types are capped at 80 characters. JSON retains
+  full types. Progress writes are serialized. List mode ends with per-file counts
+  and a total.
 - Print each result as it arrives. If a progress write fails, warn once and
   retain the typed error for `Reporter.write`; the core progress contract has
   no error channel.
@@ -83,10 +90,10 @@ successful core `Baseline` contract.
 
 ## CI exits
 
-0: all viable mutants caught (or list mode); 1: usage/config; 2: missed;
-3: timeout with no missed mutants; 4: baseline failed; 5: new-side diff/tree
+0: no missed, untested or timed-out mutants (or list mode); 1: usage/config; 2: missed or untested;
+3: timeout with no missed or untested mutants; 4: baseline failed; 5: new-side diff/tree
 mismatch; 6: invalid/unreadable diff; 70: internal/report/platform errors.
-A missed mutant takes precedence over a timeout in the same report.
+A missed or untested mutant takes precedence over a timeout in the same report.
 
 Cargo-mutants is the inspiration for the exit table and output layout:
 [exit codes](https://mutants.rs/exit-codes.html),

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "@effect/vitest";
-import { MutantSource, Reporter, Scratch, type Mutant, type RunConfig, type RunReport } from "@mutant-cafe/core";
+import { MutantSource, Reporter, Scratch, TestRunner, type Mutant, type RunConfig, type RunReport } from "@mutant-cafe/core";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -34,7 +34,90 @@ const withPorts = <A, E, R>(effect: Effect.Effect<A, E, R>, reports: Array<RunRe
   Effect.provideService(Reporter, { progress: () => Effect.void, write: (report) => Effect.sync(() => { reports.push(report); }) })
 );
 
+const selectionFixture = Effect.gen(function* () {
+  const fs = yield* FileSystem.FileSystem;
+  const dir = yield* fs.makeTempDirectoryScoped({ directory: root, prefix: "selection-" });
+  yield* fs.symlink(`${root}/node_modules`, `${dir}/node_modules`);
+  yield* fs.makeDirectory(`${dir}/src`);
+  yield* fs.makeDirectory(`${dir}/test`);
+  yield* fs.writeFileString(`${dir}/package.json`, '{"type":"module"}');
+  yield* fs.writeFileString(`${dir}/vitest.config.ts`, 'export default { test: { include: ["test/**/*.test.ts"], testTimeout: 0 } };');
+  return { path: dir, apply: () => Effect.void, revert: () => Effect.void };
+});
+
 describe("real vitest mutation runs", () => {
+  it.live("falls back from no related files to the full suite, and distinguishes zero tests (B5)", () => Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const dir = yield* selectionFixture;
+    yield* fs.writeFileString(`${dir.path}/src/orphan.ts`, 'export const value = () => 2;');
+    yield* fs.writeFileString(`${dir.path}/test/indirect.test.ts`, 'import { it, expect } from "vitest"; const file = "../src/orphan.ts"; it("dynamic consumer", async () => { const m = await import(file); expect(m.value()).toBe(1); });');
+    const tests = yield* TestRunner;
+    expect((yield* tests.runRelated(dir, "src/orphan.ts", 5000)).status).toBe("failed");
+    yield* fs.remove(`${dir.path}/test/indirect.test.ts`);
+    expect((yield* tests.runRelated(dir, "src/orphan.ts", 5000)).status).toBe("untested");
+  }).pipe(Effect.scoped, Effect.provide(live)), 20_000);
+
+  it.live("does not credit slow tests that never call the Effect.never mutant (B9)", () => Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const dir = yield* selectionFixture;
+    const original = 'import { Effect } from "effect"; export const untested = (): Effect.Effect<number> => Effect.succeed(1); export const answer = 42;';
+    yield* fs.writeFileString(`${dir.path}/src/slow.ts`, original);
+    yield* fs.writeFileString(`${dir.path}/test/slow.test.ts`, 'import { it, expect } from "vitest"; import { answer } from "../src/slow.ts"; it("slow unrelated consumer", async () => { await new Promise(r => setTimeout(r, 1500)); expect(answer).toBe(42); });');
+    const startOffset = original.indexOf("Effect.succeed(1)");
+    const item: Mutant = { ...mutation(original, "unused-never", "", "EffectNever"), file: "src/slow.ts", replacement: { startOffset, endOffset: startOffset + "Effect.succeed(1)".length, text: "Effect.never" } };
+    const report = yield* withPorts(runMutants(config(dir.path), Stream.make(item)), []);
+    expect(report.results.map((r) => r.outcome)).toEqual(["missed"]);
+  }).pipe(Effect.scoped, Effect.provide(live)), 30_000);
+
+  it.live("reports an empty package as untested rather than missed (B5)", () => Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const dir = yield* selectionFixture;
+    const original = "export const value = () => true;";
+    yield* fs.writeFileString(`${dir.path}/src/empty.ts`, original);
+    const startOffset = original.indexOf("true");
+    const item = { ...mutation(original, "empty", ""), file: "src/empty.ts", replacement: { startOffset, endOffset: startOffset + 4, text: "false" } };
+    const report = yield* withPorts(runMutants(config(dir.path), Stream.make(item)), []);
+    expect(report.results.map(r => r.outcome)).toEqual(["untested"]);
+  }).pipe(Effect.scoped, Effect.provide(live)), 15_000);
+
+  it.live("overrides disabled per-test timeouts inside the outer budget (B8)", () => Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const dir = yield* selectionFixture;
+    yield* fs.writeFileString(`${dir.path}/src/hang.ts`, "export const value = 1;");
+    yield* fs.writeFileString(`${dir.path}/test/hang.test.ts`, 'import { it } from "vitest"; import { value } from "../src/hang.ts"; it("waits forever", async () => { void value; await new Promise(() => {}); });');
+    const tests = yield* TestRunner;
+    const run = yield* tests.runRelated(dir, "src/hang.ts", 4000);
+    expect(run.status, run.output).toBe("failed");
+    expect(run.output).toContain("Test timed out");
+    expect(run.durationMs).toBeLessThan(4000);
+  }).pipe(Effect.scoped, Effect.provide(live)), 10_000);
+
+  it.live("retains a fast test failure when another related file hangs (B16)", () => Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const dir = yield* selectionFixture;
+    yield* fs.writeFileString(`${dir.path}/src/pick.ts`, 'import { Option } from "effect"; export const pick = (n: number) => Option.none<number>();');
+    yield* fs.writeFileString(`${dir.path}/test/fast.test.ts`, 'import { it, expect } from "vitest"; import { Option } from "effect"; import { pick } from "../src/pick.ts"; it("keeps positives", () => expect(Option.isSome(pick(2))).toBe(true));');
+    yield* fs.writeFileString(`${dir.path}/test/poll.test.ts`, 'import { it } from "vitest"; import { Option } from "effect"; import { pick } from "../src/pick.ts"; it("polls", async () => { while (Option.isNone(pick(1))) await new Promise(r => setTimeout(r, 10)); });');
+    const tests = yield* TestRunner;
+    const run = yield* tests.runRelated(dir, "src/pick.ts", 2500);
+    expect(run.status, run.output).toBe("failed");
+    expect(run.output).toContain("keeps positives");
+  }).pipe(Effect.scoped, Effect.provide(live)), 10_000);
+
+  it.live("does not credit a kill before test collection (B9)", () => Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const dir = yield* selectionFixture;
+    const original = 'import { Effect } from "effect"; export const value = () => Effect.succeed(1); export const ready = Effect.runSync(value());';
+    yield* fs.writeFileString(`${dir.path}/src/loading.ts`, original);
+    yield* fs.writeFileString(`${dir.path}/test/loading.test.ts`, 'import { it, expect } from "vitest"; import { ready } from "../src/loading.ts"; it("loads", () => expect(ready).toBe(1));');
+    const startOffset = original.indexOf("Effect.succeed(1)");
+    // Block module evaluation before Vitest has collected a test. The compiler
+    // port is deliberately open so this checks the runner's evidence boundary.
+    const item = { ...mutation(original, "loading", "", "EffectNever"), file: "src/loading.ts", replacement: { startOffset, endOffset: startOffset + "Effect.succeed(1)".length, text: "Effect.sync(() => { while (true) {} })" } };
+    const report = yield* withPorts(runMutants({ ...config(dir.path), timeoutMultiplier: 2 }, Stream.make(item)), []);
+    expect(report.results.map(r => r.outcome)).toEqual(["timeout"]);
+  }).pipe(Effect.scoped, Effect.provide(live)), 15_000);
+
   it.live("catches a wrong account, misses the untested Frozen path, counts a hung Effect.never as caught, and leaves source bytes unchanged", () =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;

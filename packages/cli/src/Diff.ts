@@ -3,6 +3,8 @@ import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
+import * as Stream from "effect/Stream";
+import * as ChildProcess from "effect/process/ChildProcess";
 
 export class DiffMismatch extends Schema.TaggedError<DiffMismatch>()("DiffMismatch", {
   path: Schema.String,
@@ -94,22 +96,37 @@ export const selectInDiff = Effect.fn("selectInDiff")(function*(options: {
   const diffPath = path.resolve(options.root, options.diffPath);
   const text = yield* fs.readFileString(diffPath).pipe(Effect.mapError((error) => new DiffParseError({ path: diffPath, message: String(error) })));
   const patches = yield* parseDiff(text, diffPath);
+  const gitRoot = yield* Effect.scoped(Effect.gen(function* () {
+    const handle = yield* ChildProcess.make("git", ["rev-parse", "--show-toplevel"], { cwd: options.root, stderr: "ignore" });
+    const [output, code] = yield* Effect.all([Stream.mkString(Stream.decodeText(handle.stdout)), handle.exitCode], { concurrency: "unbounded" });
+    if (Number(code) !== 0 || !output.trim()) return options.root;
+    const physicalRoot = yield* fs.realPath(options.root);
+    return path.resolve(options.root, path.relative(physicalRoot, output.trim()));
+  })).pipe(Effect.catch(() => Effect.succeed(options.root)));
   const changed = new Map<string, Set<number>>();
   for (const patch of patches) {
-    const absolute = path.resolve(options.root, patch.file);
-    const relative = path.relative(options.root, absolute);
-    if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
-      return yield* new DiffParseError({ path: diffPath, message: "Diff path escapes project root" });
-    }
-    const current = yield* fs.readFileString(absolute).pipe(Effect.mapError((error) => new DiffMismatch({ path: patch.file, message: String(error) })));
-    const lines = current.split("\n");
-    for (const line of patch.lines) {
+    const repositoryPath = path.resolve(gitRoot, patch.file);
+    // Validate both interpretations against the tree: a --relative diff can
+    // name a file that also exists at the toplevel but has different contents.
+    const candidates = [...new Set([repositoryPath, path.resolve(options.root, patch.file)])];
+    let absolute: string | undefined;
+    for (const candidate of candidates) {
+      const relative = path.relative(gitRoot, candidate);
+      if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+        return yield* new DiffParseError({ path: diffPath, message: "Diff path escapes repository root" });
+      }
+      if (!(yield* fs.exists(candidate))) continue;
+      const current = yield* fs.readFileString(candidate).pipe(Effect.mapError((error) => new DiffMismatch({ path: patch.file, message: String(error) })));
+      const lines = current.split("\n");
       const finalLine = current.endsWith("\n") ? lines.length - 1 : lines.length;
-      const newlineMismatch = line.noNewline
-        ? line.number !== finalLine || current.endsWith("\n")
-        : line.number === finalLine && !current.endsWith("\n");
-      if (lines[line.number - 1] !== line.text || newlineMismatch) return yield* new DiffMismatch({ path: patch.file, message: `New-side line ${line.number} does not match tree` });
+      if (patch.lines.every((line) => {
+        const newlineMismatch = line.noNewline
+          ? line.number !== finalLine || current.endsWith("\n")
+          : line.number === finalLine && !current.endsWith("\n");
+        return lines[line.number - 1] === line.text && !newlineMismatch;
+      })) { absolute = candidate; break; }
     }
+    if (absolute === undefined) return yield* new DiffMismatch({ path: patch.file, message: "New-side lines do not match the tree at the Git toplevel or working directory" });
     const added = changed.get(absolute) ?? new Set<number>();
     for (const line of patch.lines) if (line.added) added.add(line.number);
     changed.set(absolute, added);

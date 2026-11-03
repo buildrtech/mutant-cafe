@@ -1,6 +1,6 @@
 import {
   MutantSource, MutantResult, Reporter, Scratch, TestRunner,
-  type Baseline, type BaselineFailed, type Mutant,
+  type Baseline, BaselineFailed, type Mutant,
   type ProgramLoadError, type ReportWriteError, type RunConfig, type RunReport,
   type ScratchDir, type ScratchError, type TestSpawnError
 } from "@mutant-cafe/core";
@@ -70,6 +70,20 @@ export const runMutants = Effect.fn("Runner.runMutants")(function* (
   } }) => capture(Effect.gen(function* () {
     const dirs = input.state.pool?.value;
     if (dirs === undefined) return yield* Effect.die("Missing scratch pool");
+    // Measure the original related selection once per file before applying any
+    // mutant. Slow unrelated tests must not manufacture a caught never mutant.
+    const neverBudgets = new Map<string, number>();
+    for (const mutant of input.state.pending) {
+      if (mutant.genre !== "EffectNever" || neverBudgets.has(mutant.file)) continue;
+      const measured = yield* Effect.scoped(Effect.gen(function* () {
+        const dir = yield* Pool.get(dirs);
+        return yield* tests.runRelated(dir, path.isAbsolute(mutant.file) ? path.relative(config.root, mutant.file) : mutant.file, input.state.timeoutMs);
+      }));
+      if (measured.status === "failed" || measured.status === "timedOut") {
+        return yield* new BaselineFailed({ exitCode: 1, output: measured.output });
+      }
+      neverBudgets.set(mutant.file, Math.max(config.neverTimeoutMs, Math.ceil(measured.durationMs * config.timeoutMultiplier)));
+    }
     yield* Stream.fromIterable(input.state.pending).pipe(
       Stream.mapEffect((mutant) => Effect.scoped(Effect.gen(function* () {
         const viability = yield* source.checkViable(mutant);
@@ -82,14 +96,15 @@ export const runMutants = Effect.fn("Runner.runMutants")(function* (
         const dir = yield* Pool.get(dirs);
         const run = yield* Effect.acquireUseRelease(
           dir.apply(mutant),
-          () => tests.runRelated(dir, path.isAbsolute(mutant.file) ? path.relative(config.root, mutant.file) : mutant.file, mutant.genre === "EffectNever" ? config.neverTimeoutMs : input.state.timeoutMs),
+          () => tests.runRelated(dir, path.isAbsolute(mutant.file) ? path.relative(config.root, mutant.file) : mutant.file, mutant.genre === "EffectNever" ? neverBudgets.get(mutant.file)! : input.state.timeoutMs),
           // A dirty directory must never return to the pool, even on cancel.
           () => dir.revert(mutant).pipe(Effect.orDie)
         );
         const result: MutantResult = {
           mutant,
-          // Effect.never is meant to hang: a test that waits on it and times out noticed the mutant.
-          outcome: run.status === "timedOut" ? (mutant.genre === "EffectNever" ? "caught" : "timeout") : run.status === "failed" ? "caught" : "missed",
+          // A kill before collection proves nothing about whether tests noticed.
+          outcome: run.status === "timedOut" ? (mutant.genre === "EffectNever" && run.testsCollected ? "caught" : "timeout")
+            : run.status === "failed" ? "caught" : run.status === "untested" ? "untested" : "missed",
           durationMs: run.durationMs,
           testCommand: run.command,
           diagnostics: [],

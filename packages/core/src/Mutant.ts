@@ -4,6 +4,7 @@ export const Genre = Schema.Literals([
   "EffectSucceed",
   "EffectFail",
   "SwallowTag",
+  "TagToDefect",
   "EffectDie",
   "EffectNever",
   "OptionNone",
@@ -37,6 +38,7 @@ export const Mutant = Schema.Struct({
   file: Schema.String,
   functionName: Schema.String,
   returnType: Schema.String,
+  displayReturnType: Schema.optional(Schema.String),
   genre: Genre,
   description: Schema.String,
   span: Span,
@@ -45,7 +47,7 @@ export const Mutant = Schema.Struct({
 });
 export type Mutant = typeof Mutant.Type;
 
-export const Outcome = Schema.Literals(["caught", "missed", "unviable", "timeout"]);
+export const Outcome = Schema.Literals(["caught", "missed", "unviable", "timeout", "untested"]);
 export type Outcome = typeof Outcome.Type;
 
 export const MutantResult = Schema.Struct({

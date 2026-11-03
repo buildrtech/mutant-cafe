@@ -2,6 +2,7 @@ import * as Schema from "effect/Schema";
 
 export class ProgramLoadError extends Schema.TaggedError<ProgramLoadError>()("ProgramLoadError", {
   tsconfig: Schema.String,
+  reason: Schema.optional(Schema.Literal("selection")),
   diagnostics: Schema.Array(Schema.String),
 }) {}
 

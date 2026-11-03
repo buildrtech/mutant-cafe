@@ -17,7 +17,9 @@ Discovery covers exported function declarations and arrow functions, class metho
 
 The engine generates success values, tagged failures, per-tag recovery, defects and nontermination for Effect; none/some for Option; empty/one/fail for Stream; failing builds for Layer when an existing service key can be identified; and boolean, literal, primitive, array, tuple and object values. Nested Option/Effect values are synthesized recursively. Synthesis stops at depth four rather than inventing a value for an unknown required field. Tagged errors use visible constructors when their fields can be synthesized; otherwise a structural cast is marked `synthetic`.
 
-`SwallowTag` runs the original implementation and recovers just one declared error tag. When `A` has no synthesized value, recovery dies with `mutant.cafe: swallowed <tag>` instead of returning a fake value or spending a timeout. The description identifies this fallback. This remains a `SwallowTag` mutant with `synthetic: false`.
+`SwallowTag` runs the original implementation and recovers just one declared error tag. When `A` has no synthesized value, `TagToDefect` turns the tag into a defect instead. It is not labeled a swallow. Visible constructible error classes are instantiated; only unavailable constructors use a synthetic tag cast, and descriptions identify the choice.
+
+Replacement expressions retain the original checker return type through an annotated inner function. Types outside the file use resolvable import-type references. Synthesized objects use `as const` to preserve literal fields, including recovery callbacks. Unions of Effects combine their success, error and environment types for generation. Literal choices have stable ordering, and succeeds equal to existing literal success values are omitted.
 
 Edits replace original function bodies or generator bodies, use original-file offsets and 1-based source spans, and carry a stable SHA-256 content ID. The engine reuses existing Effect/Option/Stream/Layer namespace or named imports; it does not add imports. Generators retain the surrounding `Effect.fn` wrapper and name.
 
