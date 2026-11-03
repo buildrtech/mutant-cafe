@@ -81,7 +81,8 @@ export const runMutants = Effect.fn("Runner.runMutants")(function* (
             outcome: run.status === "timedOut" ? "timeout" : run.status === "failed" ? "caught" : "missed",
             durationMs: run.durationMs,
             testCommand: run.command,
-            diagnostics: run.output === "" ? [] : [run.output]
+            diagnostics: [],
+            ...(run.output === "" ? {} : { output: run.output })
           };
           results.push(result);
           yield* reporter.progress(result);

@@ -11,12 +11,14 @@ export const TestRunnerLive = Layer.effect(TestRunner, Effect.gen(function* () {
   const execute = Effect.fn("TestRunner.execute")(function* (dir: ScratchDir, args: ReadonlyArray<string>, timeoutMs?: number) {
     // Dependency directories are linked to the source checkout. Disable both
     // result and transform caches so Vitest cannot write through those links.
-    const command = ["pnpm", "exec", "vitest", ...args, "--no-cache", "--no-fsModuleCache"];
+    // npx resolves the project's own vitest without a package manager's
+    // install-state checks, which fail in a scratch copy at a new path.
+    const command = ["npx", "--no", "vitest", ...args, "--no-cache", "--no-fsModuleCache"];
     const started = yield* Clock.currentTimeMillis;
     const chunks: Array<string> = [];
     let exitCode = 1;
     const child = Effect.scoped(Effect.gen(function* () {
-      const handle = yield* spawner.spawn(ChildProcess.make("pnpm", command.slice(1), {
+      const handle = yield* spawner.spawn(ChildProcess.make(command[0]!, command.slice(1), {
         cwd: dir.path,
         // Node's scoped spawner kills the detached process group, not just pnpm.
         detached: true,

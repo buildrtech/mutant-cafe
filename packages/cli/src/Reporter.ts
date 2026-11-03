@@ -49,6 +49,7 @@ export const makeReporter = Effect.fn("makeReporter")(function*(options: {
   const semaphore = yield* Semaphore.make(1);
   const results: MutantResult[] = [];
   let pendingError: ReportWriteError | undefined;
+  let summarized = false;
   const writeError = (error: unknown) => new ReportWriteError({ path: dir, message: String(error) });
   const ids = new Set<string>();
   for (const mutant of options.mutants) {
@@ -110,6 +111,10 @@ export const makeReporter = Effect.fn("makeReporter")(function*(options: {
         if (!ids.has(result.mutant.id)) return yield* writeError("Final result does not belong to this report");
         yield* fs.writeFileString(path.join(dir, "logs", `${result.mutant.id}.log`), logText(result)).pipe(Effect.mapError(writeError));
       }
+      // The runner writes on completion or interrupt and the CLI writes again
+      // as the owner of the final report; files are idempotent, the summary prints once.
+      if (summarized) return;
+      summarized = true;
       const elapsed = (yield* Clock.currentTimeMillis) - started;
       yield* Console.log(outcomes.map((outcome) => `${report.results.filter((result) => result.outcome === outcome).length} ${outcome}`).join(", ") + `; ${(elapsed / 1000).toFixed(2)}s`);
     })),

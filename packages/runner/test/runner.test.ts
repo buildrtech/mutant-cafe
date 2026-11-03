@@ -55,7 +55,7 @@ describe("real vitest mutation runs", () => {
       expect(report.baseline.durationMs).toBeGreaterThan(0);
       expect(reports).toHaveLength(1);
       const timedOut = report.results.find((result) => result.outcome === "timeout");
-      const pid = /mutant-never-pid=(\d+)/.exec(timedOut?.diagnostics.join("\n") ?? "")?.[1];
+      const pid = /mutant-never-pid=(\d+)/.exec(timedOut?.output ?? "")?.[1];
       expect(pid).toBeDefined();
       const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
       const alive = yield* spawner.exitCode(ChildProcess.make("ps", ["-p", pid ?? "0", "-o", "pid="]));

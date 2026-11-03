@@ -54,6 +54,7 @@ export const MutantResult = Schema.Struct({
   durationMs: Schema.Int,
   testCommand: Schema.Array(Schema.String),
   diagnostics: Schema.Array(Schema.String),
+  output: Schema.optional(Schema.String),
 });
 export type MutantResult = typeof MutantResult.Type;
 

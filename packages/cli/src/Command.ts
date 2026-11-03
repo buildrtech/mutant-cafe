@@ -1,4 +1,4 @@
-import { ConfigFile, MutantSource, Reporter, RunConfig, type BaselineFailed, type Mutant, type ProgramLoadError, type RunReport, type Scratch, type ScratchError, type TestRunner, type TestSpawnError } from "@mutant-cafe/core";
+import { ConfigFile, MutantSource, Reporter, RunConfig, type BaselineFailed, type Mutant, type ProgramLoadError, type ReportWriteError, type RunReport, type Scratch, type ScratchError, type TestRunner, type TestSpawnError } from "@mutant-cafe/core";
 import * as Console from "effect/Console";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -16,7 +16,7 @@ import { makeReporter, mutantLine } from "./Reporter.ts";
 export class UsageError extends Schema.TaggedError<UsageError>()("UsageError", { message: Schema.String }) {}
 
 export type Run = (config: RunConfig, mutants: ReadonlyArray<Mutant>) => Effect.Effect<RunReport,
-  BaselineFailed | ScratchError | TestSpawnError | ProgramLoadError,
+  BaselineFailed | ScratchError | TestSpawnError | ProgramLoadError | ReportWriteError,
   MutantSource | Scratch | TestRunner | Reporter>;
 
 const flags = {
