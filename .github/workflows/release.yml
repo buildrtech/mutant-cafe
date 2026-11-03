@@ -35,4 +35,9 @@ jobs:
       - run: pnpm --filter mutant-cafe build
       - run: node scripts/pack-smoke.mjs
       - name: Publish the tested tarball with OIDC
-        run: npm publish "dist/mutant-cafe-${RELEASE_VERSION}.tgz" --provenance --access public
+        run: |
+          if npm view "mutant-cafe@${RELEASE_VERSION}" version >/dev/null 2>&1; then
+            echo "mutant-cafe@${RELEASE_VERSION} is already on npm; nothing to publish."
+            exit 0
+          fi
+          npm publish "dist/mutant-cafe-${RELEASE_VERSION}.tgz" --provenance --access public

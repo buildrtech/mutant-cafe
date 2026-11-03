@@ -55,7 +55,7 @@ if (!process.argv.includes("--pack-only")) {
     run("npm", ["install", "--no-audit", "--no-fund"], project);
     run("npx", ["mutant-cafe", "--jobs", "2"], project, 2);
     const missed = await readFile(join(project, "mutants.out/missed.txt"), "utf8");
-    const frozen = missed.split("\n").find((line) => /SwallowTag\(Frozen\) in withdraw\b/.test(line));
+    const frozen = missed.split("\n").find((line) => /\bwithdraw\b/.test(line) && line.includes('catchTag("Frozen"'));
     assert.ok(frozen, "missed.txt must name the Frozen swallow in withdraw");
     console.log(`pack-smoke: ${frozen.replaceAll(project, "<project>")}`);
     console.log("pack-smoke: PASS (installed tarball, exit 2, Frozen swallow missed)");
