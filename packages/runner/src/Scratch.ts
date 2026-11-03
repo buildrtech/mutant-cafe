@@ -3,6 +3,7 @@ import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
+import type * as PlatformError from "effect/PlatformError";
 
 export const ScratchLive = Layer.effect(Scratch, Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem;
@@ -48,7 +49,26 @@ export const ScratchLive = Layer.effect(Scratch, Effect.gen(function* () {
               const src = path.join(from, entry);
               const dest = path.join(to, entry);
               if (entry === "node_modules") {
-                yield* fs.symlink(path.resolve(src), dest);
+                // Own the directory so workspace/self links can point at the
+                // copied package. Linking node_modules wholesale sends tests
+                // importing their package name back to the original checkout.
+                const linkDependencies = (from: string, to: string): Effect.Effect<void, PlatformError.PlatformError> => Effect.gen(function* () {
+                  yield* fs.makeDirectory(to, { recursive: true });
+                  for (const name of yield* fs.readDirectory(from)) {
+                    if ([".vite", ".vite-temp", ".vitest", ".cache"].includes(name)) continue;
+                    const dependency = path.join(from, name);
+                    const destination = path.join(to, name);
+                    if (name.startsWith("@")) {
+                      yield* linkDependencies(dependency, destination);
+                      continue;
+                    }
+                    const realDependency = yield* fs.realPath(dependency);
+                    const rel = path.relative(copyRoot, realDependency);
+                    const inside = rel !== ".." && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel) && !rel.split(path.sep).includes("node_modules");
+                    yield* fs.symlink(inside ? path.join(temp, rel) : realDependency, destination);
+                  }
+                });
+                yield* linkDependencies(src, dest);
               } else {
                 yield* copy(src, dest, [...ancestors, real]);
               }

@@ -51,7 +51,7 @@ it.live("the real CLI reports three distinct missed mutants with root-relative c
   const root = path.resolve(import.meta.dirname, "../../../fixtures/tagged-errors");
   const output = yield* fs.makeTempDirectoryScoped({ prefix: "mutant-cli-e2e-" });
   const handle = yield* spawner.spawn(ChildProcess.make(process.execPath, [
-    path.resolve(import.meta.dirname, "../src/bin.ts"), "--jobs", "2", "--output", path.join(output, "report")
+    path.resolve(import.meta.dirname, "../src/bin.ts"), "--jobs", "1", "--output", path.join(output, "report")
   ], { cwd: root }));
   const [stdout, stderr, exit] = yield* Effect.all([
     Stream.mkString(Stream.decodeText(handle.stdout)),
@@ -89,11 +89,71 @@ it.live("the real CLI catches a viable multi-service layer failure", () => Effec
   const report = yield* Schema.decodeEffect(Schema.fromJsonString(RunReport))(
     yield* fs.readFileString(path.join(output, "report/outcomes.json")),
   );
-  expect(report.results).toHaveLength(1);
-  expect(report.results[0]?.mutant.genre).toBe("LayerFail");
-  expect(report.results[0]?.outcome, logs).toBe("caught");
-  expect(report.results[0]?.diagnostics).toEqual([]);
+  expect(report.results.map(r => r.mutant.genre).sort()).toEqual(["LayerDie", "LayerFail"]);
+  for (const result of report.results) {
+    expect(result.outcome, logs).toBe("caught");
+    expect(result.diagnostics).toEqual([]);
+  }
 }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)), 30_000);
+
+it.live("runs all coverage shapes and writes honest skips, with caught and missed examples", () => Effect.gen(function* () {
+  const fs = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const root = path.resolve(import.meta.dirname, "../../engine/test/fixtures/coverage");
+  const output = yield* fs.makeTempDirectoryScoped({ prefix: "coverage-e2e-" });
+  const handle = yield* ChildProcess.make(process.execPath, [path.resolve(import.meta.dirname, "../src/bin.ts"), "--jobs", "1", "--output", path.join(output, "report")], { cwd: root });
+  const [logs, code] = yield* Effect.all([Stream.mkString(Stream.decodeText(handle.all)), handle.exitCode], { concurrency: "unbounded" });
+  expect(Number(code), logs).toBe(2);
+  const report = yield* Schema.decodeEffect(Schema.fromJsonString(RunReport))(yield* fs.readFileString(path.join(output, "report/outcomes.json")));
+  expect(report.results.filter(r => ["unviable", "unreliable", "timeout"].includes(r.outcome))).toEqual([]);
+  const groups = [
+    ["layerOnly", "idleOnly"], ["live", "idle"], ["layerFunction", "idleLayerFunction"], ["StaticService.layer", "StaticService.idle"],
+    ["internal"], ["internalEffect"], ["untraced"], ["Greeter.layer.greet"], ["Greeter.layer.send"],
+    ["policy.canEdit"], ["machine.guards.allowed"], ["guardFor.<inner>"], ["brand"], ["set", "idleSet"],
+    ["map", "idleMap"], ["object"], ["identityCandidate"], ["identityGeneric"], ["report"], ["scoped"], ["mapped"],
+  ];
+  for (const group of groups) {
+    const outcomes = report.results.filter(r => group.includes(r.mutant.functionName)).map(r => r.outcome);
+    expect(outcomes, group.join(", ")).toContain("caught");
+    expect(outcomes, group.join(", ")).toContain("missed");
+  }
+  const skipped = yield* fs.readFileString(path.join(output, "report/not-mutated.txt"));
+  expect(skipped).toContain("generic: generic");
+  expect(skipped).toContain("opaque: no synthesizable value for field call");
+  expect(logs).toContain("Baseline command:");
+  expect(logs).toContain("not mutated");
+}).pipe(Effect.scoped, Effect.provide(NodeServices.layer)), 180_000);
+
+it.live("prints TypeScript diagnostics and a failed baseline command, retaining outcomes.json", () => Effect.gen(function* () {
+  const fs = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const root = yield* project;
+  const fixture = path.resolve(import.meta.dirname, "../../../fixtures/tagged-errors");
+  yield* fs.symlink(`${fixture}/node_modules`, `${root}/node_modules`);
+  yield* fs.writeFileString(`${root}/package.json`, JSON.stringify({ type: "module", scripts: { test: "vitest run" } }));
+  yield* fs.writeFileString(`${root}/tsconfig.json`, JSON.stringify({ compilerOptions: { target: "ESNext", module: "NodeNext", moduleResolution: "NodeNext", allowImportingTsExtensions: true, noEmit: true }, include: ["account.ts"] }));
+  yield* fs.writeFileString(`${root}/broken.test.ts`, 'import { it, expect } from "vitest"; import { isEmpty } from "./account.ts"; it("broken original", () => expect(isEmpty()).toBe(false));');
+  const invoke = (args: string[]) => Effect.gen(function* () {
+    const handle = yield* ChildProcess.make(process.execPath, [path.resolve(import.meta.dirname, "../src/bin.ts"), ...args], { cwd: root });
+    const [logs, code] = yield* Effect.all([Stream.mkString(Stream.decodeText(handle.all)), handle.exitCode], { concurrency: "unbounded" });
+    return { logs, code: Number(code) };
+  });
+  const failed = yield* invoke([]);
+  expect(failed.code, failed.logs).toBe(4);
+  expect(failed.logs).toContain("Baseline command:");
+  expect(failed.logs).toContain("Baseline failed (1): npx --no vitest run");
+  expect(failed.logs).toContain("broken original");
+  const report = yield* Schema.decodeEffect(Schema.fromJsonString(RunReport))(yield* fs.readFileString(`${root}/mutants.out/outcomes.json`));
+  expect(report.failure).toContain("vitest run");
+  expect(report.failure).toContain("broken original");
+  yield* fs.writeFileString(`${root}/account.ts`, "export const broken = (;");
+  const invalid = yield* invoke(["--list"]);
+  expect(invalid.code).toBe(70);
+  expect(invalid.logs).toContain(`${root}/tsconfig.json`);
+  expect(invalid.logs).toMatch(/TS\d+:/);
+  const help = yield* invoke(["--help"]);
+  for (const description of ["List mutants", "Only mutate bodies", "Include source glob", "Exclude source glob", "Exclude internal", "Concurrent scratch", "Absolute test timeout", "Baseline duration multiplier", "Minimum test timeout", "Report directory", "TypeScript project path"]) expect(help.logs).toContain(description);
+}).pipe(Effect.scoped, Effect.provide(NodeServices.layer)), 20_000);
 
 it.effect("writes missed output, returns CI failure, and rotates the previous run", () => Effect.gen(function*() {
   const fs = yield* FileSystem.FileSystem;
@@ -301,6 +361,21 @@ it.effect("emits a context-sized applicable patch with relative paths for an abs
   const apply = yield* ChildProcess.make("git", ["apply", "wrapped.out/diff/wrapped.diff"], { cwd: root });
   expect(Number(yield* apply.exitCode)).toBe(0);
   expect(yield* fs.readFileString(`${root}/account.ts`)).toBe(wrapped.replacement.text);
+}).pipe(Effect.scoped, Effect.provide(NodeServices.layer)));
+
+it.effect("plain diff paths apply with patch -p1, and paths needing quotes apply with git", () => Effect.gen(function* () {
+  const fs = yield* FileSystem.FileSystem;
+  const root = yield* project;
+  for (const name of ["account.ts", "with space.ts"]) {
+    const original = "export const answer = 1;\n";
+    const modified = "export const answer = 2;\n";
+    yield* fs.writeFileString(`${root}/${name}`, original);
+    yield* fs.writeFileString(`${root}/path.diff`, unifiedDiff(original, modified, name));
+    const handle = yield* ChildProcess.make(name.includes(" ") ? "git" : "patch", name.includes(" ") ? ["apply", "path.diff"] : ["-p1", "-i", "path.diff"], { cwd: root });
+    const [logs, code] = yield* Effect.all([Stream.mkString(Stream.decodeText(handle.all)), handle.exitCode], { concurrency: "unbounded" });
+    expect(Number(code), logs).toBe(0);
+    expect(yield* fs.readFileString(`${root}/${name}`)).toBe(modified);
+  }
 }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)));
 
 it.effect("context patches preserve insertions, deletions, repeated lines and newline changes", () => Effect.gen(function* () {

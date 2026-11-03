@@ -1,7 +1,7 @@
 import type { RunReport } from "@mutant-cafe/core";
 
 export const reportExitCode = (report: RunReport): number =>
-  report.results.some((result) => result.outcome === "missed" || result.outcome === "untested") ? 2 :
+  report.results.some((result) => result.outcome === "missed" || result.outcome === "untested" || result.outcome === "unreliable") ? 2 :
     report.results.some((result) => result.outcome === "timeout") ? 3 : 0;
 
 export const errorExitCode = (error: { readonly _tag: string }): number => {

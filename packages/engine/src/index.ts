@@ -18,10 +18,15 @@ export const MutantSourceLive: Layer.Layer<MutantSource> = Layer.effect(
 
 export function makeMutantSource(oracle: TypeOracle): MutantSource["Service"] {
   return {
+    notMutated: () => Effect.sync(() => [...oracle.notMutated]),
     generate: (config) => Stream.unwrap(Effect.try({
       try: () => Stream.fromIterable({
         *[Symbol.iterator]() {
-          for (const fn of oracle.discover(config)) yield* generateFunction(fn);
+          for (const fn of oracle.discover(config)) {
+            const mutants = [...generateFunction(fn)];
+            if (!mutants.length) oracle.notMutated.push({ file: fn.file, functionName: fn.name, reason: fn.skipReason ?? `opaque return or no synthesizable value: ${fn.displayReturnType}` });
+            yield* mutants;
+          }
         },
       }),
       catch: (error) => loadError(config.tsconfig, error),

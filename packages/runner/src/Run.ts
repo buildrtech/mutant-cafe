@@ -44,7 +44,8 @@ export const runMutants = Effect.fn("Runner.runMutants")(function* (
   const jobs = Math.max(1, Math.floor(config.jobs));
   const report = (state: RunState): RunReport => ({
     schemaVersion: 1, tool: "mutant.cafe", root: config.root,
-    baseline: state.baseline, timeoutMs: state.timeoutMs, results: state.results
+    baseline: state.baseline, timeoutMs: state.timeoutMs, results: state.results,
+    ...(state.failure === undefined ? {} : { failure: state.failure._tag === "BaselineFailed" ? `${state.failure._tag}: ${(state.failure.command ?? []).join(" ")}\n${state.failure.output.slice(-8000)}` : String(state.failure) })
   });
   const capture = <A, R>(effect: Effect.Effect<A, RunError, R>) => Effect.result(effect);
   const copying = createEffectLogic(() => capture(Effect.gen(function* () {
@@ -74,13 +75,13 @@ export const runMutants = Effect.fn("Runner.runMutants")(function* (
     // mutant. Slow unrelated tests must not manufacture a caught never mutant.
     const neverBudgets = new Map<string, number>();
     for (const mutant of input.state.pending) {
-      if (mutant.genre !== "EffectNever" || neverBudgets.has(mutant.file)) continue;
+      if (mutant.genre !== "EffectNever" || neverBudgets.has(mutant.file) || input.state.baseline.unreliable?.some(issue => issue.file === "*" || issue.file === (path.isAbsolute(mutant.file) ? path.relative(config.root, mutant.file) : mutant.file))) continue;
       const measured = yield* Effect.scoped(Effect.gen(function* () {
         const dir = yield* Pool.get(dirs);
         return yield* tests.runRelated(dir, path.isAbsolute(mutant.file) ? path.relative(config.root, mutant.file) : mutant.file, input.state.timeoutMs);
       }));
       if (measured.status === "failed" || measured.status === "timedOut") {
-        return yield* new BaselineFailed({ exitCode: 1, output: measured.output });
+        return yield* new BaselineFailed({ exitCode: 1, output: measured.output, command: measured.command });
       }
       neverBudgets.set(mutant.file, Math.max(config.neverTimeoutMs, Math.ceil(measured.durationMs * config.timeoutMultiplier)));
     }
@@ -89,6 +90,14 @@ export const runMutants = Effect.fn("Runner.runMutants")(function* (
         const viability = yield* source.checkViable(mutant);
         if (!viability.viable) {
           const result: MutantResult = { mutant, outcome: "unviable", durationMs: 0, testCommand: [], diagnostics: viability.diagnostics };
+          yield* input.record(result);
+          yield* reporter.progress(result);
+          return;
+        }
+        const localFile = path.isAbsolute(mutant.file) ? path.relative(config.root, mutant.file) : mutant.file;
+        const unreliable = input.state.baseline.unreliable?.filter(issue => issue.file === "*" || issue.file === localFile) ?? [];
+        if (unreliable.length) {
+          const result: MutantResult = { mutant, outcome: "unreliable", durationMs: 0, testCommand: input.state.baseline.testCommand, diagnostics: unreliable.map(issue => issue.reason) };
           yield* input.record(result);
           yield* reporter.progress(result);
           return;
@@ -148,7 +157,9 @@ export const runMutants = Effect.fn("Runner.runMutants")(function* (
         src: "baselining", input: ({ context }) => context.pool,
         onDone: ({ context, event }) => Result.isSuccess(event.output)
           ? { target: "generating", context: { ...context, ...event.output.success } }
-          : { target: event.output.failure._tag === "BaselineFailed" ? "baselineFailed" : "failed", context: { ...context, failure: event.output.failure } }
+          : { target: "reporting", context: { ...context, failure: event.output.failure,
+            baseline: event.output.failure._tag === "BaselineFailed" ? { durationMs: 0, testCommand: event.output.failure.command ?? [] } : context.baseline
+          } }
       } },
       generating: { invoke: { src: "generating", onDone: ({ context, event }) => Result.isSuccess(event.output)
         ? { target: "testing", context: { ...context, pending: event.output.success } }
@@ -176,7 +187,6 @@ export const runMutants = Effect.fn("Runner.runMutants")(function* (
           ...context, reported: Result.isSuccess(event.output), failure: Result.isFailure(event.output) ? event.output.failure : context.failure
         } })
       } },
-      baselineFailed: { type: "final" },
       failed: { type: "final" },
       done: { type: "final" }
     }

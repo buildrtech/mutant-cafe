@@ -67,7 +67,9 @@ export function* generateFunction(fn: MutableFunction): Generator<Mutant> {
     case "Layer": {
       const layer = api("Layer", "effectContext");
       const fail = api("Effect", "fail");
-      if (layer && fail && shape.service) {
+      const die = api("Effect", "die");
+      if (layer && die) yield candidate("LayerDie", `${layer}(${die}("mutant.cafe"))`);
+      if (layer && fail) {
         // Layer output is contravariant. Let the pinned return type infer the
         // complete output context, not just the first service found in the body.
         for (const error of shape.errors) yield candidate("LayerFail", `${layer}(${fail}(${error.text}))`, error);
@@ -88,8 +90,11 @@ export function* generateFunction(fn: MutableFunction): Generator<Mutant> {
 }
 
 function makeMutant(fn: MutableFunction, genre: Genre, text: string, synthetic: boolean, description: string): Mutant {
-  const replacement = { startOffset: fn.startOffset, endOffset: fn.endOffset, text };
-  const id = createHash("sha256").update(JSON.stringify([fn.file, fn.span, genre, text])).digest("hex").slice(0, 24);
+  const additions = fn.extraImports?.filter(item => text.includes(`${item.namespace}.`)) ?? [];
+  const replacement = additions.length && fn.sourcePrefix !== undefined
+    ? { startOffset: 0, endOffset: fn.endOffset, text: additions.map(item => item.statement).join("\n") + "\n" + fn.sourcePrefix + text }
+    : { startOffset: fn.startOffset, endOffset: fn.endOffset, text };
+  const id = createHash("sha256").update(JSON.stringify([fn.file, fn.name, fn.span, genre, replacement.text])).digest("hex").slice(0, 24);
   return {
     id, file: fn.file, functionName: fn.name, returnType: fn.returnType, displayReturnType: fn.displayReturnType, genre,
     description: `replace ${fn.name} -> ${fn.returnType} with ${description}`,

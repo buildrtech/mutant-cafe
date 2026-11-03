@@ -20,16 +20,17 @@ export type Run = (config: RunConfig, mutants: ReadonlyArray<Mutant>) => Effect.
   MutantSource | Scratch | TestRunner | Reporter | Path.Path>;
 
 const flags = {
-  list: Flag.Boolean("list").pipe(Flag.withDefault(false)),
-  inDiff: Flag.String("in-diff").pipe(Flag.optional),
-  include: Flag.String("file").pipe(Flag.atLeast(0)),
-  exclude: Flag.String("exclude").pipe(Flag.atLeast(0)),
-  jobs: Flag.Int("jobs").pipe(Flag.optional),
+  list: Flag.Boolean("list").pipe(Flag.withDefault(false), Flag.withDescription("List mutants and skipped function count without running tests")),
+  inDiff: Flag.String("in-diff").pipe(Flag.optional, Flag.withDescription("Only mutate bodies overlapping this unified diff")),
+  include: Flag.String("file").pipe(Flag.atLeast(0), Flag.withDescription("Include source glob relative to package root; repeatable")),
+  exclude: Flag.String("exclude").pipe(Flag.atLeast(0), Flag.withDescription("Exclude source glob; repeatable")),
+  exportedOnly: Flag.Boolean("exported-only").pipe(Flag.withDefault(false), Flag.withDescription("Exclude internal functions and values (legacy scope)")),
+  jobs: Flag.Int("jobs").pipe(Flag.optional, Flag.withDescription("Concurrent scratch/test workers; default 1")),
   timeout: Flag.Finite("timeout").pipe(Flag.optional, Flag.withDescription("Absolute test timeout in seconds")),
-  timeoutMultiplier: Flag.Finite("timeout-multiplier").pipe(Flag.optional),
+  timeoutMultiplier: Flag.Finite("timeout-multiplier").pipe(Flag.optional, Flag.withDescription("Baseline duration multiplier; default 5")),
   minimumTimeout: Flag.Finite("minimum-test-timeout").pipe(Flag.optional, Flag.withDescription("Minimum test timeout in seconds")),
-  output: Flag.String("output").pipe(Flag.withDefault("mutants.out")),
-  tsconfig: Flag.String("tsconfig").pipe(Flag.withDefault("tsconfig.json")),
+  output: Flag.String("output").pipe(Flag.withDefault("mutants.out"), Flag.withDescription("Report directory; default mutants.out")),
+  tsconfig: Flag.String("tsconfig").pipe(Flag.withDefault("tsconfig.json"), Flag.withDescription("TypeScript project path; default tsconfig.json")),
 };
 
 export const makeCommand = (options: {
@@ -51,6 +52,7 @@ export const makeCommand = (options: {
   const config = yield* Schema.decodeEffect(RunConfig)({
     root,
     tsconfig: input.tsconfig,
+    exportedOnly: input.exportedOnly,
     include: input.include.length > 0 ? input.include : fileConfig.include ?? ["**/*.{ts,tsx}"],
     exclude: input.exclude.length > 0 ? input.exclude : fileConfig.exclude ?? [],
     functionFilter: fileConfig.functionFilter ?? [],
@@ -70,6 +72,7 @@ export const makeCommand = (options: {
     Effect.mapError((error) => error.reason === "selection"
       ? new UsageError({ message: error.diagnostics.join("\n") }) : error)
   );
+  const notMutated = yield* source.notMutated?.() ?? Effect.succeed([]);
   const mutants = inDiff === undefined ? generated : yield* selectInDiff({ root, diffPath: inDiff, mutants: generated });
   if (input.list) {
     for (const mutant of mutants) yield* Console.log(mutantLine(mutant, config.root, path));
@@ -79,11 +82,11 @@ export const makeCommand = (options: {
       counts.set(file, (counts.get(file) ?? 0) + 1);
     }
     for (const [file, count] of [...counts].sort(([a], [b]) => a.localeCompare(b))) yield* Console.log(`${file}: ${count} mutants`);
-    yield* Console.log(`${mutants.length} mutants total`);
+    yield* Console.log(`${mutants.length} mutants total; ${notMutated.length} not mutated`);
     if (options.onExit !== undefined) yield* options.onExit(0);
     return;
   }
-  const reporter = yield* makeReporter({ root, outDir: config.outDir, mutants });
+  const reporter = yield* makeReporter({ root, outDir: config.outDir, mutants, notMutated });
   const report = yield* options.run(config, mutants).pipe(Effect.provideService(Reporter, reporter));
   yield* reporter.write(report);
   if (options.onExit !== undefined) yield* options.onExit(reportExitCode(report));
@@ -98,9 +101,11 @@ export const runCli = Effect.fn("runCli")(function*(options: {
 }) {
   const code = yield* Ref.make(0);
   const command = makeCommand({ ...options, onExit: (value) => Ref.set(code, value) });
-  yield* Command.runWith(command, { version: "0.1.2" })(options.args).pipe(
+  yield* Command.runWith(command, { version: "0.1.3" })(options.args).pipe(
     Effect.catch((error) => Effect.gen(function*() {
-      yield* Console.error(String(error));
+      yield* Console.error(error._tag === "ProgramLoadError" ? `${error.tsconfig}:\n${error.diagnostics.join("\n")}`
+        : error._tag === "BaselineFailed" ? `Baseline failed (${error.exitCode}): ${(error.command ?? []).join(" ")}\n${error.output.slice(-8000)}`
+        : String(error));
       yield* Ref.set(code, errorExitCode(error));
     })),
     Effect.catchDefect((defect) => Effect.gen(function*() {

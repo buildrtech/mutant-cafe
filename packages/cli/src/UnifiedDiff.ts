@@ -70,7 +70,8 @@ export const unifiedDiff = (original: string, modified: string, file: string): s
     if (edit.sign !== "-") next++;
   }
   const changed = changes.flatMap((edit, index) => edit.sign === " " ? [] : [index]);
-  const output = [`--- ${JSON.stringify(`a/${file}`)}`, `+++ ${JSON.stringify(`b/${file}`)}`];
+  const quotePath = (path: string) => /[\s"\\]/.test(path) ? JSON.stringify(path) : path;
+  const output = [`--- ${quotePath(`a/${file}`)}`, `+++ ${quotePath(`b/${file}`)}`];
   for (let i = 0; i < changed.length; i++) {
     const start = Math.max(0, changed[i]! - 3);
     let last = changed[i]!;

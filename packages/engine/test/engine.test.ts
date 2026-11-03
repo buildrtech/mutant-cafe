@@ -55,6 +55,29 @@ function loadMutation<A = AccountModule>(mutant: Mutant) {
 }
 
 describe("checker-directed mutation", () => {
+  it.effect("covers internal, nested and value shapes without generating ill-typed generic or pipeable mutants", () => Effect.gen(function* () {
+    const source = makeSource();
+    const input = config("packages/engine/test/fixtures/coverage/tsconfig.json");
+    const mutants = yield* collect(source, input);
+    for (const name of ["layerOnly", "idleOnly", "live", "idle", "StaticService.layer", "internal", "internalEffect", "untraced", "Greeter.layer.greet", "Greeter.layer.send", "policy.canEdit", "machine.guards.allowed", "guardFor.<inner>", "brand", "set", "map", "object", "identityCandidate", "identityGeneric", "report", "scoped", "mapped"]) {
+      const items = mutants.filter(m => m.functionName === name);
+      expect(items.length, name).toBeGreaterThan(0);
+      for (const mutant of items) expect((yield* source.checkViable(mutant)).diagnostics, mutant.description).toEqual([]);
+    }
+    expect(mutants.some(m => m.functionName === "identityCandidate" && m.replacement.text.includes("=> (n)"))).toBe(true);
+    expect(mutants.some(m => m.functionName === "generic")).toBe(false);
+    const skipped = yield* source.notMutated!();
+    expect(skipped.find(s => s.functionName === "generic")?.reason).toContain("generic");
+    expect(skipped.find(s => s.functionName === "opaque")?.reason).toContain("field call");
+    expect(skipped.some(s => s.functionName === "genericElement")).toBe(true);
+    expect(skipped.find(s => s.functionName === "reader.get")?.reason).toContain("generic");
+    const restricted = yield* collect(source, { ...input, exportedOnly: true });
+    expect(restricted.some(m => ["internal", "internalEffect", "untraced", "machine.guards.allowed"].includes(m.functionName))).toBe(false);
+    expect((yield* source.notMutated!()).find(s => s.functionName === "internal")?.reason).toContain("--exported-only");
+    const repeated = yield* collect(makeSource(), input);
+    expect(repeated.map(m => m.id)).toEqual(mutants.map(m => m.id));
+  }), 30_000);
+
   for (const name of ["twice", "find"]) {
     it.effect(`preserves scoped return types and callers for ${name} (B1/B2)`, () => Effect.gen(function* () {
       const source = makeSource();
@@ -104,10 +127,8 @@ describe("checker-directed mutation", () => {
   it.effect("keeps a failing multi-service layer viable", () => Effect.gen(function* () {
     const source = makeSource();
     const mutants = yield* collect(source, config("packages/engine/test/fixtures/viability/tsconfig.json", { functionFilter: ["services"] }));
-    expect(mutants).toHaveLength(1);
-    const mutant = mutants[0]!;
-    expect(mutant.genre).toBe("LayerFail");
-    expect((yield* source.checkViable(mutant)).diagnostics).toEqual([]);
+    expect(mutants.map(m => m.genre).sort()).toEqual(["LayerDie", "LayerFail"]);
+    for (const mutant of mutants) expect((yield* source.checkViable(mutant)).diagnostics).toEqual([]);
   }));
 
   it.effect("gives every generated mutant a distinct description within its function", () => Effect.gen(function* () {
@@ -165,8 +186,9 @@ describe("checker-directed mutation", () => {
     const names = new Set(mutants.map((m) => m.functionName));
     expect(names.has("skipped")).toBe(false);
     expect(names.has("skippedArrow")).toBe(false);
-    expect(names.has("privateFunction")).toBe(false);
+    expect(names.has("privateFunction")).toBe(true);
     expect(names.has("mapped")).toBe(false);
+    expect(mutants.filter(m => m.functionName === "generated" && m.genre === "EffectDie")).toHaveLength(1);
     for (const name of ["bool", "literal", "numeric", "words", "array", "nothing", "option", "stream", "layer", "generated", "named", "program", "maybe", "nested", "synthetic", "Counter.value"]) expect(names.has(name), name).toBe(true);
     expect(mutants.some((m) => m.functionName === "synthetic" && m.genre === "EffectFail" && m.synthetic)).toBe(true);
     expect(mutants.some((m) => m.functionName === "nested" && m.genre === "EffectSucceed")).toBe(true);
