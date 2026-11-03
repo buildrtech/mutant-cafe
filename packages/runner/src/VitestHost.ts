@@ -1,16 +1,38 @@
 // Executed in the target project's Node process, not in the CLI's dependency graph.
 // API verified against Vitest 5.1.0. Unsupported API shapes use the cold adapter.
 import { warmPolicySource, workerDeathSource } from "./WarmPolicy.ts";
+import { processTraceSource } from "./ProcessTrace.ts";
 
 export interface ProbeOptions { readonly token: string; readonly setupFile: string }
 
+// Resolve project files in the killable child, never in the deadline owner's
+// thread. Even a blocked package lookup/native loader remains behind its timer.
+export const vitestLauncherSource = `
+import { createRequire } from "node:module";
+import { dirname, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
+${processTraceSource}
+traceProcess("vitest-resolve-start");
+const require = createRequire(pathToFileURL(process.cwd() + "/package.json"));
+const pkgFile = require.resolve("vitest/package.json");
+const pkg = require(pkgFile);
+const bin = typeof pkg.bin === "string" ? pkg.bin : pkg.bin?.vitest;
+if (typeof bin !== "string") throw new Error("Installed Vitest has no CLI bin");
+const cli = resolve(dirname(pkgFile), bin);
+process.argv = [process.execPath, cli, ...process.argv.slice(2)];
+traceProcess("vitest-resolved");
+await import(pathToFileURL(cli).href);
+`;
+
 export const reporterSource = (marker: string, probe?: ProbeOptions) => `
 import { relative, dirname } from "node:path";
+${processTraceSource}
 ${workerDeathSource}
 export default class {
   files = []; collected = false; failed = false; durations = {}; timeouts = {}; workers = 0; concurrency = 0; fileDurations = {}; firstTestStart = 0; verdict = null; crashed = false;
   constructor(token = ${JSON.stringify(probe?.token ?? null)}, setupFile = ${JSON.stringify(probe?.setupFile ?? null)}) { this.token = token; this.setupFile = setupFile; this.loaded = false; this.originals = []; this.timeoutDetails = {}; this.activeModules = new Set(); this.hooks = new Map(); this.allowances = []; this.telemetryWarnings = []; }
   onInit(ctx) {
+    traceProcess("vitest-start");
     this.ctx = ctx;
     if (!this.setupFile) return;
     for (const vite of new Set(ctx.projects.map(project => project.vite.config))) {
@@ -41,6 +63,7 @@ export default class {
     if (this.token && log.content.includes(this.token)) { this.loaded = true; process.send?.({ type: "probeLoaded" }); console.log(${JSON.stringify(marker + "probeLoaded")}); }
   }
   onTestRunStart(specifications) {
+    traceProcess("test-run-start", { files: specifications.length });
     this.probeSupported = specifications.every(spec => ["forks", "threads", "vmForks", "vmThreads"].includes(spec.pool) && spec.project.config.environment === "node");
     console.log(${JSON.stringify(marker + "probeSupported:")} + JSON.stringify(this.probeSupported));
     const workers = this.ctx.config.maxWorkers;
@@ -56,6 +79,7 @@ export default class {
     console.log(${JSON.stringify(marker + "selected:")} + JSON.stringify(this.files));
   }
   onTestModuleStart(module) {
+    traceProcess("test-module-start");
     this.activeModules.add(module.moduleId);
     this.concurrency = Math.max(this.concurrency, this.activeModules.size);
     console.log(${JSON.stringify(marker + "concurrency:")} + this.concurrency);

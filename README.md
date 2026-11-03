@@ -127,7 +127,7 @@ An include glob that matches no source file is a usage error, including a path o
 | 0 | no missed, unreliable, untested or timed-out mutants |
 | 1 | usage, source or tsconfig error |
 | 2 | some mutants were missed, or untested with no unreliable results |
-| 3 | some timed out, with no missed, unreliable or untested results |
+| 3 | baseline deadline exceeded, or some mutants timed out with no missed, unreliable or untested results |
 | 4 | baseline tests fail |
 | 5 | the `--in-diff` diff does not match the tree |
 | 6 | the diff cannot be parsed |
@@ -162,6 +162,10 @@ This does not add `node:test` support. Literal relative imports are traced trans
 Selection and partial failures come from Vitest's reporter hooks, not its human-readable messages. A reported failure still counts as caught if another test file hangs.
 
 ### Warm and cold runs
+
+The baseline has a 30-minute overall hang guard, including selection and process startup. Set `--baseline-timeout 2400` (seconds), or `baselineTimeoutMs` in `mutants.config.json`, for a longer suite. Expiry reports `BaselineTimedOut`, names the limit and flag, and exits 3 rather than calling the original tests failed. Each cold execution also includes startup in its existing per-run budget. Cold runs launch the installed project\u0027s Vitest bin through Node, without an npm wrapper or shell lookup; the printed command names the actual generated launcher. Cleanup runs after deadline expiry before the next execution.
+
+Set `MUTANT_CAFE_PROCESS_TRACE=/absolute/path/trace.jsonl` to opt into timestamped startup and cleanup stages: parent spawn, preload, birth inspection, child spawn, Vitest resolution/start, test-module start and cwd inspection. Traces append process IDs, times and stage details, not arguments, environment contents or test output. No trace file is written by default.
 
 By default, mutant.cafe first verifies a clean cold baseline and stops if it fails. It then excludes unviable and probe-cached mutants from calibration. Small runs stay cold without more baselines. Other runs measure warm and cold after the successful primer, so both use warmed filesystem inputs. Warm must select the same files, pass, and be at least 10% faster. At decision time the samples and opened copies are already paid for. Projected savings must cover only startup for copies not yet opened; sample costs remain in the report but do not bias the choice. Reports include the decision, measured costs and testable-mutant count. Use a forcing flag to avoid calibration.
 

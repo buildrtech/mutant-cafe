@@ -12,6 +12,12 @@ export class BaselineFailed extends Schema.TaggedError<BaselineFailed>()("Baseli
   output: Schema.String,
 }) {}
 
+export class BaselineTimedOut extends Schema.TaggedError<BaselineTimedOut>()("BaselineTimedOut", {
+  timeoutMs: Schema.Int,
+  command: Schema.Array(Schema.String),
+  message: Schema.String,
+}) {}
+
 export class ScratchError extends Schema.TaggedError<ScratchError>()("ScratchError", {
   operation: Schema.String,
   path: Schema.String,

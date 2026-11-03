@@ -1,6 +1,7 @@
 import { TestSpawnError } from "@mutant-cafe/core";
 import { createEffectActor, createEffectLogic, join, send, setupEffect } from "@xstate/effect";
 import { types } from "xstate";
+import { processTraceSource } from "./ProcessTrace.ts";
 import * as Console from "effect/Console";
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
@@ -26,7 +27,7 @@ export const ProcessInspector = Context.Reference<{
   readonly inspect: (args: ReadonlyArray<string>) => Effect.Effect<{ readonly stdout: string }, TestSpawnError>;
   readonly signal?: (pid: number, signal: "SIGSTOP" | "SIGKILL") => void;
 }>("mutant.cafe/ProcessInspector", { defaultValue: () => ({ inspect: args => Effect.tryPromise({
-  try: signal => execute("ps", [...args], { signal, encoding: "utf8", maxBuffer: 32 * 1024 * 1024, timeout: 2000, env: { PATH: process.env.PATH, LC_ALL: "C", TZ: "UTC" } }),
+  try: signal => execute("/bin/ps", [...args], { signal, encoding: "utf8", maxBuffer: 32 * 1024 * 1024, timeout: 2000, env: { PATH: process.env.PATH, LC_ALL: "C", TZ: "UTC" } }),
   catch: () => new TestSpawnError({ command: ["ps"], message: "Cannot inspect owned test processes" })
 }) }) });
 // A reaped or inaccessible PID makes lsof exit 1, even with useful stdout.
@@ -36,8 +37,8 @@ export const inspectScratchCwd = (pids: ReadonlyArray<number>, probe: {
   readonly live: (pid: number) => boolean;
   readonly read: (pids: ReadonlyArray<number>, signal: AbortSignal) => Promise<{ readonly stdout: string }>;
 } = {
-  live: pid => { try { process.kill(pid, 0); return true; } catch { return false; } },
-  read: (pids, signal) => execute("lsof", ["-a", "-d", "cwd", "-p", pids.join(","), "-Fpn"], { signal, encoding: "utf8", timeout: 2000, maxBuffer: 32 * 1024 * 1024, env: { PATH: process.env.PATH, LC_ALL: "C" } })
+  live: pid => { if (pid <= 0) return false; try { process.kill(pid, 0); return true; } catch { return false; } },
+  read: (pids, signal) => execute("/usr/sbin/lsof", ["-b", "-w", "-n", "-P", "-a", "-d", "cwd", "-p", pids.join(","), "-Fpn"], { signal, encoding: "utf8", timeout: 2000, maxBuffer: 32 * 1024 * 1024, env: { PATH: process.env.PATH, LC_ALL: "C" } })
 }) => Effect.tryPromise({
   // @effect-diagnostics-next-line asyncFunction:off -- Native execFile adapter preserves partial stdout while Effect supplies cancellation.
   try: async signal => {
@@ -59,23 +60,44 @@ const preloadKey = "MUTANT_CAFE_PROCESS_PRELOAD";
 // Record native children at spawn, not when their parent eventually exits.
 // Updating builtin ESM exports also covers `import { spawn } from node:child_process`.
 const preloadSource = `import cp from "node:child_process";
+${processTraceSource}
 import { appendFileSync } from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
-const inspect = cp.execFileSync;
+const nativeExec = Symbol.for("mutant.cafe.nativeExecFile");
+const inspect = cp[nativeExec] ?? (cp[nativeExec] = cp.execFile);
 const ledger = process.env.${ledgerKey};
 const token = process.env.${tokenKey};
 const preload = process.env.${preloadKey};
-const birth = pid => {
-  try { return inspect("ps", ["-p", String(pid), "-o", "lstart="], { encoding: "utf8", timeout: 2000, env: { PATH: process.env.PATH, LC_ALL: "C", TZ: "UTC" }, stdio: ["ignore", "pipe", "ignore"] }).trim(); }
-  catch { return ""; }
-};
-const record = pid => {
-  if (!pid || !ledger) return;
-  const started = birth(pid);
-  if (started) try { appendFileSync(ledger, JSON.stringify({ pid, birth: started, phase: process.env.MUTANT_CAFE_PROCESS_PHASE }) + "\\n"); } catch {}
-};
+traceProcess("preload-start");
+// Async native inspection plus an independent timer: execFileSync's timeout
+// still waits for a kernel-blocked helper to exit, freezing the Node thread.
+const record = pid => new Promise(resolve => {
+  if (!pid || !ledger) return resolve();
+  const began = performance.now();
+  const phase = process.env.MUTANT_CAFE_PROCESS_PHASE;
+  let settled = false; let child;
+  const done = (stage, started = "") => {
+    if (settled) return;
+    settled = true; clearTimeout(timer);
+    if (started) try { appendFileSync(ledger, JSON.stringify({ pid, birth: started, phase }) + "\\n"); } catch {}
+    traceProcess(stage, { targetPid: pid, elapsedMs: performance.now() - began });
+    resolve();
+  };
+  const timer = setTimeout(() => {
+    done("ps-record-timeout");
+    try { child?.kill("SIGKILL"); } catch {}
+    child?.stdout?.destroy(); child?.stderr?.destroy(); child?.unref();
+  }, 1000);
+  traceProcess("ps-record-start", { targetPid: pid });
+  try {
+    child = inspect("/bin/ps", ["-p", String(pid), "-o", "lstart="], { encoding: "utf8", timeout: 1000, killSignal: "SIGKILL", env: { LC_ALL: "C", TZ: "UTC" } }, (error, stdout) => done(error ? "ps-record-failed" : "ps-record-done", error ? "" : stdout.trim()));
+  } catch { done("ps-record-failed"); }
+});
 if (ledger && token && preload) {
-record(process.pid);
+// Await only our own birth before user code can busy-loop. Child-spawn records
+// are asynchronous; implicit Node children also record themselves here.
+await record(process.pid);
+traceProcess("preload-ready");
 const environment = node => {
   const env = { ...process.env };
   const ownImport = "--import=" + preload;
@@ -94,8 +116,11 @@ for (const name of ["spawn", "fork", "execFile", "exec"]) {
     const node = name === "fork" ? (value?.execPath || process.execPath) === process.execPath : args[0] === process.execPath;
     if (typeof args[index] === "function") args.splice(index, 0, options(undefined, node));
     else args[index] = options(value, node);
+    traceProcess("spawn-start", { method: name, node });
     const child = original.apply(this, args);
-    record(child.pid);
+    traceProcess("spawn-return", { method: name, childPid: child.pid, node });
+    child.once("spawn", () => traceProcess("spawn", { method: name, childPid: child.pid, node }));
+    void record(child.pid);
     return child;
   };
   const custom = Symbol.for("nodejs.util.promisify.custom");
@@ -138,6 +163,10 @@ export const acquireProcessTree = Effect.fn("ProcessTree.acquire")(function* (sc
   yield* fs.writeFileString(ledger, "");
   yield* fs.writeFileString(script, preloadSource);
   liveLedgers.add(ledger);
+  const trace = (stage: string, details: { readonly [key: string]: number | string } = {}) => {
+    const destination = process.env.MUTANT_CAFE_PROCESS_TRACE;
+    return destination ? Clock.currentTimeMillis.pipe(Effect.flatMap(at => fs.writeFileString(destination, JSON.stringify({ at, pid: process.pid, ppid: process.ppid, stage, ...details }) + "\n", { flag: "a" })), Effect.timeout(100), Effect.catch(() => Effect.void)) : Effect.void;
+  };
   const roots = new Set<number>();
   const command = ["vitest", "process-cleanup"];
   // Never include inspector output: it can contain environment values.
@@ -155,7 +184,13 @@ export const acquireProcessTree = Effect.fn("ProcessTree.acquire")(function* (sc
     if (remaining <= 0) return Effect.fail(new TestSpawnError({ command, message: `Cleanup deadline exceeded during ${phase}` }));
     return effect.pipe(Effect.interruptible, Effect.timeout(remaining), Effect.mapError(() => new TestSpawnError({ command, message: `Cleanup ${phase} failed or exceeded its ${Math.ceil(remaining)} ms budget` })));
   });
-  const inspect = (args: ReadonlyArray<string>) => bounded("ps inspection", inspector.inspect(args), 2000);
+  const inspect = (args: ReadonlyArray<string>) => bounded("ps inspection", Effect.gen(function* () {
+    const began = performance.now();
+    yield* trace("inspect-start", { operation: args[0] ?? "ps" });
+    const result = yield* inspector.inspect(args);
+    yield* trace("inspect-done", { elapsedMs: performance.now() - began });
+    return result;
+  }), 2000);
   const snapshot = Effect.gen(function* () {
     const result = yield* inspect(["-A", "-ww", "-o", "pid=,ppid=,pgid=,stat=,lstart=,args="]);
     const found = new Map<number, ProcessInfo>();
@@ -269,7 +304,10 @@ export const acquireProcessTree = Effect.fn("ProcessTree.acquire")(function* (sc
     if (process.platform === "linux") yield* Effect.forEach(possible.map(item => item.pid), pid => fs.readLink(`/proc/${pid}/cwd`).pipe(
       Effect.catch(() => Effect.succeed("")), Effect.tap(cwd => Effect.sync(() => { if (cwd === scratch || cwd.startsWith(scratch + "/")) candidates.add(pid); }))), { concurrency: 8, discard: true });
     else if (process.platform === "darwin" && possible.length) {
+      const cwdStarted = performance.now();
+      yield* trace("cwd-start", { candidates: possible.length });
       const cwd = yield* inspectScratchCwd(possible.map(item => item.pid)).pipe(Effect.catch(() => Console.warn("Warning: cannot inspect scratch working directories; argv backstop remains active").pipe(Effect.as({ stdout: "" }))));
+      yield* trace("cwd-done", { elapsedMs: performance.now() - cwdStarted });
       let pid = 0;
       for (const row of cwd.stdout.split("\n")) {
         if (row.startsWith("p")) pid = Number(row.slice(1));
@@ -360,7 +398,7 @@ export const acquireProcessTree = Effect.fn("ProcessTree.acquire")(function* (sc
   const existing = process.env.NODE_OPTIONS ?? "";
   return {
     env: { ...process.env, MUTANT_CAFE_PROCESS_PHASE: undefined, [tokenKey]: token, [ledgerKey]: ledger, [preloadKey]: url, NODE_OPTIONS: `${existing} --import=${url}`.trim() },
-    addRoot: (pid: number) => { roots.add(pid); }, cleanup, reap
+    addRoot: (pid: number) => { roots.add(pid); }, cleanup, reap, trace
   };
 });
 export type OwnedProcessTree = Effect.Success<ReturnType<typeof acquireProcessTree>>;

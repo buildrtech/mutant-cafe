@@ -50,7 +50,7 @@ const program = Effect.gen(function* () {
     const dir = yield* scratch.acquire(fixture);
     yield* fs.writeFileString(`${dir.path}/vitest.config.ts`, `export default { test: { pool: "forks", maxWorkers: 1, include: ["checks/*.fixture.mjs"], env: { MUTANT_CAFE_PID_PROOF: ${JSON.stringify(proof)} } } };`);
     yield* tests.open(dir, mode === "cold", mode === "warm", 1);
-    const baseline = yield* tests.baseline(dir);
+    const baseline = yield* tests.baseline(dir, undefined, 10_000);
     const original = yield* fs.readFileString(`${dir.path}/src/value.ts`);
     const value = scenario === "busy" ? 0 : scenario === "crash" ? 3 : ["worker-timeout", "worker-timeout-interrupt"].includes(scenario) ? 4 : scenario === "normal" ? 5 : scenario === "unhandled" ? 6 : scenario === "minimal-env" ? 7 : 2;
     const offset = original.indexOf("1");

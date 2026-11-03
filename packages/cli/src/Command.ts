@@ -1,4 +1,4 @@
-import { ConfigFile, MutantList, MutantSource, Reporter, RunConfig, type BaselineFailed, type Mutant, type ProgramLoadError, ReportWriteError, type RunReport, type Scratch, type ScratchError, type TestRunner, type TestSpawnError } from "@mutant-cafe/core";
+import { DEFAULT_BASELINE_TIMEOUT_MS, ConfigFile, MutantList, MutantSource, Reporter, RunConfig, type BaselineFailed, type BaselineTimedOut, type Mutant, type ProgramLoadError, ReportWriteError, type RunReport, type Scratch, type ScratchError, type TestRunner, type TestSpawnError } from "@mutant-cafe/core";
 import * as Console from "effect/Console";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -18,7 +18,7 @@ import { git, repositoryRoot, UsageError } from "./Git.ts";
 export { UsageError } from "./Git.ts";
 
 export type Run = (config: RunConfig, mutants: ReadonlyArray<Mutant>) => Effect.Effect<RunReport,
-  BaselineFailed | ScratchError | TestSpawnError | ProgramLoadError | ReportWriteError,
+  BaselineFailed | BaselineTimedOut | ScratchError | TestSpawnError | ProgramLoadError | ReportWriteError,
   MutantSource | Scratch | TestRunner | Reporter | Path.Path>;
 
 const flags = {
@@ -36,7 +36,8 @@ const flags = {
   warm: Flag.Boolean("warm").pipe(Flag.withDefault(false), Flag.withDescription("Force a persistent Vitest instance instead of automatic selection")),
   cold: Flag.Boolean("cold").pipe(Flag.withDefault(false), Flag.withDescription("Start a fresh Vitest process for each test execution")),
   jobs: Flag.Int("jobs").pipe(Flag.optional, Flag.withDescription("Concurrent scratch/test workers; default 1")),
-  timeout: Flag.Finite("timeout").pipe(Flag.optional, Flag.withDescription("Absolute test timeout in seconds")),
+  timeout: Flag.Finite("timeout").pipe(Flag.optional, Flag.withDescription("Absolute test timeout in seconds, including startup")),
+  baselineTimeout: Flag.Finite("baseline-timeout").pipe(Flag.optional, Flag.withDescription("Overall baseline deadline in seconds, including selection and startup; default 1800 (30 minutes)")),
   timeoutMultiplier: Flag.Finite("timeout-multiplier").pipe(Flag.optional, Flag.withDescription("Baseline duration multiplier; default 5")),
   minimumTimeout: Flag.Finite("minimum-test-timeout").pipe(Flag.optional, Flag.withDescription("Minimum test timeout in seconds")),
   output: Flag.String("output").pipe(Flag.withDefault("mutants.out"), Flag.withDescription("Report directory; default mutants.out")),
@@ -84,12 +85,13 @@ export const makeCommand = (options: {
     warm: input.warm,
     jobs: Option.getOrElse(input.jobs, () => fileConfig.jobs ?? 1),
     ...(Option.isSome(timeoutMs) ? { timeoutMs: timeoutMs.value } : {}),
+    baselineTimeoutMs: Option.match(input.baselineTimeout, { onNone: () => fileConfig.baselineTimeoutMs ?? DEFAULT_BASELINE_TIMEOUT_MS, onSome: seconds => Math.ceil(seconds * 1000) }),
     timeoutMultiplier: Option.getOrElse(input.timeoutMultiplier, () => fileConfig.timeoutMultiplier ?? 5),
     minimumTimeoutMs: Option.match(input.minimumTimeout, { onNone: () => fileConfig.minimumTimeoutMs ?? 20_000, onSome: (seconds) => Math.ceil(seconds * 1000) }),
     neverTimeoutMs: 1_000,
     outDir: input.output,
   }).pipe(Effect.mapError((error) => new UsageError({ message: String(error) })));
-  if (config.jobs < 1 || config.timeoutMultiplier <= 0 || config.minimumTimeoutMs <= 0 || (config.timeoutMs !== undefined && config.timeoutMs <= 0)) {
+  if (config.jobs < 1 || config.timeoutMultiplier <= 0 || config.minimumTimeoutMs <= 0 || (config.timeoutMs !== undefined && config.timeoutMs <= 0) || (config.baselineTimeoutMs !== undefined && config.baselineTimeoutMs <= 0)) {
     return yield* new UsageError({ message: "Jobs and timeout values must be positive" });
   }
   const source = yield* MutantSource;
@@ -159,6 +161,13 @@ export const makeCommand = (options: {
       if (!input.advisory) return yield* error;
       if (markdown === undefined) yield* Console.log("Advisory: baseline failed; would exit 4 without --advisory.");
       return failed;
+    })), Effect.catchTag("BaselineTimedOut", error => Effect.gen(function* () {
+      const timedOut: RunReport = { schemaVersion: 2, tool: "mutant.cafe", root,
+        baseline: { durationMs: 0, testCommand: error.command }, timeoutMs: config.timeoutMs ?? config.minimumTimeoutMs, results: [],
+        failure: `BaselineTimedOut: ${error.message}` };
+      yield* reporter.write(timedOut);
+      if (!input.advisory) return yield* error;
+      return timedOut;
     })));
   if (input.advisory && reportExitCode(report) !== 0 && markdown === undefined) yield* Console.log(`Advisory: would exit ${reportExitCode(report)} without --advisory.`);
   yield* reporter.write(report);
@@ -177,6 +186,7 @@ export const runCli = Effect.fn("runCli")(function*(options: {
   yield* Command.runWith(command, { version: "0.1.6" })(options.args).pipe(
     Effect.catch((error) => Effect.gen(function*() {
       yield* Console.error(error._tag === "ProgramLoadError" ? `${error.tsconfig}:\n${error.diagnostics.join("\n")}`
+        : error._tag === "BaselineTimedOut" ? error.message
         : error._tag === "BaselineFailed" ? `Baseline failed (${error.exitCode}): ${error.command.join(" ")}\n${error.output.slice(-8000)}`
         : String(error));
       yield* Ref.set(code, errorExitCode(error));

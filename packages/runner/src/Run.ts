@@ -1,6 +1,6 @@
 import {
   sanitizeReportTelemetry, MutantSource, MutantResult, NotMutated, ReachabilityProbe, Reporter, Scratch, TestRunner,
-  Baseline, BaselineFailed, type Mutant,
+  Baseline, BaselineFailed, BaselineTimedOut, type Mutant,
   type ProgramLoadError, type ReportWriteError, type RunConfig, type RunReport,
   type ScratchDir, ScratchError, type TestSpawnError
 } from "@mutant-cafe/core";
@@ -15,7 +15,7 @@ import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import { unreliableFor } from "./Preflight.ts";
 
-type RunError = BaselineFailed | ScratchError | TestSpawnError | ProgramLoadError | ReportWriteError;
+type RunError = BaselineFailed | BaselineTimedOut | ScratchError | TestSpawnError | ProgramLoadError | ReportWriteError;
 // XState freezes plain context objects in development. A pool is a live
 // resource, not immutable run data; keep its internals behind a class handle.
 class ScratchPool {
@@ -50,7 +50,7 @@ export const runMutants = Effect.fn("Runner.runMutants")(function* (
   const report = (state: RunState): RunReport => sanitizeReportTelemetry({
     schemaVersion: 2, tool: "mutant.cafe", root: config.root,
     baseline: state.baseline, timeoutMs: state.timeoutMs, results: state.results, notMutated: state.notMutated, reachabilityProbes: state.probes, hostRestarts: state.hostRestarts, poolResets: state.poolResets,
-    ...(state.failure === undefined ? {} : { failure: state.failure._tag === "BaselineFailed" ? `${state.failure._tag}: ${state.failure.command.join(" ")}\n${state.failure.output.slice(-8000)}` : String(state.failure) })
+    ...(state.failure === undefined ? {} : { failure: state.failure._tag === "BaselineTimedOut" ? `BaselineTimedOut: ${state.failure.message}` : state.failure._tag === "BaselineFailed" ? `${state.failure._tag}: ${state.failure.command.join(" ")}\n${state.failure.output.slice(-8000)}` : String(state.failure) })
   }).report;
   const capture = <A, R>(effect: Effect.Effect<A, RunError, R>) => Effect.result(effect);
   const copying = createEffectLogic(({ input }: { input: number }) => capture(Effect.gen(function* () {
@@ -70,7 +70,7 @@ export const runMutants = Effect.fn("Runner.runMutants")(function* (
     if (input === undefined) return yield* Effect.die("Missing scratch pool");
     const baseline = yield* Effect.scoped(Effect.gen(function* () {
       const dir = yield* Pool.get(input.value);
-      return yield* tests.baseline(dir, path.isAbsolute(config.tsconfig) ? path.relative(config.root, config.tsconfig) : config.tsconfig);
+      return yield* tests.baseline(dir, path.isAbsolute(config.tsconfig) ? path.relative(config.root, config.tsconfig) : config.tsconfig, config.baselineTimeoutMs);
     }));
     return { baseline, timeoutMs: config.timeoutMs ?? Math.max(config.minimumTimeoutMs, Math.ceil(config.timeoutMultiplier * baseline.durationMs)) };
   })));
@@ -156,7 +156,9 @@ export const runMutants = Effect.fn("Runner.runMutants")(function* (
         const dir = yield* Pool.get(dirs);
         return yield* tests.runRelated(dir, path.isAbsolute(mutant.file) ? path.relative(config.root, mutant.file) : mutant.file, input.state.timeoutMs, probeTimeout);
       }));
-      if (measured.status === "failed" || measured.status === "timedOut") {
+      if (measured.status === "timedOut") return yield* new BaselineTimedOut({ timeoutMs: input.state.timeoutMs, command: measured.command,
+        message: `Clean related probe exceeded ${input.state.timeoutMs / 1000} seconds. Increase --timeout for a longer probe.` });
+      if (measured.status === "failed") {
         return yield* new BaselineFailed({ exitCode: 1, output: measured.output, command: measured.command });
       }
       const files = measured.testFiles ?? Object.keys(measured.testDurations ?? baseline.testDurations ?? {});
@@ -277,7 +279,7 @@ export const runMutants = Effect.fn("Runner.runMutants")(function* (
         onDone: ({ context, event }) => Result.isSuccess(event.output)
           ? { target: "testing", context: { ...context, ...event.output.success } }
           : { target: "reporting", context: { ...context, failure: event.output.failure,
-            baseline: event.output.failure._tag === "BaselineFailed" ? { durationMs: 0, testCommand: event.output.failure.command } : context.baseline
+            baseline: (event.output.failure._tag === "BaselineFailed" || event.output.failure._tag === "BaselineTimedOut") ? { durationMs: 0, testCommand: event.output.failure.command } : context.baseline
           } }
       } },
       generating: { invoke: { src: "generating", onDone: ({ context, event }) => Result.isSuccess(event.output)
