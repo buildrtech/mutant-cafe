@@ -95,6 +95,28 @@ importers:
         specifier: 4.1.2
         version: 4.1.2(effect@4.1.2)(vitest@5.1.0(@types/node@24.13.3)(vite@8.3.5(@types/node@24.13.3)(yaml@2.9.1)))
 
+  packages/mutant-cafe:
+    dependencies:
+      '@effect/platform-node':
+        specifier: 4.1.2
+        version: 4.1.2(effect@4.1.2)(redis@6.3.1)
+      '@xstate/effect':
+        specifier: 1.0.0-alpha.12
+        version: 1.0.0-alpha.12(effect@4.1.2)(xstate@6.0.0-alpha.73)
+      effect:
+        specifier: 4.1.2
+        version: 4.1.2
+      typescript:
+        specifier: 6.0.2
+        version: 6.0.2
+      xstate:
+        specifier: 6.0.0-alpha.73
+        version: 6.0.0-alpha.73
+    devDependencies:
+      esbuild-wasm:
+        specifier: 0.28.2
+        version: 0.28.2
+
   packages/runner:
     dependencies:
       '@effect/platform-node':
@@ -993,6 +1015,11 @@ packages:
 
   es-module-lexer@2.3.2:
     resolution: {integrity: sha512-poHGpORABojJJucnV9KbOavETW8lBVnphkW77ER5/BQ5Fz7oXSoCNek7IH3vR5nRjdsEz926ibFYX8KtLQmdyw==}
+
+  esbuild-wasm@0.28.2:
+    resolution: {integrity: sha512-GccVwhv3mmOUVQHCQm2Ox/rby8n/EqUwvZxE6Pjfikrq/lWw9g9WX/u9EykWnpot3Ko6j426DgQdea2xWKIAQA==}
+    engines: {node: '>=18'}
+    hasBin: true
 
   escalade@3.2.0:
     resolution: {integrity: sha512-WUj2qlxaQtO4g6Pq5c29GTcWGDyd8itL8zTlipgECz3JesAiiOKotd8JU6otB3PACgG6xkJUyVhboMS+bje/jA==}
@@ -1938,6 +1965,8 @@ snapshots:
   emoji-regex@10.6.0: {}
 
   es-module-lexer@2.3.2: {}
+
+  esbuild-wasm@0.28.2: {}
 
   escalade@3.2.0: {}
 
