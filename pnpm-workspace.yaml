@@ -27,3 +27,4 @@ minimumReleaseAgeExclude:
   - vitest@5.1.0
   - '@xstate/effect@1.0.0-alpha.12'
   - xstate@6.0.0-alpha.73
+  - '@effect/platform-browser@4.1.2'
