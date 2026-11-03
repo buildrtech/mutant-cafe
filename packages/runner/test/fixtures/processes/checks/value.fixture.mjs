@@ -22,8 +22,9 @@ it("checks the value without leaving a worker behind", async () => {
     const pending = promisify(execFile)(process.execPath, ["-e", 'process.stdout.write("child-control")']);
     expect(pending.child.pid).toBeGreaterThan(0);
     expect((await pending).stdout).toBe("child-control");
+    // macOS adds __CF_* keys even to env: {}; every other key must match.
     for (const env of [{}, { ONLY: "kept" }]) {
-      const result = await promisify(execFile)(process.execPath, ["-e", 'process.stdout.write(JSON.stringify({ value: 2 + 3, env: process.env }))'], { env });
+      const result = await promisify(execFile)(process.execPath, ["-e", 'process.stdout.write(JSON.stringify({ value: 2 + 3, env: Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("__CF_"))) }))'], { env });
       expect(JSON.parse(result.stdout)).toEqual({ value: 5, env });
     }
     expect(mode).toBe(1);
@@ -40,7 +41,7 @@ it("checks the value without leaving a worker behind", async () => {
   }
   if (mode === 7) {
     const cursor = readFileSync(proof).length;
-    const escapedCode = `const fs = require("node:fs"), cp = require("node:child_process"); if (Object.keys(process.env).length) throw new Error("explicit env changed"); const pid = process.pid; const inspect = field => cp.execFileSync("ps", ["-p", String(pid), "-o", field + "="], { encoding: "utf8", env: { TZ: "UTC", LC_ALL: "C" } }).trim(); fs.appendFileSync(${JSON.stringify(proof)}, JSON.stringify({ pid, kind: "escaped", birth: inspect("lstart"), pgid: Number(inspect("pgid")) }) + "\\n"); while (true) {}`;
+    const escapedCode = `const fs = require("node:fs"), cp = require("node:child_process"); if (Object.keys(process.env).filter(key => !key.startsWith("__CF_")).length) throw new Error("explicit env changed"); const pid = process.pid; const inspect = field => cp.execFileSync("ps", ["-p", String(pid), "-o", field + "="], { encoding: "utf8", env: { TZ: "UTC", LC_ALL: "C" } }).trim(); fs.appendFileSync(${JSON.stringify(proof)}, JSON.stringify({ pid, kind: "escaped", birth: inspect("lstart"), pgid: Number(inspect("pgid")) }) + "\\n"); while (true) {}`;
     // The env-less parent has no preload. Its env-less child must be found
     // through the live PPID chain, not a label or a grandchild ledger record.
     const code = escapedCode.replace('kind: "escaped"', 'kind: "middle"').replace("while (true) {}", `const child = cp.spawn(process.execPath, ["-e", ${JSON.stringify(escapedCode)}], { detached: true, stdio: "ignore", env: {} }); child.unref(); while (true) {}`);
