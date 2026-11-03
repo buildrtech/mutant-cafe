@@ -83,7 +83,27 @@ export const NotMutated = Schema.Struct({
 });
 export type NotMutated = typeof NotMutated.Type;
 
+// Additive optional fields preserve decoding of schemaVersion 2 reports.
+export const SelectionCounts = Schema.Struct({
+  selected: Schema.Int,
+  run: Schema.Int,
+  budgetSkipped: Schema.Int,
+});
+export type SelectionCounts = typeof SelectionCounts.Type;
+
+export const MutantList = Schema.Struct({
+  schemaVersion: Schema.Literal(2),
+  tool: Schema.Literal("mutant.cafe"),
+  mutants: Schema.Array(Mutant),
+  notMutated: Schema.Array(NotMutated),
+  counts: SelectionCounts,
+});
+export type MutantList = typeof MutantList.Type;
+
 export const RunReport = Schema.Struct({
+  selected: Schema.optional(Schema.Int),
+  run: Schema.optional(Schema.Int),
+  budgetSkipped: Schema.optional(Schema.Int),
   schemaVersion: Schema.Literal(2),
   tool: Schema.Literal("mutant.cafe"),
   root: Schema.String,

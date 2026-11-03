@@ -8,6 +8,7 @@ import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
 import { unifiedDiff } from "./UnifiedDiff.ts";
+import { countsLine, markdownSummary } from "./Summary.ts";
 
 export const mutantLine = (mutant: Mutant, root: string, path: Path.Path): string =>
   `${path.relative(root, path.resolve(root, mutant.file))}:${mutant.span.start.line}:${mutant.span.start.column}: ${mutant.description.replace(mutant.returnType, shortType(mutant.displayReturnType ?? mutant.returnType))} [${mutant.id}]`;
@@ -29,6 +30,15 @@ export const makeReporter = Effect.fn("makeReporter")(function*(options: {
   readonly outDir: string;
   readonly mutants: ReadonlyArray<Mutant>;
   readonly notMutated?: ReadonlyArray<NotMutated>;
+  readonly selected?: number;
+  readonly budgetSkipped?: number;
+  readonly markdown?: {
+    readonly gitRoot: string;
+    readonly marker: string;
+    readonly advisory: boolean;
+    readonly stdout: boolean;
+    readonly files: ReadonlyArray<string>;
+  };
 }) {
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
@@ -78,7 +88,7 @@ export const makeReporter = Effect.fn("makeReporter")(function*(options: {
   const service = Reporter.of({
     progress: (result) => semaphore.withPermit(Effect.gen(function*() {
       results.push(result);
-      yield* Console.log(`${result.outcome} ${mutantLine(result.mutant, options.root, path)} (${result.durationMs}ms)`);
+      if (!options.markdown?.stdout) yield* Console.log(`${result.outcome} ${mutantLine(result.mutant, options.root, path)} (${result.durationMs}ms)`);
       yield* Effect.gen(function*() {
         if (!ids.has(result.mutant.id)) return yield* writeError("Progress result does not belong to this report");
         yield* writeLists(results);
@@ -92,7 +102,9 @@ export const makeReporter = Effect.fn("makeReporter")(function*(options: {
     })),
     write: (report) => semaphore.withPermit(Effect.gen(function*() {
       if (pendingError !== undefined) return yield* pendingError;
-      const encoded = yield* jsonReport(report).pipe(Effect.mapError(writeError));
+      const counted: RunReport = { ...report, selected: options.selected ?? options.mutants.length,
+        run: report.results.length, budgetSkipped: options.budgetSkipped ?? 0 };
+      const encoded = yield* jsonReport(counted).pipe(Effect.mapError(writeError));
       yield* fs.writeFileString(path.join(dir, "outcomes.json.tmp"), encoded).pipe(Effect.mapError(writeError));
       yield* fs.rename(path.join(dir, "outcomes.json.tmp"), path.join(dir, "outcomes.json")).pipe(Effect.mapError(writeError));
       yield* writeLists(report.results).pipe(Effect.mapError(writeError));
@@ -102,11 +114,19 @@ export const makeReporter = Effect.fn("makeReporter")(function*(options: {
       }
       // The runner writes on completion or interrupt and the CLI writes again
       // as the owner of the final report; files are idempotent, the summary prints once.
+      if (options.markdown !== undefined) {
+        const markdown = markdownSummary({ ...options.markdown, root: options.root, path, report: counted, notMutated: options.notMutated?.length ?? 0 });
+        for (const file of new Set(options.markdown.files)) {
+          yield* fs.writeFileString(file, markdown).pipe(Effect.mapError(error => new ReportWriteError({ path: file, message: String(error) })));
+        }
+        if (!summarized && options.markdown.stdout) yield* Console.log(markdown);
+      }
       if (summarized) return;
       summarized = true;
       if (report.results.some(result => result.outcome === "unreliable")) yield* Console.warn("Unreliable: the configured Vitest run cannot see all tests. See unreliable.txt and per-mutant diagnostics; these are not missed mutants.");
       const elapsed = (yield* Clock.currentTimeMillis) - started;
-      yield* Console.log(outcomes.map((outcome) => `${report.results.filter((result) => result.outcome === outcome).length} ${outcome}`).join(", ") + `; ${options.notMutated?.length ?? 0} not mutated; ${(elapsed / 1000).toFixed(2)}s`);
+      if (!options.markdown?.stdout) yield* Console.log(countsLine(counted, options.notMutated?.length ?? 0) + `; ${(elapsed / 1000).toFixed(2)}s`);
+      if (options.markdown === undefined && report.failure !== undefined) yield* Console.warn(report.failure);
     })),
   });
   return service;
