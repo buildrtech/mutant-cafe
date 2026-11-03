@@ -1,4 +1,4 @@
-import { MutantSource, ProgramLoadError, type Mutant, type NotMutated, type RunConfig } from "@mutant-cafe/core";
+import { MutantSource, ProgramLoadError, type Mutant, type NotMutated, type RunConfig, type Viability } from "@mutant-cafe/core";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Stream from "effect/Stream";
@@ -24,27 +24,58 @@ export function makeMutantSource(oracle: TypeOracle): MutantSource["Service"] {
       const discovered = oracle.discover(config);
       const notMutated: NotMutated[] = [...discovered.notMutated];
       const mutants: Mutant[] = [];
-      for (const fn of discovered.functions) {
-        const generated = [...generateFunction(fn)];
-        if (!generated.length) notMutated.push({ file: fn.file, functionName: fn.name, reason: fn.skipReason ?? `opaque return or no synthesizable value: ${fn.displayReturnType}` });
+      const failed = new Set<typeof discovered.functions[number]>();
+      const generatedFunctions = discovered.functions.map(fn => {
+        try {
+          const iterator = generateFunction(fn);
+          const generated: Mutant[] = [];
+          let step = iterator.next();
+          while (!step.done) { generated.push(step.value); step = iterator.next(); }
+          if (step.value) {
+            failed.add(fn);
+            notMutated.push({ file: fn.file, functionName: fn.name, span: fn.span, reason: step.value });
+            return { fn, generated: [] };
+          }
+          return { fn, generated };
+        }
+        catch (error) {
+          failed.add(fn);
+          notMutated.push({ file: fn.file, functionName: fn.name, span: fn.span,
+            reason: `analysis failed: ${error instanceof Error ? error.message : String(error)}` });
+          return { fn, generated: [] };
+        }
+      });
+      for (const { fn, generated } of generatedFunctions) {
+        if (failed.has(fn)) continue;
+        {
+          const reasons = [...(fn.notices ?? [])];
+          if (!generated.length && !reasons.length) reasons.push(fn.skipReason ?? `return not synthesizable (type ${fn.displayReturnType})`);
+          const innerMutated = !generated.length && generatedFunctions.some(({ fn: inner, generated }) => inner.file === fn.file && inner.startOffset > fn.startOffset
+            && inner.endOffset < fn.endOffset && generated.length > 0);
+          if (innerMutated && !generated.length) {
+            for (let i = 0; i < reasons.length; i++) if (reasons[i]!.startsWith("return not synthesizable")) reasons[i] += "; inner functions mutated";
+          }
+          if (reasons.length) notMutated.push({ file: fn.file, functionName: fn.name, span: fn.span, reason: [...new Set(reasons)].join("; ") });
+        }
         mutants.push(...generated);
       }
-      return { mutants, notMutated };
+      return { mutants, notMutated: [...new Map(notMutated.map(item => [JSON.stringify(item), item])).values()] };
     },
-    catch: (error) => loadError(config.tsconfig, error),
+    catch: (error) => {
+      if (Schema.is(ProgramLoadError)(error)) return error;
+      // Unexpected outer defects are not config failures. Target analysis is isolated above.
+      throw error;
+    },
   });
   return {
     notMutated: (config) => discover(config).pipe(Effect.map(result => result.notMutated)),
     generate: (config) => Stream.unwrap(discover(config).pipe(Effect.map(result => Stream.fromIterable(result.mutants)))),
-    checkViable: (mutant) => Effect.try({
-      try: () => oracle.checkViable(mutant),
-      catch: (error) => loadError("", error),
+    checkViable: (mutant) => Effect.sync((): Viability => {
+      try { return oracle.checkViable(mutant); }
+      catch (error) { return { viable: false, diagnostics: [], analysisFailed: {
+        file: mutant.file, functionName: mutant.functionName, span: mutant.span,
+        reason: `analysis failed: ${error instanceof Error ? error.message : String(error)}`,
+      } }; }
     }),
   };
-}
-
-function loadError(tsconfig: string, error: unknown): ProgramLoadError {
-  return Schema.is(ProgramLoadError)(error) ? error : new ProgramLoadError({
-    tsconfig, diagnostics: [error instanceof Error ? error.message : String(error)],
-  });
 }

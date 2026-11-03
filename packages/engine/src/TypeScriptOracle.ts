@@ -48,18 +48,24 @@ class ProgramSession {
   check(mutant: Mutant): Viability {
     const file = resolve(mutant.file);
     const source = this.originals.get(file);
-    if (!source) throw new ProgramLoadError({ tsconfig: this.configPath, diagnostics: [`File not loaded: ${mutant.file}`] });
+    if (!source) return { viable: false, diagnostics: [], analysisFailed: { file: mutant.file, functionName: mutant.functionName, span: mutant.span, reason: "analysis failed: source file was not loaded" } };
     const { startOffset, endOffset, text } = mutant.replacement;
     if (startOffset < 0 || endOffset < startOffset || endOffset > source.text.length) {
       return { viable: false, diagnostics: ["Replacement offsets are outside the original file"] };
     }
+    const analysisFailed = (reason: string): Viability => ({ viable: false, diagnostics: [],
+      analysisFailed: { file: mutant.file, functionName: mutant.functionName, span: mutant.span, reason } });
     this.overlay = { file, text: source.text.slice(0, startOffset) + text + source.text.slice(endOffset) };
     try {
       const mutated = ts.createProgram({ rootNames: this.program.getRootFileNames(), options: this.program.getCompilerOptions(), host: this.host, oldProgram: this.program });
       const changed = mutated.getSourceFile(file);
       if (!changed) throw new Error(`Mutated source not found: ${file}`);
+      const issue = typedCallIssue(changed, mutated.getTypeChecker(), true);
+      if (issue) return analysisFailed(issue);
       const diagnostics = [...mutated.getSyntacticDiagnostics(changed), ...mutated.getSemanticDiagnostics(changed)];
       return { viable: diagnostics.length === 0, diagnostics: diagnosticsText(diagnostics) };
+    } catch (error) {
+      return analysisFailed(`analysis failed: ${error instanceof Error ? error.message : String(error)}`);
     } finally {
       this.overlay = undefined;
     }
@@ -93,70 +99,79 @@ export function makeTypeScriptOracle(): TypeOracle {
         if (config.exclude.some((glob) => matchesGlob(local, glob))) continue;
         owners.set(file, session);
         const api = imports(source);
+        const excluded = new Set<ts.Node>();
         const visit = (node: ts.Node): void => {
-          if (isFunction(node) && node.body && !mutable(node, checker)) {
-            notMutated.push({ file, functionName: functionName(node, checker), reason: "unsupported function position: callback, array element or curried implementation" });
-          }
-          if (isFunction(node) && node.body && mutable(node, checker)) {
-            const name = functionName(node, checker);
-            const reason = skipped(node) ? "excluded by @mutants-skip"
-              : config.exportedOnly && !publicOwner(node, checker) ? "excluded by --exported-only"
-              : config.functionFilter.length && !config.functionFilter.some(filter => matchesGlob(name, filter)) ? "excluded by function filter"
-              : undefined;
-            if (reason) notMutated.push({ file, functionName: name, reason });
-            if (!reason && (!config.functionFilter.length || config.functionFilter.some((filter) => matchesGlob(name, filter)))) {
-              const signature = checker.getSignatureFromDeclaration(node);
-              if (signature) {
-                const wrapped = wrappedEffect(node, checker);
-                const type = wrapped ?? checker.getReturnTypeOfSignature(signature);
-                const generator = wrapped && ts.isFunctionExpression(node) ? node : generatorBody(node, checker);
-                const body = generator?.body ?? node.body;
-                const start = body.getStart(source);
-                const end = body.getEnd();
-                const a = source.getLineAndCharacterOfPosition(start);
-                const b = source.getLineAndCharacterOfPosition(end);
-                const beforePipeables = wrapped && ts.isFunctionExpression(node) ? generatorContract(node, checker) : undefined;
-                const shape = beforePipeables?.shape ?? shapeOf(type, checker, node, body);
-                const originals = equivalentSuccessValues(body, api);
-                if ((!beforePipeables && (type.flags & ts.TypeFlags.TypeParameter) && !("values" in shape && shape.values.length)) || (beforePipeables ? !nameableContract(beforePipeables, checker, node) : hasUnnameableType(type, checker, node))) {
-                  notMutated.push({ file, functionName: name, reason: "generic: naked or context-only type-parameter return" });
-                } else found.push({
-                  file, name, returnType: beforePipeables?.text ?? returnTypeText(type, checker, node),
-                  displayReturnType: node.type?.getText(source) ?? checker.typeToString(type, node),
-                  skipReason: beforePipeables ? `no synthesizable generator success value: ${beforePipeables.text}` : synthesisReason(type, checker, node),
-                  equivalentValues: shape.kind === "Effect" ? shape.values.filter((value) => isEquivalentSuccess(value.text, originals)).map((value) => value.text) : [],
-                  span: { start: { line: a.line + 1, column: a.character + 1 }, end: { line: b.line + 1, column: b.character + 1 } },
-                  startOffset: start, endOffset: end, original: body.getText(source),
-                  identityFile: local, logicalSpan: { offset: start - node.getStart(source), length: end - start },
-                  sourcePrefix: source.text.slice(0, start), importInsertionOffset: importInsertionOffset(source), extraImports: mutationImports(source),
-                  literal: literalOfBody(body, checker),
-                  block: ts.isBlock(body), generator: generator !== undefined,
-                  shape, api,
-                });
-              } else notMutated.push({ file, functionName: name, reason: "missing callable signature" });
+          try {
+            if (isFunction(node) && node.body && !mutable(node, checker)) {
+              if (!ts.findAncestor(node.parent, parent => excluded.has(parent))) notMutated.push({ file, functionName: `${functionName(node, checker)}.<callback>`, span: nodeSpan(node), reason: "callback position (not mutated yet)" });
             }
-          }
-          // A Layer value is a buildable program even when it is not a function.
-          if ((ts.isVariableDeclaration(node) || ts.isPropertyDeclaration(node) || ts.isPropertyAssignment(node)) && node.initializer) {
-            const type = checker.getTypeAtLocation(node.initializer);
-            if (family(type, checker)?.kind === "Layer") {
-              const name = valuePath(node);
-              const reason = skippedNode(node) ? "excluded by @mutants-skip"
+            if (isFunction(node) && node.body && mutable(node, checker)) {
+              const name = functionName(node, checker);
+              const reason = skipped(node) ? "excluded by @mutants-skip"
                 : config.exportedOnly && !publicOwner(node, checker) ? "excluded by --exported-only"
-                : config.functionFilter.length && !config.functionFilter.some(filter => matchesGlob(name, filter)) ? "excluded by function filter" : undefined;
-              if (reason) notMutated.push({ file, functionName: name, reason });
-              else if (!config.functionFilter.length || config.functionFilter.some(filter => matchesGlob(name, filter))) {
-                const body = node.initializer;
-                const a = source.getLineAndCharacterOfPosition(body.getStart(source));
-                const b = source.getLineAndCharacterOfPosition(body.getEnd());
-                found.push({ file, name, returnType: returnTypeText(type, checker, node), displayReturnType: checker.typeToString(type, node),
-                  equivalentValues: [], span: { start: { line: a.line + 1, column: a.character + 1 }, end: { line: b.line + 1, column: b.character + 1 } },
-                  startOffset: body.getStart(source), endOffset: body.getEnd(), original: body.getText(source), literal: undefined,
-                  identityFile: local, logicalSpan: { offset: body.getStart(source) - node.getStart(source), length: body.getWidth(source) },
-                  sourcePrefix: source.text.slice(0, body.getStart(source)), importInsertionOffset: importInsertionOffset(source), extraImports: mutationImports(source),
-                  block: false, generator: false, shape: shapeOf(type, checker, node, body), api });
+                : config.functionFilter.length && !config.functionFilter.some(filter => matchesGlob(name, filter)) ? "excluded by function filter"
+                : undefined;
+              if (reason) { excluded.add(node); notMutated.push({ file, functionName: name, span: nodeSpan(node.body), reason }); }
+              if (!reason && (!config.functionFilter.length || config.functionFilter.some((filter) => matchesGlob(name, filter)))) {
+                const signature = checker.getSignatureFromDeclaration(node);
+                if (signature) {
+                  const wrapped = wrappedEffect(node, checker);
+                  const type = wrapped ?? checker.getReturnTypeOfSignature(signature);
+                  const generator = wrapped && ts.isFunctionExpression(node) ? node : generatorBody(node, checker);
+                  const body = generator?.body ?? node.body;
+                  const start = body.getStart(source);
+                  const end = body.getEnd();
+                  const a = source.getLineAndCharacterOfPosition(start);
+                  const b = source.getLineAndCharacterOfPosition(end);
+                  const beforePipeables = wrapped && ts.isFunctionExpression(node) ? generatorContract(node, checker) : undefined;
+                  const shape = beforePipeables?.shape ?? shapeOf(type, checker, node, body);
+                  const originals = equivalentSuccessValues(body, api);
+                  if ((!beforePipeables && (type.flags & ts.TypeFlags.TypeParameter) && !("values" in shape && shape.values.length)) || (beforePipeables ? !nameableContract(beforePipeables, checker, node) : hasUnnameableType(type, checker, node))) {
+                    notMutated.push({ file, functionName: name, span: nodeSpan(node), reason: "generic: naked or context-only type-parameter return" });
+                  } else found.push({
+                    file, name, functionLike: true, functionSpan: nodeSpan(body), generationIssue: () => typedCallIssue(body, checker), notices: shapeNotices(shape, type, checker, node), returnType: beforePipeables?.text ?? returnTypeText(type, checker, node),
+                    displayReturnType: node.type?.getText(source) ?? checker.typeToString(type, node),
+                    skipReason: beforePipeables ? `no synthesizable generator success value: ${beforePipeables.text}` : synthesisReason(type, checker, node),
+                    equivalentValues: shape.kind === "Effect" ? shape.values.filter((value) => isEquivalentSuccess(value.text, originals)).map((value) => value.text) : [],
+                    span: { start: { line: a.line + 1, column: a.character + 1 }, end: { line: b.line + 1, column: b.character + 1 } },
+                    startOffset: start, endOffset: end, original: body.getText(source),
+                    identityFile: local, logicalSpan: { offset: start - node.getStart(source), length: end - start },
+                    sourcePrefix: source.text.slice(0, start), importInsertionOffset: importInsertionOffset(source), extraImports: mutationImports(source),
+                    literal: literalOfBody(body, checker),
+                    block: ts.isBlock(body), generator: generator !== undefined,
+                    shape, api,
+                  });
+                } else notMutated.push({ file, functionName: name, span: nodeSpan(node), reason: "missing callable signature" });
               }
             }
+            // A Layer value is a buildable program even when it is not a function.
+            if ((ts.isVariableDeclaration(node) || ts.isPropertyDeclaration(node) || ts.isPropertyAssignment(node)) && node.initializer) {
+              const type = checker.getTypeAtLocation(node.initializer);
+              if (family(type, checker)?.kind === "Layer") {
+                const name = valuePath(node);
+                const reason = skippedNode(node) ? "excluded by @mutants-skip"
+                  : config.exportedOnly && !publicOwner(node, checker) ? "excluded by --exported-only"
+                  : config.functionFilter.length && !config.functionFilter.some(filter => matchesGlob(name, filter)) ? "excluded by function filter" : undefined;
+                if (reason) { excluded.add(node.initializer); notMutated.push({ file, functionName: name, span: nodeSpan(node.initializer), reason }); }
+                if (!reason) {
+                  const body = node.initializer;
+                  const a = source.getLineAndCharacterOfPosition(body.getStart(source));
+                  const b = source.getLineAndCharacterOfPosition(body.getEnd());
+                  found.push({ file, name, functionLike: false, generationIssue: () => typedCallIssue(body, checker), notices: shapeNotices(shapeOf(type, checker, node, body), type, checker, node), returnType: returnTypeText(type, checker, node), displayReturnType: checker.typeToString(type, node),
+                    equivalentValues: [], span: { start: { line: a.line + 1, column: a.character + 1 }, end: { line: b.line + 1, column: b.character + 1 } },
+                    startOffset: body.getStart(source), endOffset: body.getEnd(), original: body.getText(source), literal: undefined,
+                    identityFile: local, logicalSpan: { offset: body.getStart(source) - node.getStart(source), length: body.getWidth(source) },
+                    sourcePrefix: source.text.slice(0, body.getStart(source)), importInsertionOffset: importInsertionOffset(source), extraImports: mutationImports(source),
+                    block: false, generator: false, shape: shapeOf(type, checker, node, body), api });
+                }
+              }
+            }
+          } catch (error) {
+            // Source analysis is best-effort. A single checker hole must not masquerade as a config failure.
+            const target = isFunction(node) ? node.body
+              : (ts.isVariableDeclaration(node) || ts.isPropertyDeclaration(node) || ts.isPropertyAssignment(node)) ? node.initializer : undefined;
+            if (target) notMutated.push({ file, functionName: valuePath(node), span: nodeSpan(target),
+              reason: `analysis failed: ${error instanceof Error ? error.message : String(error)}` });
           }
           ts.forEachChild(node, visit);
         };
@@ -175,14 +190,40 @@ export function makeTypeScriptOracle(): TypeOracle {
         const outside = target === ".." || target.startsWith("../");
         return `No source file matched ${JSON.stringify(glob)}${outside ? " (path is outside the package root)" : ""}`;
       }) });
-      return { functions, notMutated };
+      return { functions, notMutated: [...new Map(notMutated.map(item => [JSON.stringify(item), item])).values()] };
     },
     checkViable(mutant) {
       const session = owners.get(resolve(mutant.file));
-      if (!session) throw new ProgramLoadError({ tsconfig: "", diagnostics: ["Generate mutants before checking viability"] });
+      if (!session) return { viable: false, diagnostics: [], analysisFailed: { file: mutant.file, functionName: mutant.functionName, span: mutant.span, reason: "analysis failed: generate mutants before checking viability" } };
       return session.check(mutant);
     },
   };
+}
+
+function typedCallIssue(body: ts.Node, checker: ts.TypeChecker, includeNested = false): string | undefined {
+  let issue: string | undefined;
+  const visit = (node: ts.Node): void => {
+    if (isFunction(node) && !includeNested) return; // Nested implementations have their own discovery boundary.
+    if (ts.isCallExpression(node) && node.typeArguments?.length) {
+      const signature = checker.getResolvedSignature(node);
+      // Unresolved imports and any-typed receivers may produce a synthetic signature with no declaration.
+      // A missing declaration is data, not an exception manufactured to exercise a catch.
+      if (!signature || (!signature.declaration && checker.getTypeAtLocation(node.expression).flags & ts.TypeFlags.Any)) {
+        issue = `analysis failed: compiler supplied no declaration for typed call ${node.expression.getText()}; check its import or receiver type`;
+        return;
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(body);
+  return issue;
+}
+
+function nodeSpan(node: ts.Node): Mutant["span"] {
+  const source = node.getSourceFile();
+  const a = source.getLineAndCharacterOfPosition(node.getStart(source));
+  const b = source.getLineAndCharacterOfPosition(node.getEnd());
+  return { start: { line: a.line + 1, column: a.character + 1 }, end: { line: b.line + 1, column: b.character + 1 } };
 }
 
 function isFunction(node: ts.Node): node is FunctionNode {
@@ -360,8 +401,9 @@ function nameableContract(contract: { readonly types: ReadonlyArray<ts.Type> }, 
 }
 
 function hasUnnameableType(type: ts.Type, checker: ts.TypeChecker, location: ts.Node): boolean {
-  const printed = checker.typeToTypeNode(type, location, ts.NodeBuilderFlags.NoTruncation);
-  if (!printed) return true;
+  // An explicit return annotation already supplies an in-scope spelling (including type-only aliases).
+  if (isFunction(location) && location.type && !location.asteriskToken) return false;
+  const printed = ts.createSourceFile("contract.ts", `type Contract = ${returnTypeText(type, checker, location)};`, ts.ScriptTarget.Latest, true);
   let missing = false;
   const visit = (node: ts.Node): void => {
     if (ts.isTypeReferenceNode(node) && ts.isIdentifier(node.typeName) && !checker.resolveName(node.typeName.text, location, ts.SymbolFlags.Type, false)) missing = true;
@@ -388,7 +430,7 @@ function generatorContract(node: ts.FunctionExpression, checker: ts.TypeChecker)
     types: [success, ...effects.flatMap(effect => effect.args.slice(1))],
     text: `import("effect/Effect").Effect<${print(success)}, ${union(1)}, ${union(2)}>`,
 
-    shape: { kind: "Effect", values: valuesOf(success, checker, node), errors: [...new Map(effects.flatMap(f => f.args[1] ? taggedValues(f.args[1], checker, node) : []).map(e => [e.tag, e])).values()] },
+    shape: { kind: "Effect", values: boundedValues(success, checker, node).values, omittedValues: boundedValues(success, checker, node).omitted, synthesisIssues: boundedValues(success, checker, node).issues, enumerateRecoveries: smallFinite(success), errors: [...new Map(effects.flatMap(f => f.args[1] ? taggedValues(f.args[1], checker, node) : []).map(e => [e.tag, e])).values()] },
   };
 }
 
@@ -397,7 +439,8 @@ function literalOfBody(body: ts.ConciseBody, checker: ts.TypeChecker): string | 
   const expression = ts.isBlock(body) ? first && ts.isReturnStatement(first) ? first.expression : undefined : body;
   if (!expression) return undefined;
   const type = checker.getTypeAtLocation(expression);
-  return type.isStringLiteral() ? JSON.stringify(type.value) : type.isNumberLiteral() ? String(type.value) : undefined;
+  return type.isStringLiteral() ? JSON.stringify(type.value) : type.isNumberLiteral() ? String(type.value)
+    : type.flags & ts.TypeFlags.BooleanLiteral ? checker.typeToString(type) : undefined;
 }
 
 function generatorBody(node: FunctionNode, checker: ts.TypeChecker): ts.FunctionExpression | undefined {
@@ -501,33 +544,36 @@ function family(type: ts.Type, checker: ts.TypeChecker): { kind: Family; args: R
 function shapeOf(type: ts.Type, checker: ts.TypeChecker, node: ts.Node, body: ts.ConciseBody): ReturnShape {
   if (type.isUnion() && type.types.every((member) => family(member, checker)?.kind === "Effect")) {
     const shapes = type.types.map((member) => shapeOf(member, checker, node, body));
-    const values = shapes.flatMap((shape) => shape.kind === "Effect" ? shape.values : []);
+    const successes = type.types.flatMap(member => family(member, checker)?.args[0] ?? []);
+    const bounded = boundCandidates(successes.flatMap(success => valuesOf(success, checker, node)), successes, node);
     const errors = shapes.flatMap((shape) => shape.kind === "Effect" ? shape.errors : []);
     return { kind: "Effect",
-      values: [...new Map(values.map((value) => [value.text, value])).values()].sort((a, b) => a.text.localeCompare(b.text, "en")),
+      values: bounded.values, omittedValues: bounded.omitted, synthesisIssues: shapes.flatMap(shape => shape.synthesisIssues ?? []), enumerateRecoveries: bounded.values.length <= 4 && successes.every(smallFinite),
       errors: [...new Map(errors.map((error) => [error.tag, error])).values()].sort((a, b) => a.tag.localeCompare(b.tag, "en")),
     };
   }
   const detected = family(type, checker);
   if (detected) {
     const [a, e] = detected.args;
-    const values = a ? valuesOf(a, checker, node) : [];
-    if (detected.kind === "Option") return { kind: "Option", values };
+    if (detected.kind === "Layer") return { kind: "Layer", errors: e ? taggedValues(e, checker, node) : [] };
+    const bounded = a ? boundedValues(a, checker, node) : { values: [], omitted: 0, issues: [] };
+    const values = bounded.values;
+    if (detected.kind === "Option") return { kind: "Option", values, omittedValues: bounded.omitted, synthesisIssues: bounded.issues };
     const errors = e ? taggedValues(e, checker, node) : [];
-    if (detected.kind === "Layer") return { kind: "Layer", errors };
-    return { kind: detected.kind, values, errors };
+    return { kind: detected.kind, values, errors, omittedValues: bounded.omitted, synthesisIssues: bounded.issues, enumerateRecoveries: a !== undefined && smallFinite(a) };
   }
   if (type.flags & ts.TypeFlags.Void) return { kind: "Void", values: [] };
   const members = type.isUnion() ? type.types : [type];
   const boolean = members.every((t) => (t.flags & (ts.TypeFlags.Boolean | ts.TypeFlags.BooleanLiteral)) !== 0);
   const literal = members.every((t) => t.isLiteral());
-  const values = valuesOf(type, checker, node);
+  const bounded = boundedValues(type, checker, node);
+  const values = bounded.values;
   if (isFunction(node)) for (const parameter of node.parameters) {
-    if (ts.isIdentifier(parameter.name) && !parameter.questionToken && !parameter.dotDotDotToken && checker.getTypeAtLocation(parameter) === type) {
+    if (ts.isIdentifier(parameter.name) && checker.isTypeAssignableTo(checker.getTypeAtLocation(parameter), type)) {
       values.push({ text: parameter.name.text, synthetic: false });
     }
   }
-  return { kind: boolean ? "Boolean" : literal ? "Literal" : "Value", values };
+  return { kind: boolean ? "Boolean" : literal ? "Literal" : "Value", values, omittedValues: bounded.omitted, synthesisIssues: bounded.issues };
 }
 
 function taggedValues(type: ts.Type, checker: ts.TypeChecker, location: ts.Node): TaggedValue[] {
@@ -541,11 +587,16 @@ function taggedValues(type: ts.Type, checker: ts.TypeChecker, location: ts.Node)
   });
 }
 
-function constructError(type: ts.Type, checker: ts.TypeChecker, location: ts.Node, tag: string): Value {
+function constructError(type: ts.Type, checker: ts.TypeChecker, location: ts.Node, tag: string): Value & { readonly reason?: string } {
+  const synthetic = (reason?: string): Value & { readonly reason?: string } => ({
+    text: `({ _tag: ${JSON.stringify(tag)} } as unknown as ${returnTypeText(type, checker, location)})`, synthetic: true,
+    ...(reason ? { reason } : {}),
+  });
   const symbol = type.getSymbol();
   if (symbol) {
     const visible = checker.getSymbolsInScope(location, ts.SymbolFlags.Value | ts.SymbolFlags.Alias).find((candidate) => {
-      if (candidate.declarations?.some((declaration) => ts.isImportSpecifier(declaration) && (declaration.isTypeOnly || declaration.parent.parent.isTypeOnly))) return false;
+      if (candidate.declarations?.some((declaration) => (ts.isImportClause(declaration) && declaration.isTypeOnly)
+        || (ts.isImportSpecifier(declaration) && (declaration.isTypeOnly || declaration.parent.parent.isTypeOnly)))) return false;
       const target = candidate.flags & ts.SymbolFlags.Alias ? checker.getAliasedSymbol(candidate) : candidate;
       // Exported Data.TaggedError classes may expose distinct value/type
       // symbols for the same class declaration.
@@ -554,25 +605,48 @@ function constructError(type: ts.Type, checker: ts.TypeChecker, location: ts.Nod
     if (visible) {
       const constructor = checker.getTypeOfSymbolAtLocation(visible, location).getConstructSignatures()[0];
       if (constructor) {
-        const param = constructor.parameters[0];
-        if (!param) return { text: `new ${visible.name}()`, synthetic: false };
-        const fields = checker.getTypeOfSymbolAtLocation(param, location);
-        if (fields.flags & (ts.TypeFlags.Void | ts.TypeFlags.Undefined)) return { text: `new ${visible.name}()`, synthetic: false };
-        const value = valuesOf(fields, checker, location)[0];
-        if (value && !value.synthetic) {
-          const rest = param.valueDeclaration && ts.isParameter(param.valueDeclaration) && param.valueDeclaration.dotDotDotToken;
-          return { text: `new ${visible.name}(${rest ? "..." : ""}${value.text})`, synthetic: false };
+        const arguments_: string[] = [];
+        for (const param of constructor.parameters) {
+          const fields = checker.getTypeOfSymbolAtLocation(param, location);
+          if (fields.flags & (ts.TypeFlags.Void | ts.TypeFlags.Undefined)) continue;
+          const issues = new Set<string>();
+          const value = valuesOf(fields, checker, location, new Set(), 0, issues)[0];
+          if (!value || value.synthetic) {
+            const reason = synthesisReason(fields, checker, location);
+            const field = /\(field ([^)]+)\)/.exec(reason)?.[1];
+            const detail = field ? `field ${field}` : `argument ${param.name} is not synthesizable`;
+            return synthetic(detail + (issues.size ? ` (${[...issues].join("; ")})` : ""));
+          }
+          const declaration = param.valueDeclaration;
+          const rest = declaration && ts.isParameter(declaration) && declaration.dotDotDotToken;
+          arguments_.push(`${rest ? "..." : ""}${value.text}`);
         }
+        return { text: `new ${visible.name}(${arguments_.join(", ")})`, synthetic: false };
       }
     }
+    if (symbol.declarations?.some(ts.isClassDeclaration)) {
+      return synthetic(visible ? "constructor arguments are not synthesizable" : "class is not available as a value; import its constructor");
+    }
   }
-  return { text: `({ _tag: ${JSON.stringify(tag)} } as unknown as ${checker.typeToString(type, location, ts.TypeFormatFlags.NoTruncation)})`, synthetic: true };
+  return synthetic();
 }
 
 // Without UseAliasDefinedOutsideCurrentScope the checker emits import("./module").Name
 // for names not visible here, including transitive error and Brand references.
 function returnTypeText(type: ts.Type, checker: ts.TypeChecker, node: ts.Node): string {
-  const print = (t: ts.Type) => checker.typeToString(t, node, ts.TypeFormatFlags.NoTruncation);
+  if (isFunction(node) && node.type && !node.asteriskToken && checker.getTypeFromTypeNode(node.type) === type) return node.type.getText();
+  const print = (t: ts.Type): string => {
+    if (t.isUnion()) return t.types.map(print).join(" | ");
+    const symbol = t.getSymbol();
+    if (symbol && !checker.resolveName(symbol.name, node, ts.SymbolFlags.Type, false)) {
+      const alias = checker.getSymbolsInScope(node, ts.SymbolFlags.Type | ts.SymbolFlags.Alias).find(candidate => {
+        const target = candidate.flags & ts.SymbolFlags.Alias ? checker.getAliasedSymbol(candidate) : candidate;
+        return !!target.declarations?.length && checker.getDeclaredTypeOfSymbol(target) === t;
+      });
+      if (alias) return alias.name;
+    }
+    return checker.typeToString(t, node, ts.TypeFormatFlags.NoTruncation);
+  };
   if (type.isUnion()) {
     const members = type.types.map((member) => family(member, checker));
     if (members.every((member) => member?.kind === "Effect")) {
@@ -580,6 +654,8 @@ function returnTypeText(type: ts.Type, checker: ts.TypeChecker, node: ts.Node): 
       return `import("effect/Effect").Effect<${args.join(", ")}>`;
     }
   }
+  const detected = family(type, checker);
+  if (detected) return `import("effect/${detected.kind}").${detected.kind}<${detected.args.map(print).join(", ")}>`;
   return print(type);
 }
 
@@ -588,6 +664,12 @@ function returnTypeText(type: ts.Type, checker: ts.TypeChecker, node: ts.Node): 
 function literalData(node: ts.Node): unknown {
   if (ts.isParenthesizedExpression(node) || ts.isAsExpression(node) || ts.isSatisfiesExpression(node)) return literalData(node.expression);
   if (ts.isStringLiteral(node) || ts.isNumericLiteral(node)) return [node.kind, node.text];
+  if (ts.isIdentifier(node) && node.text === "undefined") return ["undefined"];
+  if (ts.isPrefixUnaryExpression(node)) return [node.operator, literalData(node.operand)];
+  if (ts.isArrayLiteralExpression(node)) {
+    const items = node.elements.map(literalData);
+    return items.every(item => item !== undefined) ? ["array", items] : undefined;
+  }
   if (node.kind === ts.SyntaxKind.TrueKeyword || node.kind === ts.SyntaxKind.FalseKeyword || node.kind === ts.SyntaxKind.NullKeyword) return [node.kind];
   if (ts.isObjectLiteralExpression(node)) {
     const fields: Array<readonly [string, unknown]> = [];
@@ -625,25 +707,117 @@ function isEquivalentSuccess(text: string, values: ReadonlyArray<string>): boole
 
 function synthesisReason(type: ts.Type, checker: ts.TypeChecker, node: ts.Node): string {
   if (type.flags & (ts.TypeFlags.TypeParameter | ts.TypeFlags.IndexedAccess)) return "generic return cannot be synthesized";
-  const detected = family(type, checker);
-  const valueType = detected?.args[0] ?? type;
-  for (const field of valueType.getProperties()) {
-    if (!(field.flags & ts.SymbolFlags.Optional) && !valuesOf(checker.getTypeOfSymbolAtLocation(field, node), checker, node).length) {
-      return `no synthesizable value for field ${field.name}`;
-    }
+  const valueType = family(type, checker)?.args[0] ?? type;
+  // Protocol properties are implementation details, not fields a caller can supply.
+  const field = valueType.getProperties().find(field => /^[$\w]+$/.test(field.name)
+    && !(field.flags & ts.SymbolFlags.Optional) && !valuesOf(checker.getTypeOfSymbolAtLocation(field, node), checker, node).length);
+  const symbol = valueType.aliasSymbol ?? valueType.getSymbol();
+  const name = symbol && !symbol.name.startsWith("__") ? symbol.name
+    : valueType.isUnion() ? "union" : valueType.flags & ts.TypeFlags.Object || valueType.isIntersection() ? "object" : checker.typeToString(valueType, node);
+  return field ? `return not synthesizable (field ${field.name})` : `return not synthesizable (type ${name})`;
+}
+
+function valueKey(text: string): string {
+  const source = ts.createSourceFile("value.ts", `(${text})`, ts.ScriptTarget.Latest, true);
+  const statement = source.statements[0];
+  const data = statement && ts.isExpressionStatement(statement) ? literalData(statement.expression) : undefined;
+  return data === undefined ? text : JSON.stringify(data);
+}
+
+/** Finite literal sets are exhaustive up to eight; open/recursive shapes use six representatives.
+ * Undefined is retained separately, so optional returns keep their absence path. */
+function boundedValues(type: ts.Type, checker: ts.TypeChecker, node: ts.Node): { values: Value[]; omitted: number; issues: string[] } {
+  const issues = new Set<string>();
+  return { ...boundCandidates(valuesOf(type, checker, node, new Set(), 0, issues), [type], node), issues: [...issues] };
+}
+
+function smallFinite(type: ts.Type): boolean {
+  const members = type.isUnion() ? type.types : [type];
+  return members.length <= 4 && members.every(member => member.isLiteral()
+    || !!(member.flags & (ts.TypeFlags.Boolean | ts.TypeFlags.BooleanLiteral | ts.TypeFlags.Null | ts.TypeFlags.Undefined | ts.TypeFlags.Void)));
+}
+
+function boundCandidates(candidates: ReadonlyArray<Value>, types: ReadonlyArray<ts.Type>, node: ts.Node): { values: Value[]; omitted: number } {
+  const unique = [...new Map(candidates.map(value => [valueKey(value.text), value])).values()];
+  const members = types.flatMap(type => type.isUnion() ? type.types : [type]);
+  const finite = members.length <= 8 && members.every(member => member.isLiteral()
+    || !!(member.flags & (ts.TypeFlags.Boolean | ts.TypeFlags.BooleanLiteral | ts.TypeFlags.Null | ts.TypeFlags.Undefined)));
+  if (finite || unique.length <= 6) return { values: unique, omitted: 0 };
+  const absence = unique.find(value => value.text === "undefined");
+  const defined = unique.filter(value => value !== absence);
+  const preferred = ["null", '\"\"', "0", "false", "[]", "({  })"].flatMap(text => {
+    const candidate = defined.find(value => valueKey(value.text) === valueKey(text));
+    return candidate ? [candidate] : [];
+  });
+  const original = returnedDiscriminants(node);
+  const priority = defined.filter(candidate => {
+    const source = ts.createSourceFile("value.ts", `(${candidate.text})`, ts.ScriptTarget.Latest, true);
+    const statement = source.statements[0];
+    return statement && ts.isExpressionStatement(statement) && objectDiscriminants(statement.expression).some(key => original.has(key));
+  });
+  const selected = [...new Set([...priority, ...preferred, ...defined])].slice(0, 6);
+  if (absence) selected.push(absence);
+  return { values: selected, omitted: unique.length - selected.length };
+}
+
+function objectDiscriminants(node: ts.Node): string[] {
+  while (ts.isParenthesizedExpression(node) || ts.isAsExpression(node) || ts.isSatisfiesExpression(node)) node = node.expression;
+  if (!ts.isObjectLiteralExpression(node)) return [];
+  return node.properties.flatMap(field => {
+    if (!ts.isPropertyAssignment(field) || ts.isComputedPropertyName(field.name)) return [];
+    let value = field.initializer;
+    while (ts.isParenthesizedExpression(value) || ts.isAsExpression(value) || ts.isSatisfiesExpression(value)) value = value.expression;
+    return ts.isStringLiteral(value) || ts.isNumericLiteral(value)
+      ? [JSON.stringify([field.name.getText().replace(/^["']|["']$/g, ""), value.text])] : [];
+  });
+}
+
+function returnedDiscriminants(node: ts.Node): Set<string> {
+  if (!isFunction(node) || !node.body) return new Set();
+  const result = new Set(objectDiscriminants(node.body));
+  const visit = (child: ts.Node): void => {
+    if (isFunction(child)) return;
+    if (ts.isReturnStatement(child) && child.expression) for (const key of objectDiscriminants(child.expression)) result.add(key);
+    ts.forEachChild(child, visit);
+  };
+  visit(node.body);
+  return result;
+}
+
+function shapeNotices(shape: ReturnShape, type: ts.Type, checker: ts.TypeChecker, node: ts.Node): string[] {
+  const notices: string[] = [...(shape.synthesisIssues ?? [])];
+  const valueType = family(type, checker)?.args[0] ?? type;
+  if ("values" in shape && shape.values.some(value => new TextEncoder().encode(value.text).byteLength > 2048)) notices.push("synthesized value exceeds 2048 bytes");
+  const omitted = shape.omittedValues ?? 0;
+  if (omitted) notices.push(`${omitted} more values not generated (representative cap)`);
+  if ("errors" in shape) for (const error of shape.errors) {
+    if (error.reason !== undefined) notices.push(`cannot construct ${error.tag}: ${error.reason}`);
+    if (new TextEncoder().encode(error.text).byteLength > 2048) notices.push(`cannot construct ${error.tag}: synthesized value exceeds 2048 bytes`);
   }
-  return `opaque return: ${checker.typeToString(type, node)}`;
+  if ("values" in shape && !shape.values.length && !(valueType.flags & ts.TypeFlags.Never) && shape.kind !== "Void") {
+    notices.push(synthesisReason(type, checker, node));
+  }
+  return notices;
 }
 
 /** Bounded synthesis: cycles or unavailable required fields produce no fabricated value. */
-function valuesOf(type: ts.Type, checker: ts.TypeChecker, location: ts.Node, depth = 0): Value[] {
-  if (depth > 4 || type.flags & ts.TypeFlags.Never) return [];
+function valuesOf(type: ts.Type, checker: ts.TypeChecker, location: ts.Node, ancestors: ReadonlySet<ts.Type> = new Set(), depth = 0, issues = new Set<string>()): Value[] {
+  if (depth > 4) { issues.add("synthesis depth limit (4) reached"); return []; }
+  if (ancestors.has(type) || type.flags & ts.TypeFlags.Never) return [];
+  const values = synthesizeValues(type, checker, location, ancestors, depth, issues);
+  const bounded = values.filter(value => new TextEncoder().encode(value.text).byteLength <= 2048);
+  if (bounded.length !== values.length) issues.add("synthesized value exceeds 2048 bytes");
+  return bounded;
+}
+
+function synthesizeValues(type: ts.Type, checker: ts.TypeChecker, location: ts.Node, ancestors: ReadonlySet<ts.Type>, depth: number, issues: Set<string>): Value[] {
+  const descend = (inner: ts.Type): Value[] => valuesOf(inner, checker, location, new Set([...ancestors, type]), depth + 1, issues);
   const value = (text: string): Value => ({ text, synthetic: false });
   const detected = family(type, checker);
   if (detected && (detected.kind === "Option" || detected.kind === "Effect")) {
     const api = imports(location.getSourceFile());
     const inner = detected.args[0];
-    const values = inner ? valuesOf(inner, checker, location, depth + 1) : [];
+    const values = inner ? descend(inner) : [];
     const wrap = api(detected.kind, detected.kind === "Option" ? "some" : "succeed");
     const none = detected.kind === "Option" ? api("Option", "none") : undefined;
     return [
@@ -652,17 +826,25 @@ function valuesOf(type: ts.Type, checker: ts.TypeChecker, location: ts.Node, dep
     ];
   }
   if (type.isIntersection()) {
-    // Only brand primitive intersections; never fabricate arbitrary structural intersections.
+    // Primitive brands need a cast. Structural intersections synthesize their required fields below.
     const primitive = type.types.find(member => member.flags & (ts.TypeFlags.String | ts.TypeFlags.Number));
     const brand = type.types.some(member => member.getProperties().some(prop => prop.name.includes("Brand")));
-    if (primitive && brand) return valuesOf(primitive, checker, location, depth + 1).map(v => ({ ...v, text: `(${v.text} as ${returnTypeText(type, checker, location)})` }));
+    if (primitive && brand) return descend(primitive).map(v => ({ ...v, text: `(${v.text} as ${returnTypeText(type, checker, location)})` }));
   }
   const symbol = type.getSymbol();
   if ((symbol?.name === "ReadonlySet" || symbol?.name === "Set" || symbol?.name === "ReadonlyMap" || symbol?.name === "Map")
     && symbol.declarations?.some(d => /\/lib\.es.*\.d\.ts$/.test(d.getSourceFile().fileName))) {
     return [value(symbol.name.endsWith("Set") ? "new Set()" : "new Map()")];
   }
-  if (type.isUnion()) return [...type.types].sort((a, b) => a.isNumberLiteral() && b.isNumberLiteral() ? a.value - b.value : checker.typeToString(a).localeCompare(checker.typeToString(b), "en")).flatMap((member) => valuesOf(member, checker, location, depth + 1));
+  if (type.isUnion()) {
+    const members = [...type.types];
+    // The checker can intern scalar unions in different orders across selections.
+    // Tagged structural variants retain their declaration order for cap selection.
+    if (members.every(member => member.isLiteral() || !!(member.flags & (ts.TypeFlags.BooleanLiteral | ts.TypeFlags.Null | ts.TypeFlags.Undefined)))) {
+      members.sort((a, b) => a.isNumberLiteral() && b.isNumberLiteral() ? a.value - b.value : checker.typeToString(a).localeCompare(checker.typeToString(b), "en"));
+    }
+    return members.flatMap(member => descend(member));
+  }
   if (type.isStringLiteral()) return [value(JSON.stringify(type.value))];
   if (type.isNumberLiteral()) return [value(String(type.value))];
   if (type.flags & ts.TypeFlags.BooleanLiteral) return [value(checker.typeToString(type))];
@@ -674,34 +856,45 @@ function valuesOf(type: ts.Type, checker: ts.TypeChecker, location: ts.Node, dep
   if (type.flags & (ts.TypeFlags.Unknown | ts.TypeFlags.Any)) return [value("undefined")];
   if (type.flags & (ts.TypeFlags.Undefined | ts.TypeFlags.Void)) return [value("undefined")];
   if (checker.isTupleType(type)) {
-    const elements = checker.getTypeArguments(type as ts.TypeReference).map((t) => valuesOf(t, checker, location, depth + 1)[0]);
+    const elements = checker.getTypeArguments(type as ts.TypeReference).map((t) => descend(t)[0]);
     return elements.every((v) => v !== undefined) ? [value(`[${elements.map((v) => v.text).join(", ")}]`)] : [];
   }
   if (checker.isArrayType(type) || checker.isArrayLikeType(type)) {
     const element = checker.getIndexTypeOfType(type, ts.IndexKind.Number);
-    const elements = element ? valuesOf(element, checker, location, depth + 1) : [];
+    const elements = element ? descend(element) : [];
     return [value("[]"), ...elements.map((v) => ({ text: `[${v.text}]`, synthetic: v.synthetic }))];
   }
-  if (type.flags & ts.TypeFlags.Object && !type.getCallSignatures().length && !type.getConstructSignatures().length) {
+  if ((type.flags & ts.TypeFlags.Object || type.isIntersection()) && !type.getCallSignatures().length && !type.getConstructSignatures().length) {
     const fields: Array<{ name: string; values: Value[] }> = [];
     for (const prop of type.getProperties()) {
       if (prop.flags & ts.SymbolFlags.Optional) continue;
       if (!/^[$\w]+$/.test(prop.name)) return [];
-      const values = valuesOf(checker.getTypeOfSymbolAtLocation(prop, location), checker, location, depth + 1);
+      const values = descend(checker.getTypeOfSymbolAtLocation(prop, location));
       if (!values.length) return [];
       fields.push({ name: prop.name, values });
     }
     const literalFields = fields.filter(field => {
-      const prop = type.getProperty(field.name)!;
+      const prop = type.getProperty(field.name);
+      if (!prop) return false;
       const t = checker.getTypeOfSymbolAtLocation(prop, location);
       return (t.isUnion() ? t.types : [t]).every(member => member.isLiteral() || !!(member.flags & ts.TypeFlags.BooleanLiteral));
     });
-    const render = (changed?: typeof fields[number], replacement?: Value) => value(`({ ${fields.map(field => {
-      const v = (field === changed ? replacement! : field.values[0]!).text;
-      return `${JSON.stringify(field.name)}: ${literalFields.includes(field) ? `(${v} as const)` : v}`;
-    }).join(", ")} })`);
+    const render = (changed?: typeof fields[number], replacement?: Value): Value | undefined => {
+      const parts: string[] = [];
+      let bytes = 6; // ({ ... }) delimiters
+      for (const field of fields) {
+        const v = (field === changed ? replacement! : field.values[0]!).text;
+        const part = `${JSON.stringify(field.name)}: ${literalFields.includes(field) ? `(${v} as const)` : v}`;
+        bytes += new TextEncoder().encode(part).byteLength + (parts.length ? 2 : 0);
+        if (bytes > 2048) { issues.add("synthesized value exceeds 2048 bytes"); return undefined; }
+        parts.push(part);
+      }
+      return value(`({ ${parts.join(", ")} })`);
+    };
+    const first = render();
+    if (!first) return []; // Do not expand a wide object into thousands of oversized variants.
     const anonymous = !type.aliasSymbol && (!type.getSymbol() || ["__type", "__object"].includes(type.getSymbol()!.name));
-    return [render(), ...(anonymous ? literalFields.flatMap(field => field.values.slice(1).map(v => render(field, v))) : [])];
+    return [first, ...(anonymous ? literalFields.flatMap(field => field.values.slice(1).map(v => render(field, v))).filter(value => value !== undefined) : [])];
   }
   return [];
 }

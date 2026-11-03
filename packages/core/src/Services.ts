@@ -13,10 +13,9 @@ import type {
 } from "./Errors.ts";
 import type { Baseline, Mutant, MutantResult, NotMutated, RunReport } from "./Mutant.ts";
 
-export interface Viability {
-  readonly viable: boolean;
-  readonly diagnostics: ReadonlyArray<string>;
-}
+export type Viability =
+  | { readonly viable: boolean; readonly diagnostics: ReadonlyArray<string>; readonly analysisFailed?: never }
+  | { readonly viable: false; readonly diagnostics: ReadonlyArray<string>; readonly analysisFailed: NotMutated };
 
 export class MutantSource extends Context.Service<
   MutantSource,

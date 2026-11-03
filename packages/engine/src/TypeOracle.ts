@@ -7,13 +7,15 @@ export interface Value {
 
 export interface TaggedValue extends Value {
   readonly tag: string;
+  readonly reason?: string;
 }
 
-export type ReturnShape =
+export type ReturnShape = (
   | { readonly kind: "Effect" | "Stream"; readonly values: ReadonlyArray<Value>; readonly errors: ReadonlyArray<TaggedValue> }
   | { readonly kind: "Option"; readonly values: ReadonlyArray<Value> }
   | { readonly kind: "Layer"; readonly errors: ReadonlyArray<TaggedValue> }
-  | { readonly kind: "Boolean" | "Literal" | "Void" | "Value"; readonly values: ReadonlyArray<Value> };
+  | { readonly kind: "Boolean" | "Literal" | "Void" | "Value"; readonly values: ReadonlyArray<Value> }
+) & { readonly omittedValues?: number; readonly synthesisIssues?: ReadonlyArray<string>; readonly enumerateRecoveries?: boolean };
 
 export interface MutableFunction {
   readonly file: string;
@@ -22,6 +24,11 @@ export interface MutableFunction {
   readonly displayReturnType: string;
   readonly equivalentValues: ReadonlyArray<string>;
   readonly skipReason?: string;
+  readonly notices?: ReadonlyArray<string>;
+  readonly functionSpan?: Mutant["span"];
+  readonly functionLike?: boolean;
+  /** A compiler hole discovered lazily at generation, represented as a reason rather than a thrown fault. */
+  readonly generationIssue?: () => string | undefined;
   readonly span: Mutant["span"];
   readonly startOffset: number;
   readonly endOffset: number;

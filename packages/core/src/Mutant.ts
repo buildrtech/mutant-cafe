@@ -77,6 +77,8 @@ export const Baseline = Schema.Struct({
 export type Baseline = typeof Baseline.Type;
 
 export const NotMutated = Schema.Struct({
+  // Optional on decode for existing schemaVersion 2 reports; discovery always supplies it.
+  span: Schema.optional(Span),
   file: Schema.String,
   functionName: Schema.String,
   reason: Schema.String,
@@ -111,5 +113,6 @@ export const RunReport = Schema.Struct({
   timeoutMs: Schema.Int,
   results: Schema.Array(MutantResult),
   failure: Schema.optional(Schema.String),
+  notMutated: Schema.optional(Schema.Array(NotMutated)),
 });
 export type RunReport = typeof RunReport.Type;
