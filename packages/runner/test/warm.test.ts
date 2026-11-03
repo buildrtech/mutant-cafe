@@ -217,7 +217,7 @@ describe("warm Vitest proof (one scratch worker)", () => {
     const console = yield* Console.Console;
     const report = yield* execute(fixture, false, [crash, (yield* stateMutants)[0]!]).pipe(
       Effect.provideService(Console.Console, { ...console, warn: (...args) => { messages.push(args.join(" ")); } }));
-    expect(messages.filter(message => message.includes("restarting once"))).toHaveLength(1);
+    expect(messages.filter(message => message.includes("restarting once")), report.results[0]?.output).toHaveLength(1);
     expect(messages.join("\n")).toContain("crashed twice");
     expect(outcomes(report)).toEqual({ crash: "caught", wrong: "caught" });
     expect(report.results[1]?.output).not.toContain("mutant-warm:selected:");

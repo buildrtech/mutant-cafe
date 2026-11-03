@@ -1,4 +1,4 @@
-import { BaselineFailed, TestRunner, TestSpawnError, type ScratchDir, type TestRun, type SelectionIssue, type Mutant } from "@mutant-cafe/core";
+import { cleanTelemetry, BaselineFailed, TestRunner, TestSpawnError, type ScratchDir, type TestRun, type SelectionIssue, type Mutant } from "@mutant-cafe/core";
 import * as Clock from "effect/Clock";
 import * as Console from "effect/Console";
 import { preflight } from "./Preflight.ts";
@@ -32,6 +32,8 @@ export const TestRunnerLive = Layer.effect(TestRunner, Effect.gen(function* () {
   let automaticMode: "pending" | "cold" | "warm" = "pending";
   let hostRestarts = 0;
   let poolResets = 0;
+  let warned = false;
+  const warn = (message: string) => Effect.suspend(() => { if (warned) return Effect.void; warned = true; return Console.warn(message); });
   const sessionOptions = { onRestart: () => { hostRestarts++; }, onPoolReset: () => { poolResets++; } };
   const execute = Effect.fn("TestRunner.execute")(function* (dir: ScratchDir, args: ReadonlyArray<string>, timeoutMs?: number, testTimeoutMs?: number, forceCold = false, probe?: ProbeOptions) {
     const session = sessions.get(dir.path);
@@ -57,7 +59,7 @@ export const TestRunnerLive = Layer.effect(TestRunner, Effect.gen(function* () {
     // Keep diagnostics off stdout so GitHub output is a Markdown document.
     if (timeoutMs === undefined) yield* Console.error(`Baseline command: ${command.join(" ")} (cwd: ${dir.path})`);
     const started = yield* Clock.currentTimeMillis;
-    const owned = yield* acquireProcessTree().pipe(Effect.provideService(FileSystem.FileSystem, fs),
+    const owned = yield* acquireProcessTree(dir.path).pipe(Effect.provideService(FileSystem.FileSystem, fs),
       Effect.mapError(error => new TestSpawnError({ command, message: String(error) })));
     const chunks: Array<string> = [];
     let exitCode = 1;
@@ -88,7 +90,12 @@ export const TestRunnerLive = Layer.effect(TestRunner, Effect.gen(function* () {
     const failed = output.includes(marker + "failed");
     const selection = output.split("\n").find(line => line.includes(marker + "selected:"))?.split(marker + "selected:")[1];
     const selected = selection === undefined ? [] : yield* Schema.decodeEffect(Schema.fromJsonString(Schema.Array(Schema.String)))(selection).pipe(
-      Effect.mapError(error => new TestSpawnError({ command, message: `Cannot decode Vitest selected files: ${String(error)}` })));
+      Effect.mapError(error => new TestSpawnError({ command, kind: "reporter", message: `Internal cold reporter protocol error in selected files: ${String(error)}` })));
+    const telemetryWarnings: string[] = [];
+    for (const part of output.split(marker + "telemetryWarning:").slice(1)) {
+      const warning = Schema.decodeOption(Schema.fromJsonString(Schema.String))(part.split("\n")[0]!);
+      if (warning._tag === "Some") telemetryWarnings.push(warning.value);
+    }
     const testDurations: Record<string, number> = {};
     const testFileDurations: Record<string, number> = {};
     let firstTestStart = 0;
@@ -97,16 +104,18 @@ export const TestRunnerLive = Layer.effect(TestRunner, Effect.gen(function* () {
     for (const line of output.split("\n")) {
       const entry = line.split(marker + "duration:")[1];
       if (entry === undefined) continue;
-      const timing = yield* Schema.decodeEffect(Schema.fromJsonString(Schema.Struct({ file: Schema.String, duration: Schema.Finite, timeout: Schema.Finite, key: Schema.String, start: Schema.Finite })))(entry).pipe(
-        Effect.mapError(error => new TestSpawnError({ command, message: String(error) })));
+      const decoded = Schema.decodeOption(Schema.fromJsonString(Schema.Struct({ file: Schema.String, duration: Schema.Finite, timeout: Schema.Finite, key: Schema.String, start: Schema.Finite })))(entry);
+      if (decoded._tag === "None") { telemetryWarnings.push("Internal reporter telemetry error: invalid cold timing marker; omitted"); continue; }
+      const timing = decoded.value;
       if (timing.start > 0) firstTestStart = firstTestStart ? Math.min(firstTestStart, timing.start) : timing.start;
       testDurations[timing.file] = Math.max(testDurations[timing.file] ?? 0, timing.duration);
       testTimeoutDetails[timing.key] = timing.timeout;
       testTimeouts[timing.file] = Math.max(testTimeouts[timing.file] ?? 0, timing.timeout);
     }
     for (const part of output.split(marker + "fileDuration:").slice(1)) {
-      const timing = yield* Schema.decodeEffect(Schema.fromJsonString(Schema.Struct({ file: Schema.String, duration: Schema.Finite })))(part.split("\n")[0]!).pipe(
-        Effect.mapError(error => new TestSpawnError({ command, message: String(error) })));
+      const decoded = Schema.decodeOption(Schema.fromJsonString(Schema.Struct({ file: Schema.String, duration: Schema.Finite })))(part.split("\n")[0]!);
+      if (decoded._tag === "None") { telemetryWarnings.push("Internal reporter telemetry error: invalid cold file timing marker; omitted"); continue; }
+      const timing = decoded.value;
       testFileDurations[timing.file] = timing.duration;
     }
     const run: TestRun = {
@@ -117,10 +126,11 @@ export const TestRunnerLive = Layer.effect(TestRunner, Effect.gen(function* () {
       startupMs: firstTestStart ? Math.max(0, Math.ceil(firstTestStart - started)) : 0,
       probeSupported: output.includes(marker + "probeSupported:true"),
       probeLoaded: output.includes(marker + "probeLoaded"),
-      testWorkers: Number(output.split(marker + "workers:")[1]?.split("\n")[0] ?? 0),
+      testWorkers: output.includes(marker + "workers:") ? Number(output.split(marker + "workers:")[1]?.split("\n")[0]) : undefined,
       testConcurrency: Math.max(0, ...output.split(marker + "concurrency:").slice(1).map(part => Number(part.split("\n")[0]))),
     };
-    return { ...run, exitCode };
+    const cleaned = cleanTelemetry(run, "cold run");
+    return { ...cleaned.value, telemetryWarnings: [...telemetryWarnings, ...cleaned.warnings], exitCode };
   }, Effect.scoped);
   return TestRunner.of({
     stats: Effect.sync(() => ({ hostRestarts, poolResets })),
@@ -128,11 +138,11 @@ export const TestRunnerLive = Layer.effect(TestRunner, Effect.gen(function* () {
       scopes.set(dir.path, yield* Scope.Scope);
       yield* Effect.addFinalizer(() => Effect.sync(() => {
         sessions.delete(dir.path); selectors.delete(dir.path); auto.delete(dir.path); primers.delete(dir.path); scopes.delete(dir.path);
-        if (scopes.size === 0) { warmDisabled = false; automaticMode = "pending"; hostRestarts = 0; poolResets = 0; }
+        if (scopes.size === 0) { warmDisabled = false; automaticMode = "pending"; hostRestarts = 0; poolResets = 0; warned = false; }
       }));
       if (cold || warmDisabled || (!warm && automaticMode === "cold")) return;
       const started = yield* Clock.currentTimeMillis;
-      const session = yield* openWarmRunner(dir, () => { warmDisabled = true; }, sessionOptions).pipe(Effect.provideService(FileSystem.FileSystem, fs), Effect.mapError(error => new TestSpawnError({ command: ["vitest", "warm"], message: String(error) })));
+      const session = yield* openWarmRunner(dir, () => { warmDisabled = true; }, { ...sessionOptions, quiet: !warm, warn }).pipe(Effect.provideService(FileSystem.FileSystem, fs), Effect.mapError(error => new TestSpawnError({ command: ["vitest", "warm"], message: String(error) })));
       sessions.set(dir.path, session);
       if (warmDisabled || (!warm && automaticMode === "cold")) { yield* session.disable; return; }
       if (!warm && automaticMode === "pending") auto.set(dir.path, { startupMs: (yield* Clock.currentTimeMillis) - started, mutants });
@@ -195,7 +205,7 @@ export const TestRunnerLive = Layer.effect(TestRunner, Effect.gen(function* () {
       }
       if (sessions.has(dir.path)) yield* sessions.get(dir.path)!.invalidate(run.testFiles?.[0] ?? "package.json");
       if (auto.has(dir.path)) primers.set(dir.path, run);
-      return { durationMs: run.durationMs, testCommand: run.command, unreliable, hostPid: run.hostPid, testTimeoutDetails: run.testTimeoutDetails,
+      return { durationMs: run.durationMs, testCommand: run.command, unreliable, hostPid: run.hostPid, telemetryWarnings: run.telemetryWarnings, testTimeoutDetails: run.testTimeoutDetails,
         testDurations: run.testDurations, testTimeouts: run.testTimeouts, testWorkers: run.testWorkers, testConcurrency: run.testConcurrency,
         testFileDurations: run.testFileDurations, startupMs: run.startupMs, probeSupported: run.probeSupported,
         runnerMode: sessions.has(dir.path) && !warmDisabled && !auto.has(dir.path) ? "warm" as const : "cold" as const };

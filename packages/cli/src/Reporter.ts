@@ -1,4 +1,4 @@
-import { Reporter, ReportWriteError, RunReport, Mutant, type MutantResult, type NotMutated } from "@mutant-cafe/core";
+import { sanitizeReportTelemetry, Reporter, ReportWriteError, RunReport, Mutant, type MutantResult, type NotMutated } from "@mutant-cafe/core";
 import * as Clock from "effect/Clock";
 import * as Console from "effect/Console";
 import * as Effect from "effect/Effect";
@@ -48,6 +48,7 @@ export const makeReporter = Effect.fn("makeReporter")(function*(options: {
   const results: MutantResult[] = [];
   let pendingError: ReportWriteError | undefined;
   let summarized = false;
+  const telemetryWarned = new Set<string>();
   const writeError = (error: unknown) => new ReportWriteError({ path: dir, message: String(error) });
   const ids = new Set<string>();
   for (const mutant of options.mutants) {
@@ -104,7 +105,8 @@ export const makeReporter = Effect.fn("makeReporter")(function*(options: {
       if (pendingError !== undefined) return yield* pendingError;
       const notMutated = [...new Map([...(options.notMutated ?? []), ...(report.notMutated ?? [])].map(item => [JSON.stringify(item), item])).values()];
       yield* fs.writeFileString(path.join(dir, "not-mutated.txt"), notMutated.map(item => `${path.relative(options.root, item.file)}:${item.span?.start.line ?? "?"}:${item.span?.start.column ?? "?"}: ${item.functionName}: ${item.reason}\n`).join("")).pipe(Effect.mapError(writeError));
-      const counted: RunReport = { ...report, notMutated, selected: options.selected ?? options.mutants.length,
+      const telemetry = sanitizeReportTelemetry(report);
+      const counted: RunReport = { ...telemetry.report, notMutated, selected: options.selected ?? options.mutants.length,
         run: report.results.length, budgetSkipped: options.budgetSkipped ?? 0 };
       const encoded = yield* jsonReport(counted).pipe(Effect.mapError(writeError));
       yield* fs.writeFileString(path.join(dir, "outcomes.json.tmp"), encoded).pipe(Effect.mapError(writeError));
@@ -113,6 +115,11 @@ export const makeReporter = Effect.fn("makeReporter")(function*(options: {
       for (const result of report.results) {
         if (!ids.has(result.mutant.id)) return yield* writeError("Final result does not belong to this report");
         yield* fs.writeFileString(path.join(dir, "logs", `${result.mutant.id}.log`), logText(result)).pipe(Effect.mapError(writeError));
+      }
+      // Telemetry warnings cannot prevent persisting the outcomes above.
+      for (const warning of telemetry.warnings) if (!telemetryWarned.has(warning)) {
+        telemetryWarned.add(warning);
+        yield* Console.warn(warning);
       }
       // The runner writes on completion or interrupt and the CLI writes again
       // as the owner of the final report; files are idempotent, the summary prints once.

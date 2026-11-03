@@ -1,4 +1,4 @@
-import { TestSpawnError, type ScratchDir, type TestRun } from "@mutant-cafe/core";
+import { cleanTelemetry, TestSpawnError, type ScratchDir, type TestRun } from "@mutant-cafe/core";
 import { createEffectActor, send, setupEffect } from "@xstate/effect";
 // @effect-diagnostics-next-line nodeBuiltinImport:off -- Node IPC (process.send) is not exposed by Effect's spawner.
 import { spawn, type ChildProcess } from "node:child_process";
@@ -26,9 +26,24 @@ const Message = Schema.Union([
   Schema.Struct({ type: Schema.Literal("crash"), message: Schema.String }),
   Schema.Struct({ type: Schema.Literal("result"), status: Schema.Literals(["passed", "failed", "untested"]),
     testFiles: Schema.Array(Schema.String), testsCollected: Schema.Boolean,
-    testDurations: Schema.Record(Schema.String, Schema.Finite), testTimeouts: Schema.Record(Schema.String, Schema.Finite), testWorkers: Schema.Int, testConcurrency: Schema.Int, testFileDurations: Schema.Record(Schema.String, Schema.Finite), firstTestStart: Schema.Finite, probeSupported: Schema.Boolean, probeLoaded: Schema.Boolean, testTimeoutDetails: Schema.Record(Schema.String, Schema.Finite), crashed: Schema.Boolean })
+    testDurations: Schema.Record(Schema.String, Schema.Finite), testTimeouts: Schema.Record(Schema.String, Schema.Finite), testWorkers: Schema.optional(Schema.Int), testConcurrency: Schema.optional(Schema.Int), telemetryWarnings: Schema.optional(Schema.Array(Schema.String)), testFileDurations: Schema.Record(Schema.String, Schema.Finite), firstTestStart: Schema.Finite, probeSupported: Schema.Boolean, probeLoaded: Schema.Boolean, testTimeoutDetails: Schema.Record(Schema.String, Schema.Finite), crashed: Schema.Boolean })
 ]);
 type Message = typeof Message.Type;
+
+export class ReporterMessageError extends Error { readonly kind = "reporter"; }
+export function decodeWarmMessage(value: unknown): Message {
+  try {
+    const raw = Schema.decodeUnknownSync(Schema.Record(Schema.String, Schema.Unknown))(value);
+    const cleaned = cleanTelemetry(raw, "warm message");
+    if (raw.type === "result") {
+      for (const [key, fallback] of Object.entries({ testDurations: {}, testTimeouts: {}, testFileDurations: {}, testTimeoutDetails: {}, firstTestStart: 0 }))
+        if (cleaned.value[key] === undefined) Reflect.set(cleaned.value, key, fallback);
+      const previous = cleaned.value.telemetryWarnings;
+      Reflect.set(cleaned.value, "telemetryWarnings", [...(Array.isArray(previous) ? previous : []), ...cleaned.warnings]);
+    }
+    return Schema.decodeUnknownSync(Message)(cleaned.value);
+  } catch (error) { throw new ReporterMessageError(`Internal warm reporter protocol error: ${String(error)}`); }
+}
 
 // One pending request per scratch copy. IPC carries only parsed reporter data;
 // stdout is diagnostic text, never an outcome parser for the warm adapter.
@@ -47,7 +62,7 @@ class Host {
   private startup: Promise<Message>;
   private quiescing: (() => void) | undefined;
   private quiesced: (() => void) | undefined;
-  constructor(root: string, script: string, reporter: string, tree: OwnedProcessTree, scope: Scope.Closeable, selectionOnly = false) {
+  constructor(root: string, script: string, reporter: string, tree: OwnedProcessTree, scope: Scope.Closeable, selectionOnly = false, decode = decodeWarmMessage) {
     this.tree = tree;
     this.scope = scope;
     this.child = spawn(process.execPath, [script, reporter, selectionOnly ? "select" : "run"], {
@@ -59,7 +74,7 @@ class Host {
     this.child.stderr?.on("data", chunk => { this.output += String(chunk); });
     this.child.on("message", value => {
       try {
-        const message = Schema.decodeUnknownSync(Message)(value);
+        const message = decode(value);
         if (message.type === "retained") { this.retained = message.pids; return; }
         if (message.type === "quiescing") { this.quiescing?.(); return; }
         if (message.type === "quiesced") { this.quiesced?.(); return; }
@@ -70,7 +85,7 @@ class Host {
         const pending = this.pending;
         this.pending = undefined;
         pending?.resolve(message);
-      } catch (error) { this.pending?.reject(new Error(`Invalid warm reporter message: ${String(error)}`)); }
+      } catch (error) { this.pending?.reject(error instanceof ReporterMessageError ? error : new ReporterMessageError(String(error))); }
     });
     // @effect-diagnostics-next-line newPromise:off -- Promise bridge for the native IPC adapter, scoped by openWarmRunner.
     this.exited = new Promise<void>(resolve => this.child.once("close", () => {
@@ -141,7 +156,7 @@ const lifecycle = setupEffect({ schemas: { events: {
   }
 });
 
-export const openWarmRunner = Effect.fn("TestRunner.openWarm")(function* (dir: ScratchDir, onFallback: () => void, options: { readonly quiet?: boolean; readonly onRestart?: () => void; readonly onPoolReset?: () => void } = {}) {
+export const openWarmRunner = Effect.fn("TestRunner.openWarm")(function* (dir: ScratchDir, onFallback: () => void, options: { readonly quiet?: boolean; readonly onRestart?: () => void; readonly onPoolReset?: () => void; readonly warn?: (message: string) => Effect.Effect<void>; readonly decodeMessage?: typeof decodeWarmMessage } = {}) {
   const fs = yield* FileSystem.FileSystem;
   const parentScope = yield* Scope.Scope;
   const temp = yield* fs.makeTempDirectoryScoped({ prefix: "mutant-warm-" });
@@ -152,21 +167,21 @@ export const openWarmRunner = Effect.fn("TestRunner.openWarm")(function* (dir: S
   const actor = yield* createEffectActor(lifecycle);
   let host: Host | undefined;
   const attempt = <A>(fn: () => Promise<A>) => Effect.tryPromise({ try: fn,
-    catch: error => new TestSpawnError({ command: ["vitest", "warm"], message: String(error) }) });
+    catch: error => new TestSpawnError({ command: ["vitest", "warm"], message: String(error), ...(error instanceof ReporterMessageError ? { kind: "reporter" as const } : {}) }) });
   const close = () => host === undefined ? Effect.void : host.close();
   yield* Effect.addFinalizer(() => close().pipe(Effect.orDie));
   const start = Effect.gen(function* () {
     const scope = yield* Scope.make();
     yield* Effect.addFinalizer(() => Scope.close(scope, Exit.succeed(undefined))).pipe(Effect.provideService(Scope.Scope, parentScope));
-    const tree = yield* acquireProcessTree().pipe(Effect.provideService(Scope.Scope, scope), Effect.provideService(FileSystem.FileSystem, fs),
+    const tree = yield* acquireProcessTree(dir.path).pipe(Effect.provideService(Scope.Scope, scope), Effect.provideService(FileSystem.FileSystem, fs),
       Effect.mapError(error => new TestSpawnError({ command: ["vitest", "warm"], message: String(error) })));
-    const active = new Host(dir.path, script, reporter, tree, scope, options.quiet === true);
+    const active = new Host(dir.path, script, reporter, tree, scope, options.quiet === true, options.decodeMessage);
     host = active;
     yield* Effect.addFinalizer(() => active.grace()).pipe(Effect.provideService(Scope.Scope, scope));
     const ready = yield* attempt(() => host!.ready()).pipe(Effect.timeout(30_000),
       Effect.mapError(error => new TestSpawnError({ command: ["vitest", "warm"], message: String(error) })));
     if (ready.type !== "ready") {
-      if (!options.quiet) yield* Console.warn(`Warning: warm Vitest unavailable; using cold mode: ${"message" in ready ? ready.message : ready.type}`);
+      if (!options.quiet) yield* (options.warn ?? Console.warn)(`Warning: warm Vitest unavailable; using cold mode: ${"message" in ready ? ready.message : ready.type}`);
       yield* Effect.sync(onFallback);
       yield* send(actor, { type: "FALLBACK" });
       yield* close();
@@ -205,7 +220,6 @@ export const openWarmRunner = Effect.fn("TestRunner.openWarm")(function* (dir: S
     yield* attempt(() => pool.done).pipe(Effect.timeout(100), Effect.result);
     const settled = yield* attempt(() => pending).pipe(Effect.timeout(500), Effect.result);
     const health = settled._tag === "Success" ? yield* attempt(() => active.request({ type: "ping" })).pipe(Effect.timeout(500), Effect.result) : settled;
-    yield* Effect.sync(() => options.onPoolReset?.());
     return clean === "clean" && started._tag === "Success" && health._tag === "Success" && health.success.type === "healthy";
   });
   const run = Effect.fn("Warm.run")(function* (file: string | undefined, timeoutMs?: number, testTimeout?: number, probe?: ProbeOptions): Effect.fn.Return<TestRun | undefined, TestSpawnError> {
@@ -230,6 +244,7 @@ export const openWarmRunner = Effect.fn("TestRunner.openWarm")(function* (dir: S
           ...(active.child.pid === undefined ? {} : { hostPid: active.child.pid }), command, output: active.output, durationMs: (yield* Clock.currentTimeMillis) - started };
       }
       if (result._tag === "Failure" && result.failure._tag === "TimeoutError") {
+        yield* Effect.sync(() => options.onPoolReset?.());
         const failedAtDeadline = active.failed;
         yield* send(actor, { type: "CANCEL" });
         // cancelCurrentRun waits for the test: enforce a separate recovery grace.
@@ -239,6 +254,8 @@ export const openWarmRunner = Effect.fn("TestRunner.openWarm")(function* (dir: S
         return { status: failedAtDeadline ? "failed" : "timedOut", command, output: active.output, durationMs: (yield* Clock.currentTimeMillis) - started,
           ...(active.child.pid === undefined ? {} : { hostPid: active.child.pid }), testsCollected: active.collected, testFiles: active.testFiles };
       }
+      if (result._tag === "Failure" && result.failure._tag === "TestSpawnError" && result.failure.kind === "reporter") return yield* result.failure;
+      yield* Effect.sync(() => options.onPoolReset?.());
       if (crash === 0) {
         yield* Console.warn(`Warning: Vitest pool crashed; restarting once: ${result._tag === "Failure" ? String(result.failure) : "message" in result.success ? result.success.message : result.success.type}`);
         if (yield* finish(active, pending)) yield* send(actor, { type: "DONE" });
@@ -257,11 +274,13 @@ export const openWarmRunner = Effect.fn("TestRunner.openWarm")(function* (dir: S
   }, effect => effect.pipe(Effect.onInterrupt(() => Effect.gen(function* () {
     yield* send(actor, { type: "CANCEL" });
     const active = host;
+    yield* Effect.sync(() => options.onPoolReset?.());
     active?.post({ type: "cancel" });
     if (active?.runPending && (yield* finish(active, active.runPending).pipe(Effect.orDie))) yield* send(actor, { type: "DONE" });
     else yield* retire.pipe(Effect.orDie);
   }))));
   const disable = Effect.gen(function* () {
+    if (isCold()) return;
     yield* close();
     yield* send(actor, { type: "FALLBACK" });
   });

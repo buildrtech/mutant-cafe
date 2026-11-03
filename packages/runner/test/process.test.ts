@@ -38,7 +38,7 @@ const waitForEscape = (proof: string) => Effect.callback<void>(resume => {
 
 // This suite executes mutant fixtures. Run on the assigned mutation host only.
 for (const mode of ["cold", "warm"]) {
-  for (const scenario of ["busy", "escaped", "worker-timeout", "normal", "unhandled", "cancel", "crash", "sigint"]) {
+  for (const scenario of ["busy", "escaped", "worker-timeout", "normal", "minimal-env", "unhandled", "cancel", "crash", "sigint"]) {
     it.live(`${mode}: reaps owned PIDs after ${scenario}, including new sessions`, () => Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
       const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
@@ -70,7 +70,7 @@ for (const mode of ["cold", "warm"]) {
       if (scenario !== "sigint") {
         expect(code, output.join("")).toBe(0);
         const metrics = yield* Schema.decodeEffect(Schema.fromJsonString(Schema.Struct({ hostRestarts: Schema.Int, poolResets: Schema.Int })))(yield* fs.readFileString(proof + ".summary.json"));
-        if (mode === "warm" && scenario !== "crash") { expect(metrics.hostRestarts).toBe(0); expect(metrics.poolResets).toBeGreaterThanOrEqual(3); }
+        if (mode === "warm" && scenario !== "crash") { expect(metrics.hostRestarts).toBe(0); expect(metrics.poolResets).toBe(["busy", "escaped", "cancel"].includes(scenario) ? 1 : 0); }
       }
       expect(yield* handle.isRunning).toBe(false);
       const observed = records(proof);

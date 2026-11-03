@@ -47,12 +47,13 @@ export interface TestRun {
   readonly durationMs: number;
   readonly command: ReadonlyArray<string>;
   readonly output: string;
+  readonly telemetryWarnings?: ReadonlyArray<string> | undefined;
   readonly testsCollected?: boolean;
   readonly testFiles?: ReadonlyArray<string>;
   readonly testDurations?: Readonly<Record<string, number>>;
   readonly testTimeouts?: Readonly<Record<string, number>>;
-  readonly testWorkers?: number;
-  readonly testConcurrency?: number;
+  readonly testWorkers?: number | undefined;
+  readonly testConcurrency?: number | undefined;
   readonly testFileDurations?: Readonly<Record<string, number>>;
   readonly startupMs?: number;
   readonly hostPid?: number;

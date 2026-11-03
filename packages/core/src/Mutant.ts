@@ -61,6 +61,7 @@ export const MutantResult = Schema.Struct({
   timeoutMs: Schema.optional(Schema.Int),
   outerTimeoutMs: Schema.optional(Schema.Int),
   hangBudgetBaseMs: Schema.optional(Schema.Finite),
+  telemetryWarnings: Schema.optional(Schema.Array(Schema.String)),
   testWorkers: Schema.optional(Schema.Int),
   testConcurrency: Schema.optional(Schema.Int),
 });
@@ -86,6 +87,7 @@ export const Baseline = Schema.Struct({
   startupMs: Schema.optional(Schema.Int),
   probeSupported: Schema.optional(Schema.Boolean),
   testableMutants: Schema.optional(Schema.Int),
+  telemetryWarnings: Schema.optional(Schema.Array(Schema.String)),
   hostPid: Schema.optional(Schema.Int),
   testTimeoutDetails: Schema.optional(Schema.Record(Schema.String, Schema.Finite)),
   runnerMode: Schema.optional(Schema.Literals(["cold", "warm"])),

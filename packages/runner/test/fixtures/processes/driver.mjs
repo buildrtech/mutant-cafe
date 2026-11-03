@@ -42,7 +42,7 @@ const program = Effect.gen(function* () {
     yield* tests.open(dir, mode === "cold", mode === "warm", 1);
     const baseline = yield* tests.baseline(dir);
     const original = yield* fs.readFileString(`${dir.path}/src/value.ts`);
-    const value = scenario === "busy" ? 0 : scenario === "crash" ? 3 : scenario === "worker-timeout" ? 4 : scenario === "normal" ? 5 : scenario === "unhandled" ? 6 : 2;
+    const value = scenario === "busy" ? 0 : scenario === "crash" ? 3 : scenario === "worker-timeout" ? 4 : scenario === "normal" ? 5 : scenario === "unhandled" ? 6 : scenario === "minimal-env" ? 7 : 2;
     const offset = original.indexOf("1");
     const mutant = { id: "process-cleanup", file: "src/value.ts", functionName: "value", returnType: "number", genre: "BooleanFlip", description: "process cleanup fixture", synthetic: false,
       span: { start: { line: 1, column: 1 }, end: { line: 1, column: original.trimEnd().length + 1 } }, replacement: { startOffset: offset, endOffset: offset + 1, text: String(value) } };
@@ -55,7 +55,7 @@ const program = Effect.gen(function* () {
         yield* Fiber.interrupt(fiber);
       } else {
         const result = yield* run;
-        if (scenario !== "sigint" && result.status !== (scenario === "normal" ? "passed" : ["crash", "worker-timeout", "unhandled"].includes(scenario) ? "failed" : "timedOut")) throw new Error(`Unexpected fixture status: ${result.status}; ${result.output}`);
+        if (scenario !== "sigint" && result.status !== (["normal", "minimal-env"].includes(scenario) ? "passed" : ["crash", "worker-timeout", "unhandled"].includes(scenario) ? "failed" : "timedOut")) throw new Error(`Unexpected fixture status: ${result.status}; ${result.output}`);
         if (mode === "warm" && scenario !== "crash" && result.hostPid !== baseline.hostPid) throw new Error("Healthy warm instance was restarted");
       }
       const survivors = records().filter(item => !(mode === "warm" && item.kind === "ancestor") && alive(item));

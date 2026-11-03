@@ -100,7 +100,7 @@ interface CleanupState {
   readonly failure: string | undefined;
 }
 
-export const acquireProcessTree = Effect.fn("ProcessTree.acquire")(function* () {
+export const acquireProcessTree = Effect.fn("ProcessTree.acquire")(function* (scratch?: string) {
   const fs = yield* FileSystem.FileSystem;
   const directory = yield* fs.makeTempDirectory({ prefix: "mutant-processes-" });
   const ledger = `${directory}/pids.jsonl`;
@@ -193,6 +193,34 @@ export const acquireProcessTree = Effect.fn("ProcessTree.acquire")(function* () 
       });
     }
   });
+  // A scratch-path match nominates a survivor for warning, never for killing.
+  const warnUnowned = Effect.gen(function* () {
+    if (!scratch) return;
+    const table = yield* snapshot;
+    const registered = yield* fs.readFileString(ledger);
+    const known = new Set(registered.split("\n").flatMap(line => {
+      const parsed = Schema.decodeOption(Schema.fromJsonString(Record))(line);
+      return parsed._tag === "Some" && table.get(parsed.value.pid)?.birth === parsed.value.birth ? [parsed.value.pid] : [];
+    }));
+    const candidates = new Set<number>();
+    const argv = yield* inspect(["-A", "-o", "pid=,args="]);
+    for (const line of argv.stdout.split("\n")) {
+      const row = /^\s*(\d+)\s+(.+)$/.exec(line);
+      if (row && row[2]!.includes(scratch)) candidates.add(Number(row[1]));
+    }
+    if (process.platform === "linux") yield* Effect.forEach([...table.keys()].filter(pid => !known.has(pid)), pid => fs.readLink(`/proc/${pid}/cwd`).pipe(
+      Effect.catch(() => Effect.succeed("")), Effect.tap(cwd => Effect.sync(() => { if (cwd === scratch || cwd.startsWith(scratch + "/")) candidates.add(pid); }))), { concurrency: 8, discard: true });
+    else if (process.platform === "darwin") {
+      const cwd = yield* Effect.tryPromise({ try: () => execute("lsof", ["-a", "-d", "cwd", "-Fpn"], { encoding: "utf8", timeout: 5000, maxBuffer: 32 * 1024 * 1024, env: { PATH: process.env.PATH, LC_ALL: "C" } }), catch: () => new TestSpawnError({ command: ["lsof"], message: "Cannot inspect scratch working directories" }) }).pipe(Effect.catch(() => Console.warn("Warning: cannot inspect scratch working directories; argv backstop remains active").pipe(Effect.as({ stdout: "" }))));
+      let pid = 0;
+      for (const row of cwd.stdout.split("\n")) {
+        if (row.startsWith("p")) pid = Number(row.slice(1));
+        if (row.startsWith("n") && (row.slice(1) === scratch || row.slice(1).startsWith(scratch + "/"))) candidates.add(pid);
+      }
+    }
+    const survivors = [...candidates].filter(pid => table.has(pid) && !known.has(pid));
+    if (survivors.length) yield* Console.warn(`Warning: unowned scratch-related process PIDs ${survivors.join(", ")} survived; not signalled because ownership is unproven`);
+  }).pipe(Effect.catch(() => Console.warn("Warning: cannot inspect unowned scratch-related survivors; no unverified PID was signalled")));
   const semaphore = yield* Semaphore.make(1);
   type Outcome = "clean" | "warning";
   let closed: Outcome | undefined;
@@ -202,8 +230,8 @@ export const acquireProcessTree = Effect.fn("ProcessTree.acquire")(function* () 
   const stopping = createEffectLogic(({ input }: { input: ReadonlyArray<ProcessInfo> }) => signal(input, "SIGSTOP").pipe(Effect.result));
   const killing = createEffectLogic(({ input }: { input: ReadonlyArray<ProcessInfo> }) => signal(input, "SIGKILL").pipe(Effect.result));
   // tracking -> discovering -> stopping -> killing -> verifying -> closed.
-  // A newly discovered descendant repeats stopping; a failed cleanup aborts the
-  // lease rather than starting another mutant beside a runaway worker.
+  // A newly discovered descendant repeats stopping. Unverifiable ownership
+  // warns rather than blocking the remaining mutation run.
   const machine = setupEffect({ schemas: { context: types<CleanupState>(), events: { CLOSE: Schema.Struct({}) } },
     actors: { discovering, stopping, killing } }).createMachine({
     context: { pending: [], round: 0, failure: undefined }, output: ({ context }) => context,
@@ -232,6 +260,7 @@ export const acquireProcessTree = Effect.fn("ProcessTree.acquire")(function* () 
   yield* send(actor, { type: "CLOSE" });
   // @effect-diagnostics-next-line anyUnknownInErrorContext:off -- Inspection failures are machine outputs; join failures are unexpected actor defects.
   const result = yield* join(actor).pipe(Effect.orDie);
+  yield* warnUnowned;
   if (result.failure) yield* Console.warn(`Warning: ${result.failure} (tracked PIDs ${(result.pending.length ? result.pending.map(item => item.pid) : [...roots]).join(", ")}); ownership ledger kept at ${ledger}; continuing without reusing the host`);
   return result.failure ? "warning" as const : "clean" as const;
   })).pipe(Effect.uninterruptible);

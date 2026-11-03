@@ -98,7 +98,7 @@ describe("round three regression proof", () => {
       Effect.provideService(Console.Console, { ...original, warn: (...args: ReadonlyArray<unknown>) => { warnings.push(args.join(" ")); } }));
     expect(report.results.map(result => result.outcome)).toEqual(["caught", "caught", "caught"]);
     expect(report.reachabilityProbes).toEqual([]);
-    expect(hosts).toBeLessThanOrEqual(1);
+    expect(hosts).toBe(1);
     expect(warnings.some(message => message.includes("warm Vitest unavailable"))).toBe(false);
   }).pipe(Effect.scoped, Effect.provide(live)), 30_000);
 
@@ -115,15 +115,17 @@ describe("round three regression proof", () => {
     expect(warm.results.map(result => result.outcome)).toEqual(["caught", "missed"]);
     expect(cold.baseline.testConcurrency).toBeGreaterThan(1);
     expect(warm.baseline.testConcurrency).toBeGreaterThan(1);
+    expect(warm.baseline.testConcurrency).toBe(cold.baseline.testConcurrency);
   }).pipe(Effect.scoped, Effect.provide(live)), 40_000);
 
-  it.live("keeps startup services needed by the reused Vitest instance", () => Effect.gen(function* () {
+  it.live("uses cold execution for global setup services", () => Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem;
     const root = yield* fixture(value, 'import { it, expect, inject } from "vitest"; import * as Effect from "effect/Effect"; import { value } from "../src/value.ts"; it("uses its setup service", async () => { const expected = Number(await (await fetch("http://127.0.0.1:" + inject("servicePort"))).text()); expect(await Effect.runPromise(value())).toBe(expected); });', 'globalSetup: ["./setup.mjs"],');
     yield* fs.writeFileString(`${root}/setup.mjs`, 'import { spawn } from "node:child_process"; export default async function(project) { const child = spawn(process.execPath, ["-e", `const server = require("node:http").createServer((request, response) => response.end("1")); server.listen(0, "127.0.0.1", () => console.log(server.address().port));`], { stdio: ["ignore", "pipe", "inherit"] }); const port = await new Promise(resolve => child.stdout.once("data", chunk => resolve(Number(String(chunk).trim())))); project.provide("servicePort", port); return () => child.kill("SIGTERM"); }');
     const report = yield* run(config(root), [replace(value, "Effect.succeed(1)", "Effect.succeed(2)", "wrong"), replace(value, "Effect.succeed(1)", "Effect.succeed(1)", "control")]);
     expect(report.results.map(result => result.outcome)).toEqual(["caught", "missed"]);
     expect(report.hostRestarts).toBe(0);
+    expect(report.baseline.runnerMode).toBe("cold");
   }).pipe(Effect.scoped, Effect.provide(live)), 20_000);
 
   it.live("continues testing after process inspection fails and warns with tracked PIDs", () => Effect.gen(function* () {
@@ -147,8 +149,9 @@ describe("round three regression proof", () => {
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)));
 
   it("reserves startup for unopened scratch copies", () => {
-    expect(startupCost([100], 3)).toBe(300);
-    expect(startupCost([100, 400], 3)).toBe(1200);
+    expect(startupCost([100], 3)).toBe(200);
+    expect(startupCost([100, 400], 2)).toBe(0);
+    expect(startupCost([100, 400], 3)).toBe(400);
   });
 
   it.live("auto excludes unviable and probe-cached mutants", () => Effect.gen(function* () {

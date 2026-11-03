@@ -1,5 +1,5 @@
 import {
-  MutantSource, MutantResult, NotMutated, ReachabilityProbe, Reporter, Scratch, TestRunner,
+  sanitizeReportTelemetry, MutantSource, MutantResult, NotMutated, ReachabilityProbe, Reporter, Scratch, TestRunner,
   Baseline, BaselineFailed, type Mutant,
   type ProgramLoadError, type ReportWriteError, type RunConfig, type RunReport,
   type ScratchDir, ScratchError, type TestSpawnError
@@ -47,11 +47,11 @@ export const runMutants = Effect.fn("Runner.runMutants")(function* (
   const scope = yield* Scope.Scope;
   const path = yield* Path.Path;
   const jobs = Math.max(1, Math.floor(config.jobs));
-  const report = (state: RunState): RunReport => ({
+  const report = (state: RunState): RunReport => sanitizeReportTelemetry({
     schemaVersion: 2, tool: "mutant.cafe", root: config.root,
     baseline: state.baseline, timeoutMs: state.timeoutMs, results: state.results, notMutated: state.notMutated, reachabilityProbes: state.probes, hostRestarts: state.hostRestarts, poolResets: state.poolResets,
     ...(state.failure === undefined ? {} : { failure: state.failure._tag === "BaselineFailed" ? `${state.failure._tag}: ${state.failure.command.join(" ")}\n${state.failure.output.slice(-8000)}` : String(state.failure) })
-  });
+  }).report;
   const capture = <A, R>(effect: Effect.Effect<A, RunError, R>) => Effect.result(effect);
   const copying = createEffectLogic(({ input }: { input: number }) => capture(Effect.gen(function* () {
     const acquire = Effect.gen(function* () {
@@ -86,7 +86,21 @@ export const runMutants = Effect.fn("Runner.runMutants")(function* (
     if (dirs === undefined) return yield* Effect.die("Missing scratch pool");
     let baseline = input.state.baseline;
     const viabilityById = new Map<string, Effect.Success<ReturnType<typeof source.checkViable>>>();
-    for (const mutant of input.state.pending) viabilityById.set(mutant.id, yield* source.checkViable(mutant));
+    // Auto needs a count before sampling; forced modes check inside the jobs
+    // stream so oracle work overlaps native test processes. Auto preflight is
+    // concurrent too, and reports rejected candidates as soon as they finish.
+    const preReported = new Set<string>();
+    if (!config.cold && !config.warm && tests.calibrate) yield* Effect.forEach(input.state.pending, mutant => Effect.gen(function* () {
+      const viability = yield* source.checkViable(mutant);
+      viabilityById.set(mutant.id, viability);
+      if (viability.analysisFailed) { preReported.add(mutant.id); yield* input.skip(viability.analysisFailed); }
+      else if (!viability.viable) {
+        preReported.add(mutant.id);
+        const result: MutantResult = { mutant, outcome: "unviable", durationMs: 0, testCommand: [], diagnostics: viability.diagnostics };
+        yield* input.record(result);
+        yield* reporter.progress(result);
+      }
+    }), { concurrency: jobs, discard: true });
     const unreachable = new Map<string, ReachabilityProbe>();
     const selectRelated = tests.selectRelated;
     const probeReachability = tests.probeReachability;
@@ -94,7 +108,7 @@ export const runMutants = Effect.fn("Runner.runMutants")(function* (
       const seen = new Set<string>();
       const builtTests = input.state.baseline.unreliable?.flatMap(issue => issue.kind === "built" ? issue.testFiles : []) ?? [];
       for (const mutant of input.state.pending) {
-        if (!viabilityById.get(mutant.id)?.viable) continue;
+        if (viabilityById.has(mutant.id) && !viabilityById.get(mutant.id)?.viable) continue;
         const file = path.isAbsolute(mutant.file) ? path.relative(config.root, mutant.file) : mutant.file;
         if (seen.has(file)) continue;
         seen.add(file);
@@ -132,12 +146,15 @@ export const runMutants = Effect.fn("Runner.runMutants")(function* (
     const neverBases = new Map<string, number>();
     const neverAllowances = new Map<string, number>();
     for (const mutant of input.state.pending) {
-      if (!viabilityById.get(mutant.id)?.viable) continue;
+      if (viabilityById.has(mutant.id) && !viabilityById.get(mutant.id)?.viable) continue;
       if (unreachable.has(path.isAbsolute(mutant.file) ? path.relative(config.root, mutant.file) : mutant.file)) continue;
       if (mutant.genre !== "EffectNever" || neverBudgets.has(mutant.file) || unreliableFor(input.state.baseline, path.isAbsolute(mutant.file) ? path.relative(config.root, mutant.file) : mutant.file).length > 0) continue;
+      let probeTimeout = Math.max(1, Math.floor(input.state.timeoutMs / 2));
+      const originalTimeouts = new Set(Object.values(baseline.testTimeoutDetails ?? {}));
+      while (originalTimeouts.has(probeTimeout)) probeTimeout++;
       const measured = yield* Effect.scoped(Effect.gen(function* () {
         const dir = yield* Pool.get(dirs);
-        return yield* tests.runRelated(dir, path.isAbsolute(mutant.file) ? path.relative(config.root, mutant.file) : mutant.file, input.state.timeoutMs);
+        return yield* tests.runRelated(dir, path.isAbsolute(mutant.file) ? path.relative(config.root, mutant.file) : mutant.file, input.state.timeoutMs, probeTimeout);
       }));
       if (measured.status === "failed" || measured.status === "timedOut") {
         return yield* new BaselineFailed({ exitCode: 1, output: measured.output, command: measured.command });
@@ -158,7 +175,8 @@ export const runMutants = Effect.fn("Runner.runMutants")(function* (
     }
     yield* Stream.fromIterable(input.state.pending).pipe(
       Stream.mapEffect((mutant) => Effect.scoped(Effect.gen(function* () {
-        const viability = viabilityById.get(mutant.id)!;
+        if (preReported.has(mutant.id)) return;
+        const viability = viabilityById.get(mutant.id) ?? (yield* source.checkViable(mutant));
         if (viability.analysisFailed) { yield* input.skip(viability.analysisFailed); return; }
         if (!viability.viable) {
           const result: MutantResult = { mutant, outcome: "unviable", durationMs: 0, testCommand: [], diagnostics: viability.diagnostics };
@@ -207,6 +225,7 @@ export const runMutants = Effect.fn("Runner.runMutants")(function* (
           timeoutMs: testTimeoutMs ?? timeoutMs,
           outerTimeoutMs: timeoutMs,
           ...(testTimeoutMs === undefined ? {} : { hangBudgetBaseMs: neverBases.get(mutant.file) }),
+          telemetryWarnings: run.telemetryWarnings,
           testWorkers: run.testWorkers,
           testConcurrency: run.testConcurrency,
           testCommand: run.command,

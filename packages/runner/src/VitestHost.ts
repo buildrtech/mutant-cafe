@@ -1,12 +1,15 @@
 // Executed in the target project's Node process, not in the CLI's dependency graph.
 // API verified against Vitest 5.1.0. Unsupported API shapes use the cold adapter.
+import { warmPolicySource, workerDeathSource } from "./WarmPolicy.ts";
+
 export interface ProbeOptions { readonly token: string; readonly setupFile: string }
 
 export const reporterSource = (marker: string, probe?: ProbeOptions) => `
 import { relative, dirname } from "node:path";
+${workerDeathSource}
 export default class {
-  files = []; collected = false; failed = false; durations = {}; timeouts = {}; workers = 0; concurrency = 0; fileDurations = {}; firstTestStart = 0; verdict = null;
-  constructor(token = ${JSON.stringify(probe?.token ?? null)}, setupFile = ${JSON.stringify(probe?.setupFile ?? null)}) { this.token = token; this.setupFile = setupFile; this.loaded = false; this.originals = []; this.timeoutDetails = {}; this.activeModules = new Set(); this.hooks = new Map(); this.allowances = []; }
+  files = []; collected = false; failed = false; durations = {}; timeouts = {}; workers = 0; concurrency = 0; fileDurations = {}; firstTestStart = 0; verdict = null; crashed = false;
+  constructor(token = ${JSON.stringify(probe?.token ?? null)}, setupFile = ${JSON.stringify(probe?.setupFile ?? null)}) { this.token = token; this.setupFile = setupFile; this.loaded = false; this.originals = []; this.timeoutDetails = {}; this.activeModules = new Set(); this.hooks = new Map(); this.allowances = []; this.telemetryWarnings = []; }
   onInit(ctx) {
     this.ctx = ctx;
     if (!this.setupFile) return;
@@ -40,8 +43,14 @@ export default class {
   onTestRunStart(specifications) {
     this.probeSupported = specifications.every(spec => ["forks", "threads", "vmForks", "vmThreads"].includes(spec.pool) && spec.project.config.environment === "node");
     console.log(${JSON.stringify(marker + "probeSupported:")} + JSON.stringify(this.probeSupported));
-    this.workers = Math.max(0, ...specifications.map(spec => spec.project.config.maxWorkers));
-    console.log(${JSON.stringify(marker + "workers:")} + this.workers);
+    const workers = this.ctx.config.maxWorkers;
+    this.workers = Number.isSafeInteger(workers) && workers > 0 ? workers : undefined;
+    if (this.workers !== undefined) console.log(${JSON.stringify(marker + "workers:")} + this.workers);
+    else {
+      const warning = "Internal reporter telemetry error: testWorkers=" + String(workers) + "; resolved worker budget unavailable, omitted";
+      this.telemetryWarnings.push(warning);
+      console.log(${JSON.stringify(marker + "telemetryWarning:")} + JSON.stringify(warning));
+    }
     this.files = specifications.map(spec => relative(process.cwd(), spec.moduleId));
     process.send?.({ type: "selected", files: this.files });
     console.log(${JSON.stringify(marker + "selected:")} + JSON.stringify(this.files));
@@ -58,6 +67,7 @@ export default class {
   }
   onTestModuleEnd(module) {
     const file = relative(process.cwd(), module.moduleId);
+    this.crashed ||= (module.errors?.() ?? []).some(error => workerDied(error));
     const timing = module.diagnostic();
     this.fileDurations[file] = timing.duration + timing.collectDuration + timing.prepareDuration + timing.setupDuration + timing.environmentSetupDuration;
     console.log(${JSON.stringify(marker + "fileDuration:")} + JSON.stringify({ file, duration: this.fileDurations[file] }));
@@ -65,6 +75,7 @@ export default class {
   }
   onTestCaseResult(test) {
     const result = test.result();
+    this.crashed ||= (result.errors ?? []).some(error => workerDied(error));
     const state = result.state;
     if (state === "failed") { this.failed = true; process.send?.({ type: "failed" }); console.log(${JSON.stringify(marker + "failed")}); }
     if (state === "passed") {
@@ -79,6 +90,7 @@ export default class {
   }
   onTestRunEnd(modules, errors = [], state) {
     this.verdict = state ?? null;
+    this.crashed ||= errors.some(error => workerDied(error)) || modules.some(module => workerDied(module.task) || (module.errors?.() ?? []).some(error => workerDied(error)));
     // Vitest's official run verdict also covers cancelled or pending modules.
     // Parallel bail can omit case-result hooks and module-end results.
     if ((state != null && state !== "passed") || (!this.ctx?.config.dangerouslyIgnoreUnhandledErrors && errors.length)) { this.failed = true; process.send?.({ type: "failed" }); console.log(${JSON.stringify(marker + "failed")}); }
@@ -94,6 +106,8 @@ import { resolve } from "node:path";
 import { readFileSync } from "node:fs";
 const require = createRequire(resolve("package.json"));
 const { default: Reporter } = await import(pathToFileURL(process.argv[2]).href);
+${warmPolicySource}
+${workerDeathSource}
 let ctx;
 let reporter;
 const retained = () => {
@@ -106,14 +120,19 @@ const setup = async fn => {
   try { return await fn(); } finally { if (previous === undefined) delete process.env.MUTANT_CAFE_PROCESS_PHASE; else process.env.MUTANT_CAFE_PROCESS_PHASE = previous; }
 };
 try {
+  const version = JSON.parse(readFileSync(require.resolve("vitest/package.json"), "utf8")).version;
+  const versionRefusal = warmRefusal(version, null);
+  if (versionRefusal) throw new Error(versionRefusal);
   const { createVitest } = await import(pathToFileURL(require.resolve("vitest/node")).href);
   if (typeof createVitest !== "function") throw new Error("createVitest is unavailable");
   ctx = await setup(() => createVitest({ root: process.cwd(), run: true, watch: false, cache: false, fsModuleCache: false,
-    bail: 1, passWithNoTests: true, reporters: ["default", new Reporter()] }));
+    bail: 1, passWithNoTests: true, reporters: ["default", new Reporter()] }, { plugins: [{ name: "mutant-cafe-health", resolveId(id) { if (id === "virtual:mutant-cafe-health") return "\0mutant-cafe-health"; }, load(id) { if (id === "\0mutant-cafe-health") return "export default 1"; } }] }));
   if (typeof ctx.runTestSpecifications !== "function" || typeof ctx.invalidateFile !== "function"
     || typeof ctx.cancelCurrentRun !== "function" || typeof ctx.getRelevantTestSpecifications !== "function" || typeof ctx.initializeGlobalSetup !== "function") {
     throw new Error("installed Vitest does not expose the supported warm API");
   }
+  const refusal = warmRefusal(version, ctx, process.argv[3] === "select");
+  if (refusal) throw new Error(refusal);
   const isolated = config => config.isolate !== false &&
     !Object.values(config.poolOptions ?? {}).some(pool => pool?.isolate === false);
   const script = JSON.parse(readFileSync(resolve("package.json"), "utf8")).scripts?.test ?? "";
@@ -161,6 +180,10 @@ process.on("message", async request => {
     if (request.type === "invalidate") { invalidate(request.file); process.send({ type: "invalidated" }); return; }
     if (request.type === "ping") {
       if (!ctx.runningPromise) ctx.cancelPromise = undefined;
+      const module = ctx.vite.moduleGraph?.getModuleById("\0mutant-cafe-health");
+      if (module) ctx.vite.moduleGraph.invalidateModule(module);
+      const transformed = await ctx.vite.transformRequest("virtual:mutant-cafe-health");
+      if (!transformed?.code) throw new Error("health transform failed");
       process.send({ type: "healthy" });
       return;
     }
@@ -207,7 +230,7 @@ process.on("message", async request => {
     const failed = reporter.failed || (!ctx.config.dangerouslyIgnoreUnhandledErrors && result.unhandledErrors.length > 0);
     process.send({ type: "result", status: failed ? "failed" : empty ? "untested" : "passed",
       testFiles: reporter.files, testsCollected: reporter.collected, testDurations: reporter.durations, testTimeouts: reporter.timeouts, testWorkers: reporter.workers, testConcurrency: reporter.concurrency, testFileDurations: reporter.fileDurations, firstTestStart: reporter.firstTestStart, probeSupported: reporter.probeSupported, probeLoaded: reporter.loaded, testTimeoutDetails: reporter.timeoutDetails,
-      crashed: result.unhandledErrors.some(error => String(error?.message ?? "").startsWith("Worker exited unexpectedly ")) });
+      telemetryWarnings: reporter.telemetryWarnings, crashed: reporter.crashed || result.unhandledErrors.some(error => workerDied(error)) });
     process.exitCode = 0;
   } catch (error) { reporter?.restore(); process.send({ type: "crash", message: String(error) }); }
 });

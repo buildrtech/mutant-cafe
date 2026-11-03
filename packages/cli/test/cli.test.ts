@@ -2,6 +2,7 @@ import { it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { BaselineFailed, MutantSource, Reporter, Scratch, TestRunner, RunReport, type Mutant, type NotMutated } from "@mutant-cafe/core";
 import * as Effect from "effect/Effect";
+import * as Console from "effect/Console";
 import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 import * as FileSystem from "effect/FileSystem";
@@ -249,6 +250,23 @@ it.effect("writes mutants before execution, and outcome lists and logs during pr
   expect(yield* fs.readFileString(`${root}/mutants.out/logs/${item.id}.log`)).toBe("raw test output");
   yield* reporter.write(output);
   expect(reportExitCode(output)).toBe(2);
+}).pipe(Effect.scoped, Effect.provide(NodeServices.layer)));
+
+it.effect("persists outcomes before warning about invalid telemetry without changing the exit code", () => Effect.gen(function* () {
+  const fs = yield* FileSystem.FileSystem; const root = yield* project; const item = mutant();
+  const events: string[] = [];
+  const tracked: FileSystem.FileSystem = { ...fs, rename: (from, to) => fs.rename(from, to).pipe(Effect.tap(() => Effect.sync(() => { if (to.endsWith("outcomes.json")) events.push("persisted"); }))) };
+  const writer = yield* makeReporter({ root, outDir: "mutants.out", mutants: [item] }).pipe(Effect.provideService(FileSystem.FileSystem, tracked));
+  const base = report(root, [item]);
+  const bad: RunReport = { ...base, hostRestarts: NaN, baseline: { ...base.baseline, testWorkers: 0.5 }, results: base.results.map(result => ({ ...result, testWorkers: 0.5, testConcurrency: Infinity, durationMs: 0.5 })) };
+  const original = yield* Console.Console;
+  const warnings: string[] = [];
+  yield* writer.write(bad).pipe(Effect.provideService(Console.Console, { ...original, warn: (...args: ReadonlyArray<unknown>) => { events.push("warn"); warnings.push(args.join(" ")); } }));
+  const saved = yield* Schema.decodeEffect(Schema.fromJsonString(RunReport))(yield* fs.readFileString(`${root}/mutants.out/outcomes.json`));
+  expect(saved.results[0]?.outcome).toBe("missed"); expect(saved.results[0]?.testWorkers).toBeUndefined(); expect(saved.baseline.testWorkers).toBeUndefined();
+  expect(reportExitCode(saved)).toBe(reportExitCode(base)); expect(reportExitCode(saved)).toBe(2);
+  expect(events[0]).toBe("persisted"); expect(events).toContain("warn");
+  expect(warnings.join(" ")).toContain("testWorkers=0.5");
 }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)));
 
 it.effect("a real git diff of the fixture selects only mutants in the edited function", () => Effect.gen(function*() {
