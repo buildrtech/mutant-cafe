@@ -35,7 +35,8 @@ test("the built page serves the README heading and cargo-mutants credit", async 
   const escapeHtml = (text) => text.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;");
   assert.ok(html.includes(`<h1>${escapeHtml(heading)}</h1>`));
   assert.ok(html.includes(`<a href="${escapeHtml(credit)}">cargo-mutants</a>`));
-  assert.match(html, /<meta name="robots" content="noindex">/);
+  assert.doesNotMatch(html, /<meta name="robots"[^>]*noindex/, "the launched site must be indexable");
+  assert.ok(html.includes('<a href="https://ratstack.sh">rat-stack</a>'), "page must link rat-stack");
   assert.match(html, /<meta property="og:image" content="https:\/\/mutant\.cafe\/banner\.jpg">/);
   assert.match(html, /<meta name="twitter:image" content="https:\/\/mutant\.cafe\/banner\.jpg">/);
   const image = await readFile(new URL("../dist/client/banner.jpg", import.meta.url));

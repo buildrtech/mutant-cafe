@@ -15,7 +15,6 @@ const flags = { document: Markdown.decodeDocument(readme) };
 export const renderDocument: Server.DocumentRenderer = (application, assets) =>
   Server.renderDocument(application, assets, {
     head: [
-      '<meta name="robots" content="noindex">',
       '<link rel="icon" href="/favicon.ico" sizes="32x32">',
       '<link rel="icon" href="/favicon.svg" type="image/svg+xml">',
       '<link rel="apple-touch-icon" href="/apple-touch-icon.png">',
