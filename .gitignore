@@ -1,0 +1,9 @@
+node_modules
+.alchemy
+.env*
+.brain/
+.pi/
+.agent_sources/
+mutants.out/
+dist/
+*.log

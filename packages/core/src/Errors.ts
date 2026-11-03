@@ -1,0 +1,32 @@
+import * as Schema from "effect/Schema";
+
+export class ProgramLoadError extends Schema.TaggedError<ProgramLoadError>()("ProgramLoadError", {
+  tsconfig: Schema.String,
+  diagnostics: Schema.Array(Schema.String),
+}) {}
+
+export class BaselineFailed extends Schema.TaggedError<BaselineFailed>()("BaselineFailed", {
+  exitCode: Schema.Int,
+  output: Schema.String,
+}) {}
+
+export class ScratchError extends Schema.TaggedError<ScratchError>()("ScratchError", {
+  operation: Schema.String,
+  path: Schema.String,
+  message: Schema.String,
+}) {}
+
+export class TestSpawnError extends Schema.TaggedError<TestSpawnError>()("TestSpawnError", {
+  command: Schema.Array(Schema.String),
+  message: Schema.String,
+}) {}
+
+export class DiffParseError extends Schema.TaggedError<DiffParseError>()("DiffParseError", {
+  path: Schema.String,
+  message: Schema.String,
+}) {}
+
+export class ReportWriteError extends Schema.TaggedError<ReportWriteError>()("ReportWriteError", {
+  path: Schema.String,
+  message: Schema.String,
+}) {}

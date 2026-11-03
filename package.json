@@ -1,0 +1,20 @@
+{
+  "name": "mutant-cafe-workspace",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@11.3.0",
+  "engines": { "node": ">=24.18.0" },
+  "scripts": {
+    "typecheck": "pnpm -r --if-present run typecheck",
+    "test": "pnpm -r --if-present run test",
+    "guard": "node scripts/public-guard.mjs"
+  },
+  "devDependencies": {
+    "@effect/language-service": "0.87.5",
+    "@types/node": "24.13.3",
+    "@yielded/effect-tsrs": "0.2.0",
+    "typescript": "7.0.2",
+    "vitest": "5.1.0",
+    "@effect/vitest": "4.1.2"
+  }
+}
