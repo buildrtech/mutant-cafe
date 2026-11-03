@@ -34,10 +34,11 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm --filter mutant-cafe build
       - run: node scripts/pack-smoke.mjs
-      - name: Publish the tested tarball with OIDC
+      # Stage only: a maintainer approves the staged version with 2FA. OIDC cannot approve.
+      - name: Stage the tested tarball with OIDC
         run: |
           if npm view "mutant-cafe@${RELEASE_VERSION}" version >/dev/null 2>&1; then
-            echo "mutant-cafe@${RELEASE_VERSION} is already on npm; nothing to publish."
+            echo "mutant-cafe@${RELEASE_VERSION} is already published; nothing to stage."
             exit 0
           fi
-          npm publish "dist/mutant-cafe-${RELEASE_VERSION}.tgz" --provenance --access public
+          npm stage publish "./dist/mutant-cafe-${RELEASE_VERSION}.tgz" --provenance --access public

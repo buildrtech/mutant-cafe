@@ -88,7 +88,7 @@ export const runCli = Effect.fn("runCli")(function*(options: {
 }) {
   const code = yield* Ref.make(0);
   const command = makeCommand({ ...options, onExit: (value) => Ref.set(code, value) });
-  yield* Command.runWith(command, { version: "0.1.0" })(options.args).pipe(
+  yield* Command.runWith(command, { version: "0.1.1" })(options.args).pipe(
     Effect.catch((error) => Effect.gen(function*() {
       yield* Console.error(String(error));
       yield* Ref.set(code, errorExitCode(error));

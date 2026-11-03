@@ -1,6 +1,6 @@
 {
   "name": "mutant-cafe",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Type-directed mutation testing for Effect TypeScript",
   "license": "MIT",
   "type": "module",
