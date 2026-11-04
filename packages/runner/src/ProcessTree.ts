@@ -120,6 +120,10 @@ for (const name of ["spawn", "fork", "execFile", "exec"]) {
     const child = original.apply(this, args);
     traceProcess("spawn-return", { method: name, childPid: child.pid, node });
     child.once("spawn", () => traceProcess("spawn", { method: name, childPid: child.pid, node }));
+    // Exact birth inspection cannot block spawn: a minimal-env child can be
+    // orphaned before this async callback if its parent exits immediately.
+    // Without a birth row, surviving PPID edge or label, it stays warning-only
+    // (cwd/argv backstop). A PID plus approximate spawn time is not reuse proof.
     void record(child.pid);
     return child;
   };

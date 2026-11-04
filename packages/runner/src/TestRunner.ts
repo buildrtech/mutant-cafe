@@ -1,4 +1,4 @@
-import { cleanTelemetry, DEFAULT_BASELINE_TIMEOUT_MS, BaselineFailed, BaselineTimedOut, TestRunner, TestSpawnError, type ScratchDir, type TestRun, type SelectionIssue, type Mutant } from "@mutant-cafe/core";
+import { cleanTelemetry, DEFAULT_BASELINE_TIMEOUT_MS, BaselineFailed, BaselineTimedOut, formatTestCommand, TestRunner, TestSpawnError, type ScratchDir, type TestRun, type SelectionIssue, type Mutant } from "@mutant-cafe/core";
 import * as Clock from "effect/Clock";
 import * as Console from "effect/Console";
 import { preflight } from "./Preflight.ts";
@@ -32,7 +32,7 @@ export const TestRunnerLive = Layer.effect(TestRunner, Effect.gen(function* () {
   const auto = new Map<string, { readonly startupMs: number; readonly mutants: number }>();
   const primers = new Map<string, TestRun>();
   const backstopTotals = new Map<string, number>();
-  const baselineBudgets = new Map<string, number>();
+  let baselineBudgetMs = DEFAULT_BASELINE_TIMEOUT_MS;
   const lastCommands = new Map<string, ReadonlyArray<string>>();
   const onBackstop = (dir: string) => (ms: number) => { backstopTotals.set(dir, (backstopTotals.get(dir) ?? 0) + ms); };
   const scopes = new Map<string, Scope.Scope>();
@@ -45,7 +45,7 @@ export const TestRunnerLive = Layer.effect(TestRunner, Effect.gen(function* () {
   const warn = (message: string) => Effect.suspend(() => { if (warned) return Effect.void; warned = true; return Console.warn(message); });
   const sessionOptions = { onRestart: () => { hostRestarts++; }, onPoolReset: () => { poolResets++; } };
   const execute = Effect.fn("TestRunner.execute")(function* (dir: ScratchDir, args: ReadonlyArray<string>, timeoutMs?: number, testTimeoutMs?: number, forceCold = false, probe?: ProbeOptions) {
-    const overallMs = timeoutMs ?? baselineBudgets.get(dir.path) ?? DEFAULT_BASELINE_TIMEOUT_MS;
+    const overallMs = timeoutMs ?? baselineBudgetMs;
     const beforeBackstop = backstopTotals.get(dir.path) ?? 0;
     const backstopMs = () => Math.max(0, (backstopTotals.get(dir.path) ?? 0) - beforeBackstop);
     const session = sessions.get(dir.path);
@@ -78,7 +78,7 @@ export const TestRunnerLive = Layer.effect(TestRunner, Effect.gen(function* () {
     const chunks: Array<string> = [];
     let exitCode = 1;
     const child = Effect.scoped(Effect.gen(function* () {
-      if (timeoutMs === undefined) yield* Console.error(`Baseline command: ${command.join(" ")} (cwd: ${dir.path})`);
+      if (timeoutMs === undefined) yield* Console.error(`Baseline command: ${formatTestCommand(command)} (cwd: ${dir.path})`);
       lastCommands.set(dir.path, command);
       yield* owned.trace("cold-spawn-start", { budgetMs: overallMs });
       const handle = yield* spawner.spawn(ChildProcess.make(command[0]!, command.slice(1), {
@@ -156,8 +156,8 @@ export const TestRunnerLive = Layer.effect(TestRunner, Effect.gen(function* () {
       scopes.set(dir.path, yield* Scope.Scope);
       openedAt.set(dir.path, yield* Clock.currentTimeMillis);
       yield* Effect.addFinalizer(() => Effect.sync(() => {
-        sessions.delete(dir.path); selectors.delete(dir.path); auto.delete(dir.path); primers.delete(dir.path); scopes.delete(dir.path); backstopTotals.delete(dir.path); openedAt.delete(dir.path); baselineBudgets.delete(dir.path); lastCommands.delete(dir.path);
-        if (scopes.size === 0) { warmDisabled = false; automaticMode = "pending"; hostRestarts = 0; poolResets = 0; warned = false; modeReason = undefined; }
+        sessions.delete(dir.path); selectors.delete(dir.path); auto.delete(dir.path); primers.delete(dir.path); scopes.delete(dir.path); backstopTotals.delete(dir.path); openedAt.delete(dir.path); lastCommands.delete(dir.path);
+        if (scopes.size === 0) { baselineBudgetMs = DEFAULT_BASELINE_TIMEOUT_MS; warmDisabled = false; automaticMode = "pending"; hostRestarts = 0; poolResets = 0; warned = false; modeReason = undefined; }
       }));
       if (cold) modeReason = "Explicit --cold";
       if (cold || warmDisabled || (!warm && automaticMode === "cold")) return;
@@ -213,9 +213,9 @@ export const TestRunnerLive = Layer.effect(TestRunner, Effect.gen(function* () {
     }, effect => effect.pipe(Effect.scoped, Effect.mapError(error => error._tag === "ScratchError" || error._tag === "TestSpawnError" ? error :
       new TestSpawnError({ command: ["vitest", "probe"], message: String(error) })))),
     baseline: Effect.fn("TestRunner.baseline")(function* (dir: ScratchDir, tsconfig?: string, timeoutMs = DEFAULT_BASELINE_TIMEOUT_MS) {
-      baselineBudgets.set(dir.path, timeoutMs);
+      baselineBudgetMs = timeoutMs;
       lastCommands.delete(dir.path);
-      const unreliable: ReadonlyArray<SelectionIssue> = yield* preflight(dir.path, tsconfig, timeoutMs).pipe(Effect.provideService(FileSystem.FileSystem, fs), Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner), Effect.catch(error => Effect.succeed([{ kind: "warning" as const, reason: `Cannot verify runner selection: ${String(error)}` }])));
+      const unreliable: ReadonlyArray<SelectionIssue> = yield* preflight(dir.path, tsconfig, timeoutMs, { processesSince: openedAt.get(dir.path), onBackstop: onBackstop(dir.path) }).pipe(Effect.provideService(FileSystem.FileSystem, fs), Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner), Effect.catch(error => Effect.succeed([{ kind: "warning" as const, reason: `Cannot verify runner selection: ${String(error)}` }])));
       for (const issue of unreliable) yield* Console.warn(`Warning (${issue.kind}): ${issue.reason}`);
       if (unreliable.some(issue => issue.kind === "runner")) {
         const command = ["npx", "--no", "vitest", "run", "--passWithNoTests"];
@@ -254,10 +254,10 @@ export const TestRunnerLive = Layer.effect(TestRunner, Effect.gen(function* () {
       auto.clear();
       // Finish the cold process before warm global-setup services are started.
       const cold = yield* execute(dir, ["run", "--passWithNoTests"], undefined, undefined, true);
-      if (cold.status === "timedOut") return yield* baselineTimedOut(baselineBudgets.get(dir.path) ?? DEFAULT_BASELINE_TIMEOUT_MS, cold.command);
+      if (cold.status === "timedOut") return yield* baselineTimedOut(baselineBudgetMs, cold.command);
       if (cold.status !== "passed" && cold.status !== "untested") return yield* new BaselineFailed({ exitCode: cold.exitCode, output: cold.output, command: cold.command });
       const warm = yield* execute(dir, ["run", "--passWithNoTests"]);
-      if (warm.status === "timedOut") return yield* baselineTimedOut(baselineBudgets.get(dir.path) ?? DEFAULT_BASELINE_TIMEOUT_MS, warm.command);
+      if (warm.status === "timedOut") return yield* baselineTimedOut(baselineBudgetMs, warm.command);
       if (warm.status !== "passed" && warm.status !== "untested") return yield* new BaselineFailed({ exitCode: warm.exitCode, output: warm.output, command: warm.command });
       const calibration: Calibration = { coldMs: cold.durationMs, warmMs: warm.durationMs,
         warmStartupMs: startupCost(startups, copies),

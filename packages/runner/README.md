@@ -33,7 +33,7 @@ cancel from any active state → interrupted → partial report → done
 - A failing baseline stops before generating or testing mutants.
 - The scratch pool has `jobs` isolated directories, with at least one worker.
   Each worker restores the exact original file bytes before returning its lease.
-- Tests run through the package's Vitest using `npx --no vitest`. Baseline uses
+- Tests run through the package's Vitest using the current Node executable and a generated launcher that resolves the installed Vitest bin inside the child. Baseline uses
   `run`; mutants start with `related <file> --run --passWithNoTests`. If no test
   files are selected, run the full package suite within the remaining budget.
   If that also selects no files, report `untested`. A scoped reporter uses Vitest's

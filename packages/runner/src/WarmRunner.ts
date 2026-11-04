@@ -1,4 +1,4 @@
-import { cleanTelemetry, TestSpawnError, type ScratchDir, type TestRun } from "@mutant-cafe/core";
+import { cleanTelemetry, DEFAULT_BASELINE_TIMEOUT_MS, TestSpawnError, type ScratchDir, type TestRun } from "@mutant-cafe/core";
 import { createEffectActor, send, setupEffect } from "@xstate/effect";
 // @effect-diagnostics-next-line nodeBuiltinImport:off -- Node IPC (process.send) is not exposed by Effect's spawner.
 import { spawn, type ChildProcess } from "node:child_process";
@@ -241,30 +241,37 @@ export const openWarmRunner = Effect.fn("TestRunner.openWarm")(function* (dir: S
     if (options.selectionOnly) return yield* abortHost(new TestSpawnError({ command: ["vitest", "select"], kind: "reporter", message: "Selection-only host cannot execute tests" }));
     const command = ["vitest", ...(file ? ["related", file, "--run"] : ["run"]), "--reporter=default"];
     for (let crash = 0; crash < 2; crash++) {
-      yield* send(actor, { type: "RUN" });
       const active = host!;
       active.output = "";
       active.collected = false;
       active.failed = false;
       active.testFiles = [];
       const started = yield* Clock.currentTimeMillis;
-      const pending = active.request({ type: "run", file, testTimeout, probe });
-      active.runPending = pending;
-      const response = attempt(() => pending);
-      const result = yield* (timeoutMs === undefined ? response : response.pipe(Effect.timeout(timeoutMs))).pipe(Effect.result);
+      active.runPending = undefined;
+      const budgetMs = timeoutMs ?? DEFAULT_BASELINE_TIMEOUT_MS;
+      const operation = Effect.gen(function* () {
+        yield* active.tree.trace("warm-attempt-start", { budgetMs });
+        yield* send(actor, { type: "RUN" });
+        const pending = active.request({ type: "run", file, testTimeout, probe });
+        active.runPending = pending;
+        return yield* attempt(() => pending);
+      });
+      const result = yield* operation.pipe(Effect.interruptible, Effect.timeout(budgetMs), Effect.result);
+      const pending = active.runPending;
       if (result._tag === "Success" && result.success.type === "result" && !result.success.crashed) {
-        if (yield* finish(active, pending)) yield* send(actor, { type: "DONE" });
+        if (pending && (yield* finish(active, pending))) yield* send(actor, { type: "DONE" });
         else yield* retire;
         return { ...result.success, startupMs: result.success.firstTestStart > 0 ? Math.max(0, Math.ceil(result.success.firstTestStart - started)) : 0,
           ...(active.child.pid === undefined ? {} : { hostPid: active.child.pid }), command, output: active.output, durationMs: (yield* Clock.currentTimeMillis) - started };
       }
       if (result._tag === "Failure" && result.failure._tag === "TimeoutError") {
         yield* Effect.sync(() => options.onPoolReset?.());
+        yield* active.tree.trace("warm-deadline", { budgetMs });
         const failedAtDeadline = active.failed;
         yield* send(actor, { type: "CANCEL" });
         // cancelCurrentRun waits for the test: enforce a separate recovery grace.
         active.post({ type: "cancel" });
-        if (yield* finish(active, pending)) yield* send(actor, { type: "DONE" });
+        if (pending && (yield* finish(active, pending))) yield* send(actor, { type: "DONE" });
         else yield* retire;
         return { status: failedAtDeadline ? "failed" : "timedOut", command, output: active.output, durationMs: (yield* Clock.currentTimeMillis) - started,
           ...(active.child.pid === undefined ? {} : { hostPid: active.child.pid }), testsCollected: active.collected, testFiles: active.testFiles };
@@ -273,7 +280,7 @@ export const openWarmRunner = Effect.fn("TestRunner.openWarm")(function* (dir: S
       yield* Effect.sync(() => options.onPoolReset?.());
       if (crash === 0) {
         yield* Console.warn(`Warning: Vitest pool crashed; restarting once: ${result._tag === "Failure" ? String(result.failure) : "message" in result.success ? result.success.message : result.success.type}`);
-        if (yield* finish(active, pending)) yield* send(actor, { type: "DONE" });
+        if (pending && (yield* finish(active, pending))) yield* send(actor, { type: "DONE" });
         else yield* restart;
       }
       else {

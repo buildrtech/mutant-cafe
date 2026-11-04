@@ -1,4 +1,4 @@
-import { DEFAULT_BASELINE_TIMEOUT_MS, ConfigFile, MutantList, MutantSource, Reporter, RunConfig, type BaselineFailed, type BaselineTimedOut, type Mutant, type ProgramLoadError, ReportWriteError, type RunReport, type Scratch, type ScratchError, type TestRunner, type TestSpawnError } from "@mutant-cafe/core";
+import { DEFAULT_BASELINE_TIMEOUT_MS, formatTestCommand, ConfigFile, MutantList, MutantSource, Reporter, RunConfig, type BaselineFailed, type BaselineTimedOut, type Mutant, type ProgramLoadError, ReportWriteError, type RunReport, type Scratch, type ScratchError, type TestRunner, type TestSpawnError } from "@mutant-cafe/core";
 import * as Console from "effect/Console";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -156,7 +156,7 @@ export const makeCommand = (options: {
     Effect.catchTag("BaselineFailed", error => Effect.gen(function*() {
       const failed: RunReport = { schemaVersion: 2, tool: "mutant.cafe", root,
         baseline: { durationMs: 0, testCommand: error.command }, timeoutMs: config.timeoutMs ?? config.minimumTimeoutMs, results: [],
-        failure: `BaselineFailed: ${error.command.join(" ")}\n${error.output.slice(-8000)}` };
+        failure: `BaselineFailed: ${formatTestCommand(error.command)}\n${error.output.slice(-8000)}` };
       yield* reporter.write(failed);
       if (!input.advisory) return yield* error;
       if (markdown === undefined) yield* Console.log("Advisory: baseline failed; would exit 4 without --advisory.");
@@ -187,7 +187,7 @@ export const runCli = Effect.fn("runCli")(function*(options: {
     Effect.catch((error) => Effect.gen(function*() {
       yield* Console.error(error._tag === "ProgramLoadError" ? `${error.tsconfig}:\n${error.diagnostics.join("\n")}`
         : error._tag === "BaselineTimedOut" ? error.message
-        : error._tag === "BaselineFailed" ? `Baseline failed (${error.exitCode}): ${error.command.join(" ")}\n${error.output.slice(-8000)}`
+        : error._tag === "BaselineFailed" ? `Baseline failed (${error.exitCode}): ${formatTestCommand(error.command)}\n${error.output.slice(-8000)}`
         : String(error));
       yield* Ref.set(code, errorExitCode(error));
     })),

@@ -1,6 +1,6 @@
 import {
   sanitizeReportTelemetry, MutantSource, MutantResult, NotMutated, ReachabilityProbe, Reporter, Scratch, TestRunner,
-  Baseline, BaselineFailed, BaselineTimedOut, type Mutant,
+  Baseline, BaselineFailed, BaselineTimedOut, formatTestCommand, type Mutant,
   type ProgramLoadError, type ReportWriteError, type RunConfig, type RunReport,
   type ScratchDir, ScratchError, type TestSpawnError
 } from "@mutant-cafe/core";
@@ -50,7 +50,7 @@ export const runMutants = Effect.fn("Runner.runMutants")(function* (
   const report = (state: RunState): RunReport => sanitizeReportTelemetry({
     schemaVersion: 2, tool: "mutant.cafe", root: config.root,
     baseline: state.baseline, timeoutMs: state.timeoutMs, results: state.results, notMutated: state.notMutated, reachabilityProbes: state.probes, hostRestarts: state.hostRestarts, poolResets: state.poolResets,
-    ...(state.failure === undefined ? {} : { failure: state.failure._tag === "BaselineTimedOut" ? `BaselineTimedOut: ${state.failure.message}` : state.failure._tag === "BaselineFailed" ? `${state.failure._tag}: ${state.failure.command.join(" ")}\n${state.failure.output.slice(-8000)}` : String(state.failure) })
+    ...(state.failure === undefined ? {} : { failure: state.failure._tag === "BaselineTimedOut" ? `BaselineTimedOut: ${state.failure.message}` : state.failure._tag === "BaselineFailed" ? `${state.failure._tag}: ${formatTestCommand(state.failure.command)}\n${state.failure.output.slice(-8000)}` : String(state.failure) })
   }).report;
   const capture = <A, R>(effect: Effect.Effect<A, RunError, R>) => Effect.result(effect);
   const copying = createEffectLogic(({ input }: { input: number }) => capture(Effect.gen(function* () {

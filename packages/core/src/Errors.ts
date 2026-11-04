@@ -6,6 +6,11 @@ export class ProgramLoadError extends Schema.TaggedError<ProgramLoadError>()("Pr
   diagnostics: Schema.Array(Schema.String),
 }) {}
 
+/** Keep the actual argv in reports, but name the runner in human diagnostics. */
+export const formatTestCommand = (command: ReadonlyArray<string>): string => command[1]?.endsWith("/launch.mjs")
+  ? `vitest ${command.slice(2).filter(arg => arg === "--reporter=default" || !arg.startsWith("--reporter=")).join(" ")} (via ${command.join(" ")})`
+  : command.join(" ");
+
 export class BaselineFailed extends Schema.TaggedError<BaselineFailed>()("BaselineFailed", {
   exitCode: Schema.Int,
   command: Schema.Array(Schema.String),

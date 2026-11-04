@@ -156,7 +156,7 @@ it.live("prints TypeScript diagnostics and a failed baseline command, retaining 
   const failed = yield* invoke(["--cold"]);
   expect(failed.code, failed.logs).toBe(4);
   expect(failed.logs).toContain("Baseline command:");
-  expect(failed.logs).toContain(`Baseline failed (1): ${process.execPath}`);
+  expect(failed.logs).toContain("Baseline failed (1): vitest run");
   expect(failed.logs).toContain("broken original");
   const report = yield* Schema.decodeEffect(Schema.fromJsonString(RunReport))(yield* fs.readFileString(`${root}/mutants.out/outcomes.json`));
   expect(report.failure).toContain("launch.mjs run");
@@ -395,9 +395,9 @@ it.effect("forced modes reach the runner, default is auto, and conflicts are rej
 it.effect("flags win over config and timeout flags use seconds", () => Effect.gen(function*() {
   const fs = yield* FileSystem.FileSystem;
   const root = yield* project;
-  yield* fs.writeFileString(`${root}/mutants.config.json`, JSON.stringify({ jobs: 2, include: ["from-config.ts"], exclude: ["skip.ts"], timeoutMultiplier: 3, baselineTimeoutMs: 9000 }));
+  yield* fs.writeFileString(`${root}/mutants.config.json`, JSON.stringify({ jobs: 3, include: ["from-config.ts"], exclude: ["skip.ts"], timeoutMultiplier: 3, baselineTimeoutMs: 9000 }));
   const run: Run = (config, mutants) => Effect.sync(() => {
-    expect(config.jobs).toBe(4);
+    expect(config.jobs).toBe(2);
     expect(config.include).toEqual(["a.ts", "b.ts"]);
     expect(config.exclude).toEqual(["skip.ts"]);
     expect(config.timeoutMs).toBe(1500);
@@ -406,7 +406,7 @@ it.effect("flags win over config and timeout flags use seconds", () => Effect.ge
     expect(config.timeoutMultiplier).toBe(3);
     return report(config.root, mutants);
   });
-  expect(yield* invoke(root, ["--jobs", "4", "--file", "a.ts", "--file", "b.ts", "--timeout", "1.5", "--baseline-timeout", "2", "--minimum-test-timeout", "2.5"], [], run)).toBe(0);
+  expect(yield* invoke(root, ["--jobs", "2", "--file", "a.ts", "--file", "b.ts", "--timeout", "1.5", "--baseline-timeout", "2", "--minimum-test-timeout", "2.5"], [mutant({ file: "a.ts" })], run)).toBe(2);
   expect(yield* invoke(root, ["--jobs", "0"], [])).toBe(1);
   expect(yield* invoke(root, ["--baseline-timeout", "0"], [])).toBe(1);
   yield* fs.writeFileString(`${root}/mutants.config.json`, '{"jobs":"bad"}');
