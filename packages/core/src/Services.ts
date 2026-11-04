@@ -5,13 +5,13 @@ import type * as Stream from "effect/Stream";
 
 import type { RunConfig } from "./Config.ts";
 import type {
-  BaselineFailed,
+  BaselineFailed, BaselineTimedOut,
   ProgramLoadError,
   ReportWriteError,
   ScratchError,
   TestSpawnError,
 } from "./Errors.ts";
-import type { Baseline, Mutant, MutantResult, NotMutated, RunReport } from "./Mutant.ts";
+import type { Baseline, Mutant, MutantResult, NotMutated, ReachabilityProbe, RunReport } from "./Mutant.ts";
 
 export type Viability =
   | { readonly viable: boolean; readonly diagnostics: ReadonlyArray<string>; readonly analysisFailed?: never }
@@ -30,6 +30,7 @@ export interface ScratchDir {
   readonly path: string;
   readonly apply: (mutant: Mutant) => Effect.Effect<void, ScratchError>;
   readonly revert: (mutant: Mutant) => Effect.Effect<void, ScratchError>;
+  readonly poison?: (mutant: Mutant, signal: string, token: string) => Effect.Effect<void, ScratchError>;
 }
 
 export class Scratch extends Context.Service<
@@ -46,18 +47,37 @@ export interface TestRun {
   readonly durationMs: number;
   readonly command: ReadonlyArray<string>;
   readonly output: string;
+  readonly backstopMs?: number | undefined;
+  readonly telemetryWarnings?: ReadonlyArray<string> | undefined;
   readonly testsCollected?: boolean;
   readonly testFiles?: ReadonlyArray<string>;
+  readonly testDurations?: Readonly<Record<string, number>>;
+  readonly testTimeouts?: Readonly<Record<string, number>>;
+  readonly testWorkers?: number | undefined;
+  readonly testConcurrency?: number | undefined;
+  readonly testFileDurations?: Readonly<Record<string, number>>;
+  readonly startupMs?: number;
+  readonly hostPid?: number;
+  readonly testTimeoutDetails?: Readonly<Record<string, number>>;
+  readonly probeSupported?: boolean;
+  readonly probeLoaded?: boolean;
 }
 
 export class TestRunner extends Context.Service<
   TestRunner,
   {
-    readonly baseline: (dir: ScratchDir, tsconfig?: string) => Effect.Effect<Baseline, BaselineFailed | TestSpawnError>;
+    readonly open?: (dir: ScratchDir, cold: boolean, warm?: boolean, mutants?: number) => Effect.Effect<void, TestSpawnError, Scope.Scope>;
+    readonly invalidate?: (dir: ScratchDir, file: string) => Effect.Effect<void, TestSpawnError>;
+    readonly stats?: Effect.Effect<{ readonly hostRestarts: number; readonly poolResets: number }>;
+    readonly calibrate?: (dir: ScratchDir, testableMutants: number, copies: number) => Effect.Effect<Partial<Baseline>, BaselineFailed | BaselineTimedOut | TestSpawnError>;
+    readonly selectRelated?: (dir: ScratchDir, file: string) => Effect.Effect<ReadonlyArray<string> | undefined, TestSpawnError>;
+    readonly probeReachability?: (dir: ScratchDir, mutant: Mutant, timeoutMs: number) => Effect.Effect<ReachabilityProbe, ScratchError | TestSpawnError>;
+    readonly baseline: (dir: ScratchDir, tsconfig?: string, timeoutMs?: number) => Effect.Effect<Baseline, BaselineFailed | BaselineTimedOut | TestSpawnError>;
     readonly runRelated: (
       dir: ScratchDir,
       file: string,
-      timeoutMs: number
+      timeoutMs: number,
+      testTimeoutMs?: number
     ) => Effect.Effect<TestRun, TestSpawnError>;
   }
 >()("mutant.cafe/TestRunner") {}

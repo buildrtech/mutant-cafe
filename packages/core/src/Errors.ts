@@ -6,10 +6,21 @@ export class ProgramLoadError extends Schema.TaggedError<ProgramLoadError>()("Pr
   diagnostics: Schema.Array(Schema.String),
 }) {}
 
+/** Keep the actual argv in reports, but name the runner in human diagnostics. */
+export const formatTestCommand = (command: ReadonlyArray<string>): string => command[1]?.endsWith("/launch.mjs")
+  ? `vitest ${command.slice(2).filter(arg => arg === "--reporter=default" || !arg.startsWith("--reporter=")).join(" ")} (via ${command.join(" ")})`
+  : command.join(" ");
+
 export class BaselineFailed extends Schema.TaggedError<BaselineFailed>()("BaselineFailed", {
   exitCode: Schema.Int,
   command: Schema.Array(Schema.String),
   output: Schema.String,
+}) {}
+
+export class BaselineTimedOut extends Schema.TaggedError<BaselineTimedOut>()("BaselineTimedOut", {
+  timeoutMs: Schema.Int,
+  command: Schema.Array(Schema.String),
+  message: Schema.String,
 }) {}
 
 export class ScratchError extends Schema.TaggedError<ScratchError>()("ScratchError", {
@@ -19,6 +30,7 @@ export class ScratchError extends Schema.TaggedError<ScratchError>()("ScratchErr
 }) {}
 
 export class TestSpawnError extends Schema.TaggedError<TestSpawnError>()("TestSpawnError", {
+  kind: Schema.optional(Schema.Literal("reporter")),
   command: Schema.Array(Schema.String),
   message: Schema.String,
 }) {}

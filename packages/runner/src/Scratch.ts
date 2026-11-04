@@ -1,15 +1,29 @@
 import { Scratch, ScratchError, type Mutant, type ScratchDir } from "@mutant-cafe/core";
 import * as Effect from "effect/Effect";
+import * as Console from "effect/Console";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
 import type * as PlatformError from "effect/PlatformError";
+import { poisonInsertion } from "./Poison.ts";
 
 export const ScratchLive = Layer.effect(Scratch, Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const failure = (operation: string, location: string, error: { readonly message: string }) =>
     new ScratchError({ operation, path: location, message: error.message });
+
+  const skipVanished = (from: string, to: string) => <E extends PlatformError.PlatformError | ScratchError>(effect: Effect.Effect<void, E>) => effect.pipe(Effect.catch(error => {
+    if (error._tag !== "PlatformError" || error.reason._tag !== "NotFound") return Effect.fail(error);
+    return Effect.gen(function* () {
+      const entry = yield* fs.lstat(from).pipe(Effect.result);
+      if (entry._tag === "Success") return yield* Effect.fail(error); // Includes dangling symlinks: the source entry still exists.
+      if (entry.failure.reason._tag !== "NotFound") return yield* Effect.fail(entry.failure);
+      // Only our partial destination is removed, never a source entry.
+      yield* fs.remove(to, { recursive: true, force: true });
+      yield* Effect.logDebug("Scratch copy skipped a vanished source", { source: from });
+    });
+  }));
 
   return Scratch.of({
     acquire: Effect.fn("Scratch.acquire")(function* (root: string) {
@@ -30,7 +44,7 @@ export const ScratchLive = Layer.effect(Scratch, Effect.gen(function* () {
       const temp = yield* Effect.acquireRelease(
         fs.makeTempDirectory({ prefix: "mutant-cafe-" }).pipe(
           Effect.mapError((error) => failure("create", source, error))),
-        (dir) => fs.remove(dir, { recursive: true }).pipe(Effect.orDie)
+        (dir) => fs.remove(dir, { recursive: true, force: true }).pipe(Effect.interruptible, Effect.timeout(30_000), Effect.catch(error => Console.warn(`Warning: scratch removal did not complete within its cleanup budget: ${error.message}`, { path: dir })))
       );
       // Materialize source symlinks, except dependencies. No editable file in
       // the scratch tree may point back into the original checkout.
@@ -58,17 +72,19 @@ export const ScratchLive = Layer.effect(Scratch, Effect.gen(function* () {
                     if ([".vite", ".vite-temp", ".vitest", ".cache"].includes(name)) continue;
                     const dependency = path.join(from, name);
                     const destination = path.join(to, name);
-                    if (name.startsWith("@")) {
-                      yield* linkDependencies(dependency, destination);
-                      continue;
-                    }
-                    const realDependency = yield* fs.realPath(dependency);
-                    const rel = path.relative(copyRoot, realDependency);
-                    const inside = rel !== ".." && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel) && !rel.split(path.sep).includes("node_modules");
-                    yield* fs.symlink(inside ? path.join(temp, rel) : realDependency, destination);
+                    yield* Effect.gen(function* () {
+                      if (name.startsWith("@")) {
+                        yield* linkDependencies(dependency, destination);
+                        return;
+                      }
+                      const realDependency = yield* fs.realPath(dependency);
+                      const rel = path.relative(copyRoot, realDependency);
+                      const inside = rel !== ".." && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel) && !rel.split(path.sep).includes("node_modules");
+                      yield* fs.symlink(inside ? path.join(temp, rel) : realDependency, destination);
+                    }).pipe(skipVanished(dependency, destination));
                   }
                 });
-                yield* linkDependencies(src, dest);
+                yield* linkDependencies(src, dest).pipe(skipVanished(src, dest));
               } else {
                 yield* copy(src, dest, [...ancestors, real]);
               }
@@ -76,7 +92,7 @@ export const ScratchLive = Layer.effect(Scratch, Effect.gen(function* () {
           } else if (info.type === "File") {
             yield* fs.copyFile(from, to);
           }
-        }).pipe(Effect.mapError((error) => failure("copy", from, error)));
+        }).pipe(skipVanished(from, to), Effect.mapError((error) => failure("copy", from, error)));
       yield* copy(copyRoot, temp, []);
       const packageRoot = yield* fs.realPath(path.join(temp, path.relative(copyRoot, source))).pipe(
         Effect.mapError((error) => failure("resolve", source, error)));
@@ -109,6 +125,13 @@ export const ScratchLive = Layer.effect(Scratch, Effect.gen(function* () {
           }
           yield* fs.writeFileString(location, original.slice(0, startOffset) + text + original.slice(endOffset));
         }, (effect, mutant) => effect.pipe(Effect.mapError((error) => failure("apply", mutant.file, error)))),
+        poison: Effect.fn("Scratch.poison")(function* (mutant: Mutant, signal: string, token: string) {
+          const location = yield* target(mutant);
+          const bytes = yield* fs.readFile(location).pipe(Effect.mapError(error => failure("probe", location, error)));
+          const original = new TextDecoder("utf-8", { ignoreBOM: true }).decode(bytes);
+          const insertion = poisonInsertion(original, signal, token);
+          yield* dir.apply({ ...mutant, replacement: { startOffset: insertion.offset, endOffset: insertion.offset, text: insertion.text } });
+        }),
         revert: Effect.fn("Scratch.revert")(function* (mutant: Mutant) {
           const location = yield* target(mutant);
           const bytes = originals.get(location);

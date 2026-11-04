@@ -4,10 +4,17 @@ import { reportExitCode } from "./ExitCode.ts";
 
 export const outcomeNames = ["caught", "missed", "timeout", "unviable", "untested", "unreliable"] as const;
 
+const backstopCosts = (report: RunReport): string => {
+  const samples = report.results.flatMap(result => result.backstopMs !== undefined && Number.isFinite(result.backstopMs) ? [result.backstopMs] : []).sort((a, b) => a - b);
+  if (!samples.length) return "";
+  const percentile = (p: number) => samples[Math.max(0, Math.ceil(samples.length * p) - 1)]!.toFixed(1);
+  return `; backstop per mutant p50 ${percentile(0.5)} ms, p90 ${percentile(0.9)} ms (${samples.length} measured)`;
+};
+
 export const countsLine = (report: RunReport, notMutated: number): string =>
   `${report.selected ?? report.results.length} selected, ${report.run ?? report.results.length} run, ${report.budgetSkipped ?? 0} budget-skipped; ` +
   outcomeNames.map(outcome => `${report.results.filter(result => result.outcome === outcome).length} ${outcome}`).join(", ") +
-  `; ${notMutated} not mutated`;
+  `; ${notMutated} not mutated` + (report.hostRestarts === undefined ? "" : `; ${report.hostRestarts} host restarts, ${report.poolResets ?? 0} pool resets`) + backstopCosts(report);
 
 // HTML entities avoid starting code spans; backslashes protect table separators.
 const cell = (text: string): string => text.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;")

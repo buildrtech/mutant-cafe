@@ -1,5 +1,7 @@
 import * as Schema from "effect/Schema";
 
+export const DEFAULT_BASELINE_TIMEOUT_MS = 30 * 60 * 1000;
+
 export const RunConfig = Schema.Struct({
   root: Schema.String,
   tsconfig: Schema.String,
@@ -8,8 +10,11 @@ export const RunConfig = Schema.Struct({
   functionFilter: Schema.Array(Schema.String),
   inDiff: Schema.optional(Schema.String),
   exportedOnly: Schema.optional(Schema.Boolean),
+  cold: Schema.optional(Schema.Boolean),
+  warm: Schema.optional(Schema.Boolean),
   jobs: Schema.Int,
   timeoutMs: Schema.optional(Schema.Int),
+  baselineTimeoutMs: Schema.optional(Schema.Int),
   timeoutMultiplier: Schema.Finite,
   minimumTimeoutMs: Schema.Int,
   neverTimeoutMs: Schema.Int,
@@ -24,5 +29,6 @@ export const ConfigFile = Schema.Struct({
   jobs: Schema.optional(Schema.Int),
   timeoutMultiplier: Schema.optional(Schema.Finite),
   minimumTimeoutMs: Schema.optional(Schema.Int),
+  baselineTimeoutMs: Schema.optional(Schema.Int),
 });
 export type ConfigFile = typeof ConfigFile.Type;

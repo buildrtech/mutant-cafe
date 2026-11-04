@@ -1,8 +1,10 @@
-import { SelectionIssue, type Baseline } from "@mutant-cafe/core";
+import { DEFAULT_BASELINE_TIMEOUT_MS, SelectionIssue, type Baseline } from "@mutant-cafe/core";
 import * as Effect from "effect/Effect";
+import * as Clock from "effect/Clock";
 import * as Schema from "effect/Schema";
 import * as ChildProcess from "effect/process/ChildProcess";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
+import { acquireProcessTree } from "./ProcessTree.ts";
 
 const Issues = Schema.Array(SelectionIssue);
 
@@ -150,15 +152,20 @@ if (otherRunner) {
 console.log('mutant-cafe-preflight:' + JSON.stringify([...new Map(issues.map(issue => [JSON.stringify(issue), issue])).values()]));
 `;
 
-export const preflight = Effect.fn("TestRunner.preflight")(function* (root: string, tsconfig = "tsconfig.json") {
+interface PreflightOptions { readonly processesSince?: number | undefined; readonly onBackstop?: (ms: number) => void }
+export const preflight = Effect.fn("TestRunner.preflight")(function* (root: string, tsconfig = "tsconfig.json", timeoutMs = DEFAULT_BASELINE_TIMEOUT_MS, options: PreflightOptions = {}) {
   const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
-  const output = yield* spawner.string(ChildProcess.make("node", ["--input-type=module", "--eval", probe, tsconfig], { cwd: root, stdin: "ignore" }));
+  const since = options.processesSince ?? (yield* Clock.currentTimeMillis);
+  const owned = yield* acquireProcessTree(root, options.onBackstop, since);
+  yield* owned.trace("preflight-start", { budgetMs: timeoutMs });
+  const output = yield* spawner.string(ChildProcess.make(process.execPath, ["--input-type=module", "--eval", probe, tsconfig], { cwd: root, env: owned.env, detached: true, killSignal: "SIGKILL", forceKillAfter: "100 millis", stdin: "ignore" })).pipe(Effect.onInterrupt(() => owned.cleanup));
+  yield* owned.trace("preflight-done");
   const encoded = output.split("\n").find(line => line.startsWith("mutant-cafe-preflight:"))?.slice("mutant-cafe-preflight:".length);
   const issues = encoded === undefined
     ? [{ kind: "warning" as const, reason: "Vitest selection probe returned no evidence" }]
     : yield* Schema.decodeEffect(Schema.fromJsonString(Issues))(encoded);
   return issues;
-});
+}, (effect, _root, _tsconfig = "tsconfig.json", timeoutMs = DEFAULT_BASELINE_TIMEOUT_MS, _options: PreflightOptions = {}) => effect.pipe(Effect.timeout(timeoutMs), Effect.scoped));
 
 /** Only runner/omitted-target evidence is unconditional. Built imports require
  * both a source-closure match (when known) and the actual selected test set. */

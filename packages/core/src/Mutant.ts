@@ -58,6 +58,13 @@ export const MutantResult = Schema.Struct({
   testCommand: Schema.Array(Schema.String),
   diagnostics: Schema.Array(Schema.String),
   output: Schema.optional(Schema.String),
+  timeoutMs: Schema.optional(Schema.Int),
+  outerTimeoutMs: Schema.optional(Schema.Int),
+  backstopMs: Schema.optional(Schema.Finite),
+  hangBudgetBaseMs: Schema.optional(Schema.Finite),
+  telemetryWarnings: Schema.optional(Schema.Array(Schema.String)),
+  testWorkers: Schema.optional(Schema.Int),
+  testConcurrency: Schema.optional(Schema.Int),
 });
 export type MutantResult = typeof MutantResult.Type;
 
@@ -73,6 +80,20 @@ export const Baseline = Schema.Struct({
   durationMs: Schema.Int,
   testCommand: Schema.Array(Schema.String),
   unreliable: Schema.optional(Schema.Array(SelectionIssue)),
+  testDurations: Schema.optional(Schema.Record(Schema.String, Schema.Finite)),
+  testTimeouts: Schema.optional(Schema.Record(Schema.String, Schema.Finite)),
+  testWorkers: Schema.optional(Schema.Int),
+  testConcurrency: Schema.optional(Schema.Int),
+  testFileDurations: Schema.optional(Schema.Record(Schema.String, Schema.Finite)),
+  startupMs: Schema.optional(Schema.Int),
+  probeSupported: Schema.optional(Schema.Boolean),
+  testableMutants: Schema.optional(Schema.Int),
+  telemetryWarnings: Schema.optional(Schema.Array(Schema.String)),
+  hostPid: Schema.optional(Schema.Int),
+  testTimeoutDetails: Schema.optional(Schema.Record(Schema.String, Schema.Finite)),
+  runnerMode: Schema.optional(Schema.Literals(["cold", "warm"])),
+  runnerModeReason: Schema.optional(Schema.String),
+  calibration: Schema.optional(Schema.Struct({ coldMs: Schema.Int, warmMs: Schema.Int, warmStartupMs: Schema.Int, overheadMs: Schema.optional(Schema.Int), coldStartupMs: Schema.optional(Schema.Int), warmRunStartupMs: Schema.optional(Schema.Int), testFiles: Schema.Int, mutants: Schema.Int })),
 });
 export type Baseline = typeof Baseline.Type;
 
@@ -102,7 +123,19 @@ export const MutantList = Schema.Struct({
 });
 export type MutantList = typeof MutantList.Type;
 
+export const ReachabilityProbe = Schema.Struct({
+  file: Schema.String,
+  status: Schema.Literals(["unreachable", "reachable", "unsupported"]),
+  durationMs: Schema.Int,
+  testCommand: Schema.Array(Schema.String),
+  output: Schema.String,
+});
+export type ReachabilityProbe = typeof ReachabilityProbe.Type;
+
 export const RunReport = Schema.Struct({
+  hostRestarts: Schema.optional(Schema.Int),
+  poolResets: Schema.optional(Schema.Int),
+  reachabilityProbes: Schema.optional(Schema.Array(ReachabilityProbe)),
   selected: Schema.optional(Schema.Int),
   run: Schema.optional(Schema.Int),
   budgetSkipped: Schema.optional(Schema.Int),

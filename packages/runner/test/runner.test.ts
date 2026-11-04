@@ -4,6 +4,8 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Clock from "effect/Clock";
+import { prologueEnd } from "../src/Poison.ts";
 import * as Stream from "effect/Stream";
 import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
@@ -38,7 +40,7 @@ const withPorts = <A, E, R>(effect: Effect.Effect<A, E, R>, reports: Array<RunRe
 
 const selectionFixture = Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem;
-  const dir = yield* fs.makeTempDirectoryScoped({ directory: root, prefix: "selection-" });
+  const dir = yield* fs.makeTempDirectoryScoped({ prefix: "selection-" });
   yield* fs.symlink(`${root}/node_modules`, `${dir}/node_modules`);
   yield* fs.makeDirectory(`${dir}/src`);
   yield* fs.makeDirectory(`${dir}/test`);
@@ -48,6 +50,32 @@ const selectionFixture = Effect.gen(function* () {
 });
 
 describe("real vitest mutation runs", () => {
+  it("places poison after BOM, shebang and directive prologues but before code", () => {
+    const header = '\uFEFF#!/usr/bin/env node\n// licence\n"use strict";\n\'use client\'\n';
+    expect(prologueEnd(`${header}export const value = 1;`)).toBe(header.length);
+    expect(prologueEnd('"not a directive" + value;')).toBe(0);
+    expect(prologueEnd('"not a directive"\n(value);')).toBe(0);
+  });
+
+  for (const catchesImport of [false, true]) {
+    it.live(`keeps per-mutant fallback when a dynamic import ${catchesImport ? "catches poison" : "loads the target"}`, () => Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const dir = yield* selectionFixture;
+      const original = "export const value = () => 1;";
+      yield* fs.writeFileString(`${dir.path}/src/dynamic.ts`, original);
+      yield* fs.writeFileString(`${dir.path}/vitest.config.ts`, 'export default { test: { maxWorkers: 2, include: ["test/**/*.test.ts"], silent: true, onConsoleLog: () => false } };');
+      const load = catchesImport ? 'import(file).catch(() => ({ value: () => 1 }))' : 'import(file)';
+      yield* fs.writeFileString(`${dir.path}/test/dynamic.test.ts`, `import { it, expect } from "vitest"; const file = "../src/dynamic.ts"; it("reads the target", async () => { const module = await ${load}; expect(module.value()).toBe(1); });`);
+      const offset = original.lastIndexOf("1");
+      const items = [2, 1].map(value => ({ ...mutation(original, `dynamic-${value}`, ""), file: "src/dynamic.ts", replacement: { startOffset: offset, endOffset: offset + 1, text: String(value) } }));
+      const report = yield* withPorts(runMutants({ ...config(dir.path), cold: true }, Stream.fromIterable(items)), []);
+      expect(report.results.map(result => result.outcome)).toEqual(["caught", "untested"]);
+      expect(report.reachabilityProbes).toHaveLength(1);
+      expect(report.reachabilityProbes![0]!.status).toBe("reachable");
+      expect(report.results.every(result => result.testCommand.length > 0)).toBe(true);
+    }).pipe(Effect.scoped, Effect.provide(live)), 20_000);
+  }
+
   it.effect("records a real compiler viability hole without creating an unviable outcome", () => Effect.gen(function* () {
     const source = makeMutantSource(makeTypeScriptOracle());
     const input = { ...config(root), tsconfig: "../../packages/engine/test/fixtures/honesty/tsconfig.json", include: ["**/viability.ts"] };
@@ -234,11 +262,31 @@ describe("real vitest mutation runs", () => {
     const dir = yield* selectionFixture;
     const original = "export const double = (n: number): number => n * 2;";
     yield* fs.writeFileString(`${dir.path}/src/double.ts`, original);
-    yield* fs.writeFileString(`${dir.path}/test/unrelated.test.ts`, 'import { it, expect } from "vitest"; it("unrelated", () => expect(1).toBe(1));');
+    const counter = `${dir.path}/runs.txt`;
+    yield* fs.writeFileString(counter, "");
+    yield* fs.writeFileString(`${dir.path}/src/other.ts`, "export const other = () => 2;");
+    yield* fs.writeFileString(`${dir.path}/test/unrelated.test.ts`, `import { it, expect } from "vitest"; import { appendFileSync } from "node:fs"; import { setTimeout } from "node:timers/promises"; import { other } from "../src/other.ts"; it("unrelated", async () => { appendFileSync(${JSON.stringify(counter)}, "run\\n"); await setTimeout(500); expect(other()).toBe(2); });`);
     const startOffset = original.indexOf("n * 2");
     const items = ["0", "1", "-1"].map(text => ({ ...mutation(original, `double-${text}`, ""), file: "src/double.ts", replacement: { startOffset, endOffset: startOffset + 5, text } }));
-    const report = yield* withPorts(runMutants(config(dir.path), Stream.fromIterable(items)), []);
+    const runner = yield* TestRunner;
+    const { selectRelated: _select, probeReachability: _probe, ...withoutProbe } = runner;
+    const started = yield* Clock.currentTimeMillis;
+    const before = yield* withPorts(runMutants({ ...config(dir.path), warm: true }, Stream.fromIterable(items)), []).pipe(Effect.provideService(TestRunner, withoutProbe));
+    const middle = yield* Clock.currentTimeMillis;
+    const beforeRuns = (yield* fs.readFileString(counter)).trim().split("\n").length;
+    const report = yield* withPorts(runMutants({ ...config(dir.path), warm: true }, Stream.fromIterable(items)), []);
+    const ended = yield* Clock.currentTimeMillis;
+    const afterRuns = (yield* fs.readFileString(counter)).trim().split("\n").length - beforeRuns;
+    expect(before.results.map(r => r.outcome)).toEqual(["untested", "untested", "untested"]);
     expect(report.results.map(r => r.outcome)).toEqual(["untested", "untested", "untested"]);
+    expect(beforeRuns).toBe(4);
+    expect(afterRuns).toBe(2); // One baseline and one poison probe, not three fallbacks.
+    expect(report.reachabilityProbes).toHaveLength(1);
+    expect(report.reachabilityProbes![0]!.status).toBe("unreachable");
+    expect(report.results.every(result => result.testCommand.length === 0)).toBe(true);
+    const proof = process.env.MUTANT_CAFE_REACH_PROOF;
+    if (proof) yield* fs.writeFileString(proof, JSON.stringify({ beforeMs: middle - started, afterMs: ended - middle,
+      beforeRuns, afterRuns, probeCount: report.reachabilityProbes!.length, outcomes: report.results.map(result => result.outcome) }, null, 2));
   }).pipe(Effect.scoped, Effect.provide(live)), 20_000);
 
   it.live("repoints a workspace self-link so package-name imports catch the scratch mutation", () => Effect.gen(function* () {
@@ -246,7 +294,7 @@ describe("real vitest mutation runs", () => {
     const dir = yield* selectionFixture;
     yield* fs.remove(`${dir.path}/node_modules`);
     yield* fs.makeDirectory(`${dir.path}/node_modules`);
-    for (const name of ["vitest", "effect"]) yield* fs.symlink(yield* fs.realPath(`${root}/node_modules/${name}`), `${dir.path}/node_modules/${name}`);
+    for (const name of [".bin", "vitest", "effect"]) yield* fs.symlink(yield* fs.realPath(`${root}/node_modules/${name}`), `${dir.path}/node_modules/${name}`);
     yield* fs.symlink(dir.path, `${dir.path}/node_modules/self-fixture`);
     yield* fs.writeFileString(`${dir.path}/package.json`, JSON.stringify({ name: "self-fixture", type: "module", main: "./src/self.ts", scripts: { test: "vitest run" } }));
     const original = "export const value = () => true;";

@@ -1,7 +1,8 @@
 import { it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { BaselineFailed, MutantSource, Reporter, Scratch, TestRunner, RunReport, type Mutant, type NotMutated } from "@mutant-cafe/core";
+import { BaselineFailed, BaselineTimedOut, MutantSource, Reporter, Scratch, TestRunner, RunReport, type Mutant, type NotMutated } from "@mutant-cafe/core";
 import * as Effect from "effect/Effect";
+import * as Console from "effect/Console";
 import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 import * as FileSystem from "effect/FileSystem";
@@ -13,6 +14,7 @@ import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 import { runCli, type Run } from "../src/Command.ts";
 import { makeReporter, mutantLine } from "../src/Reporter.ts";
 import { reportExitCode } from "../src/ExitCode.ts";
+import { countsLine } from "../src/Summary.ts";
 import { makeMutantSource, makeTypeScriptOracle } from "@mutant-cafe/engine";
 import { selectInDiff } from "../src/Diff.ts";
 import { unifiedDiff } from "../src/UnifiedDiff.ts";
@@ -26,6 +28,15 @@ const mutant = (options: { file?: string; line?: number; id?: string } = {}): Mu
 const report = (root: string, mutants: ReadonlyArray<Mutant>): RunReport => ({
   schemaVersion: 2, tool: "mutant.cafe", root, baseline: { durationMs: 10, testCommand: ["vitest", "run"] }, timeoutMs: 20_000,
   results: mutants.map((mutant) => ({ mutant, outcome: "missed", durationMs: 5, testCommand: ["vitest", "related", mutant.file], diagnostics: [] })),
+});
+it("includes actual host restarts and pool resets in the summary", () => {
+  expect(countsLine({ ...report("/fixture", []), hostRestarts: 2, poolResets: 7 }, 0)).toContain("2 host restarts, 7 pool resets");
+});
+it("reports measured per-mutant backstop percentiles without inventing missing samples", () => {
+  const base = report("/fixture", [mutant(), mutant(), mutant(), mutant()]);
+  const measured = { ...base, results: base.results.map((result, index) => index === 3 ? result : { ...result, backstopMs: [1, 2, 9][index]! }) };
+  expect(countsLine(measured, 0)).toContain("backstop per mutant p50 2.0 ms, p90 9.0 ms (3 measured)");
+  expect(countsLine(base, 0)).not.toContain("backstop per mutant");
 });
 const missedRun: Run = (config, mutants) => Effect.gen(function*() {
   const reporter = yield* Reporter;
@@ -142,15 +153,18 @@ it.live("prints TypeScript diagnostics and a failed baseline command, retaining 
     const [logs, code] = yield* Effect.all([Stream.mkString(Stream.decodeText(handle.all)), handle.exitCode], { concurrency: "unbounded" });
     return { logs, code: Number(code) };
   });
-  const failed = yield* invoke([]);
+  const failed = yield* invoke(["--cold"]);
   expect(failed.code, failed.logs).toBe(4);
   expect(failed.logs).toContain("Baseline command:");
-  expect(failed.logs).toContain("Baseline failed (1): npx --no vitest run");
+  expect(failed.logs).toContain("Baseline failed (1): vitest run");
   expect(failed.logs).toContain("broken original");
   const report = yield* Schema.decodeEffect(Schema.fromJsonString(RunReport))(yield* fs.readFileString(`${root}/mutants.out/outcomes.json`));
-  expect(report.failure).toContain("vitest run");
+  expect(report.failure).toContain("launch.mjs run");
   expect(report.failure).toContain("broken original");
-  expect(report.baseline.testCommand.length).toBeGreaterThan(3);
+  const launcher = report.baseline.testCommand[1]!;
+  expect(launcher).toMatch(/\/mutant-vitest-[^/]+\/launch\.mjs$/);
+  expect(report.baseline.testCommand).toEqual([process.execPath, launcher, "run", "--passWithNoTests", "--reporter=default",
+    `--reporter=${path.join(path.dirname(launcher), "reporter.mjs")}`, "--bail", "1", "--no-cache", "--no-fsModuleCache"]);
   expect(failed.logs).toContain(report.baseline.testCommand.join(" "));
   yield* fs.writeFileString(`${root}/account.ts`, "export const broken = (;");
   const invalid = yield* invoke(["--list"]);
@@ -244,6 +258,23 @@ it.effect("writes mutants before execution, and outcome lists and logs during pr
   expect(yield* fs.readFileString(`${root}/mutants.out/logs/${item.id}.log`)).toBe("raw test output");
   yield* reporter.write(output);
   expect(reportExitCode(output)).toBe(2);
+}).pipe(Effect.scoped, Effect.provide(NodeServices.layer)));
+
+it.effect("persists outcomes before warning about invalid telemetry without changing the exit code", () => Effect.gen(function* () {
+  const fs = yield* FileSystem.FileSystem; const root = yield* project; const item = mutant();
+  const events: string[] = [];
+  const tracked: FileSystem.FileSystem = { ...fs, rename: (from, to) => fs.rename(from, to).pipe(Effect.tap(() => Effect.sync(() => { if (to.endsWith("outcomes.json")) events.push("persisted"); }))) };
+  const writer = yield* makeReporter({ root, outDir: "mutants.out", mutants: [item] }).pipe(Effect.provideService(FileSystem.FileSystem, tracked));
+  const base = report(root, [item]);
+  const bad: RunReport = { ...base, hostRestarts: NaN, baseline: { ...base.baseline, testWorkers: 0.5 }, results: base.results.map(result => ({ ...result, testWorkers: 0.5, testConcurrency: Infinity, durationMs: 0.5 })) };
+  const original = yield* Console.Console;
+  const warnings: string[] = [];
+  yield* writer.write(bad).pipe(Effect.provideService(Console.Console, { ...original, warn: (...args: ReadonlyArray<unknown>) => { events.push("warn"); warnings.push(args.join(" ")); } }));
+  const saved = yield* Schema.decodeEffect(Schema.fromJsonString(RunReport))(yield* fs.readFileString(`${root}/mutants.out/outcomes.json`));
+  expect(saved.results[0]?.outcome).toBe("missed"); expect(saved.results[0]?.testWorkers).toBeUndefined(); expect(saved.baseline.testWorkers).toBeUndefined();
+  expect(reportExitCode(saved)).toBe(reportExitCode(base)); expect(reportExitCode(saved)).toBe(2);
+  expect(events[0]).toBe("persisted"); expect(events).toContain("warn");
+  expect(warnings.join(" ")).toContain("testWorkers=0.5");
 }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)));
 
 it.effect("a real git diff of the fixture selects only mutants in the edited function", () => Effect.gen(function*() {
@@ -346,21 +377,44 @@ it.effect("malformed diffs exit 6 without running tests or creating reports", ()
   expect(yield* fs.exists(`${root}/mutants.out`)).toBe(false);
 }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)));
 
+it.effect("forced modes reach the runner, default is auto, and conflicts are rejected", () => Effect.gen(function* () {
+  const root = yield* project;
+  const modes: Array<{ cold: boolean; warm: boolean }> = [];
+  const run: Run = (config, mutants) => Effect.sync(() => {
+    expect(config.baselineTimeoutMs).toBe(1_800_000);
+    modes.push({ cold: config.cold ?? false, warm: config.warm ?? false });
+    return report(config.root, mutants);
+  });
+  yield* invoke(root, ["--cold"], [mutant()], run);
+  yield* invoke(root, ["--warm"], [mutant()], run);
+  yield* invoke(root, [], [mutant()], run);
+  expect(yield* invoke(root, ["--cold", "--warm"], [mutant()], run)).toBe(1);
+  expect(modes).toEqual([{ cold: true, warm: false }, { cold: false, warm: true }, { cold: false, warm: false }]);
+}).pipe(Effect.scoped, Effect.provide(NodeServices.layer)));
+
 it.effect("flags win over config and timeout flags use seconds", () => Effect.gen(function*() {
   const fs = yield* FileSystem.FileSystem;
   const root = yield* project;
-  yield* fs.writeFileString(`${root}/mutants.config.json`, JSON.stringify({ jobs: 2, include: ["from-config.ts"], exclude: ["skip.ts"], timeoutMultiplier: 3 }));
+  const source = yield* fs.readFileString(`${root}/account.ts`);
+  for (const file of ["a.ts", "b.ts"]) yield* fs.writeFileString(`${root}/${file}`, source);
+  yield* fs.writeFileString(`${root}/mutants.config.json`, JSON.stringify({ jobs: 3, include: ["from-config.ts"], exclude: ["skip.ts"], timeoutMultiplier: 3, baselineTimeoutMs: 9000 }));
+  const observed: Array<Parameters<Run>[0]> = [];
+  const errors: string[] = [];
+  const original = yield* Console.Console;
   const run: Run = (config, mutants) => Effect.sync(() => {
-    expect(config.jobs).toBe(4);
-    expect(config.include).toEqual(["a.ts", "b.ts"]);
-    expect(config.exclude).toEqual(["skip.ts"]);
-    expect(config.timeoutMs).toBe(1500);
-    expect(config.minimumTimeoutMs).toBe(2500);
-    expect(config.timeoutMultiplier).toBe(3);
+    observed.push(config);
     return report(config.root, mutants);
   });
-  expect(yield* invoke(root, ["--jobs", "4", "--file", "a.ts", "--file", "b.ts", "--timeout", "1.5", "--minimum-test-timeout", "2.5"], [], run)).toBe(0);
+  const code = yield* invoke(root, ["--jobs", "2", "--file", "a.ts", "--file", "b.ts", "--timeout", "1.5", "--baseline-timeout", "2", "--minimum-test-timeout", "2.5"], [mutant({ file: "a.ts" })], run).pipe(
+    Effect.provideService(Console.Console, { ...original, error: (...args: ReadonlyArray<unknown>) => { errors.push(args.join(" ")); } }));
+  expect({ code, errors }).toEqual({ code: 2, errors: [] });
+  // Assert outside runCli's defect handler so Vitest shows the actual config diff.
+  expect(observed.map(({ jobs, include, exclude, timeoutMs, baselineTimeoutMs, minimumTimeoutMs, timeoutMultiplier }) => ({
+    jobs, include, exclude, timeoutMs, baselineTimeoutMs, minimumTimeoutMs, timeoutMultiplier,
+  }))).toEqual([{ jobs: 2, include: ["a.ts", "b.ts"], exclude: ["skip.ts"], timeoutMs: 1500,
+    baselineTimeoutMs: 2000, minimumTimeoutMs: 2500, timeoutMultiplier: 3 }]);
   expect(yield* invoke(root, ["--jobs", "0"], [])).toBe(1);
+  expect(yield* invoke(root, ["--baseline-timeout", "0"], [])).toBe(1);
   yield* fs.writeFileString(`${root}/mutants.config.json`, '{"jobs":"bad"}');
   expect(yield* invoke(root, ["--list"], [])).toBe(1);
 }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)));
@@ -369,6 +423,9 @@ it.effect("maps baseline failure, timeouts, unviable mutants and internal defect
   const root = yield* project;
   const baselineFailure: Run = () => Effect.fail(new BaselineFailed({ exitCode: 1, output: "Failing original suite", command: ["vitest", "run"] }));
   expect(yield* invoke(root, [], [mutant()], baselineFailure)).toBe(4);
+  const baselineTimeout: Run = () => Effect.fail(new BaselineTimedOut({ timeoutMs: 2000, command: [], message: "Baseline exceeded 2 seconds. Increase --baseline-timeout." }));
+  expect(yield* invoke(root, [], [mutant()], baselineTimeout)).toBe(3);
+  expect(yield* invoke(root, ["--advisory"], [mutant()], baselineTimeout)).toBe(0);
   const timeoutRun: Run = (config, mutants) => Effect.succeed({ ...report(config.root, mutants), results: report(config.root, mutants).results.map((result) => ({ ...result, outcome: "timeout" })) });
   expect(yield* invoke(root, [], [mutant()], timeoutRun)).toBe(3);
   const unviableRun: Run = (config, mutants) => Effect.succeed({ ...report(config.root, mutants), results: report(config.root, mutants).results.map((result) => ({ ...result, outcome: "unviable" })) });
