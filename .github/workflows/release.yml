@@ -6,8 +6,7 @@ on:
       - 'v*'
 
 permissions:
-  contents: read
-  id-token: write
+  contents: write
 
 jobs:
   publish:
@@ -24,8 +23,6 @@ jobs:
         with:
           version: 11.3.0
           run_install: false
-      # npm trusted publishing requires CLI >=11.5.1.
-      - run: npm install --global npm@11.16.0
       - name: Check tag matches package version
         run: |
           VERSION=$(node -p "JSON.parse(require('node:fs').readFileSync('packages/mutant-cafe/package.json', 'utf8')).version")
@@ -34,10 +31,12 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm --filter mutant-cafe build
       - run: node scripts/pack-smoke.mjs
-      - name: Publish the tested tarball with OIDC
+      # This fork can't publish mutant-cafe to npm, so it attaches the tested
+      # tarball to a GitHub release, which Bedrock installs by URL.
+      - name: Attach the tested tarball to a GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          if npm view "mutant-cafe@${RELEASE_VERSION}" version >/dev/null 2>&1; then
-            echo "mutant-cafe@${RELEASE_VERSION} is already published; nothing to publish."
-            exit 0
-          fi
-          npm publish "./dist/mutant-cafe-${RELEASE_VERSION}.tgz" --provenance --access public
+          gh release create "$GITHUB_REF_NAME" "./dist/mutant-cafe-${RELEASE_VERSION}.tgz" \
+            --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --verify-tag \
+            --notes "Install with \`\"mutant-cafe\": \"https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME/mutant-cafe-${RELEASE_VERSION}.tgz\"\`."

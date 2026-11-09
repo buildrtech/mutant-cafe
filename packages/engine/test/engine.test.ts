@@ -4,7 +4,7 @@ import { mkdtemp, readFile, writeFile, rm } from "node:fs/promises";
 // @effect-diagnostics-next-line nodeBuiltinImport:off
 import { resolve, dirname } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import ts from "typescript";
+import ts from "typescript6";
 import { describe, expect } from "vitest";
 import { it } from "@effect/vitest";
 import * as Effect from "effect/Effect";

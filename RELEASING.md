@@ -1,6 +1,8 @@
-# Releasing mutant-cafe
+# Releasing buildrtech/mutant-cafe
 
-A version tag publishes. GitHub Actions builds the package, runs the release gate on the exact tarball, and publishes that tarball to npm with provenance over OIDC. There is no npm token and no manual approval step.
+This is Buildr's fork of [joelhooks/mutant-cafe](https://github.com/joelhooks/mutant-cafe). It carries a port of the type oracle (`packages/engine/src/TypeScriptOracle.ts`) to TypeScript 7's `typescript/unstable/sync` API, which upstream does not have. Versions are upstream's with a `-buildr.<n>` suffix, such as `0.1.6-buildr.1`.
+
+The fork can't publish `mutant-cafe` to npm. A version tag instead builds the package, runs the release gate on the exact tarball, and attaches that tarball to a GitHub release. Bedrock installs it by the release asset's URL, and its `bun.lock` pins the tarball's integrity.
 
 ## How a release flows
 
@@ -9,25 +11,16 @@ A version tag publishes. GitHub Actions builds the package, runs the release gat
 
    ```sh
    pnpm install --frozen-lockfile
+   pnpm test
    pnpm --filter mutant-cafe build
    node scripts/pack-smoke.mjs
    ```
 
-   The gate writes `dist/mutant-cafe-<version>.tgz`, prints its SHA256, installs that exact tarball in a temporary Effect/Vitest project, and requires exit 2 with the Frozen swallow in withdraw reported as missed. It never publishes.
-3. Once that commit is on `main`, push a matching tag, for example `v0.1.3`.
-4. **Actions → Release** checks that the tag matches the package version, installs the frozen lockfile, builds, runs the same tarball gate, and publishes that tarball with `npm publish --provenance --access public`. A failed gate publishes nothing. If the version is already on npm, the workflow skips publishing.
-5. Check the version, the `latest` dist-tag and provenance on npmjs.com before announcing it.
+   The gate writes `dist/mutant-cafe-<version>.tgz`, prints its SHA256, installs that exact tarball in a temporary Effect/Vitest project, and requires exit 2 with the Frozen swallow in withdraw reported as missed.
+3. Once that commit is on `main`, push a matching tag, for example `v0.1.6-buildr.1`.
+4. **Actions → Release** checks that the tag matches the package version, installs the frozen lockfile, builds, runs the same tarball gate, and creates a GitHub release with the tarball attached. A failed gate releases nothing. A release can't be recreated under the same tag; fix a bad one with a new version.
+5. Point Bedrock's root `package.json` at `https://github.com/buildrtech/mutant-cafe/releases/download/v<version>/mutant-cafe-<version>.tgz` and run `bun install`.
 
-## Trusted publisher setup
+## Taking upstream changes
 
-On npmjs.com, open the `mutant-cafe` package, choose **Settings → Trusted Publisher → GitHub Actions**, and set **Organization or user** `joelhooks`, **Repository** `mutant-cafe`, **Workflow filename** `release.yml` (filename only), **Environment name** blank (the workflow declares none), with permission to publish.
-
-The workflow uses npm 11.16.0 and Node 24 on a GitHub-hosted runner, requests `id-token: write` for OIDC and uses no npm token. Provenance requires the source repository to be public.
-
-If the trusted publisher is ever narrowed to **npm stage publish** only, change the publish step to `npm stage publish` (same tarball path and flags). A maintainer then approves each staged version with 2FA on npmjs.com (**Staged Packages**) or with `npm stage approve <stage-id>`. Pass the tarball as `./dist/…`: without `./`, npm reads `dist/x.tgz` as a GitHub shorthand.
-
-Sources: [trusted publishing](https://docs.npmjs.com/trusted-publishers/), [staged publishing](https://docs.npmjs.com/staged-publishing/).
-
-## When it fails
-
-If OIDC fails, check that the owner, repository and workflow filename match the npm settings exactly. Do not add an `NPM_TOKEN` workaround. Published npm versions cannot be overwritten; fix a bad release with a new version.
+Merge upstream's `main` into the fork's, then rerun the engine suite (`pnpm --filter @mutant-cafe/engine test`), which checks the TypeScript 7 oracle. `packages/engine/test/engine.test.ts` builds its fixtures with TypeScript 6 through the `typescript6` alias, because TypeScript 7 has no JavaScript compiler API.

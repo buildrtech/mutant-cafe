@@ -1,6 +1,6 @@
 {
   "name": "mutant-cafe",
-  "version": "0.1.6",
+  "version": "0.1.6-buildr.1",
   "description": "Type-directed mutation testing for Effect TypeScript",
   "license": "MIT",
   "type": "module",
@@ -17,7 +17,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/joelhooks/mutant-cafe.git"
+    "url": "git+https://github.com/buildrtech/mutant-cafe.git"
   },
   "homepage": "https://mutant.cafe",
   "scripts": {
@@ -27,7 +27,7 @@
   "dependencies": {
     "effect": "4.1.2",
     "@effect/platform-node": "4.1.2",
-    "typescript": "6.0.2",
+    "typescript": "7.0.2",
     "xstate": "6.0.0-alpha.73",
     "@xstate/effect": "1.0.0-alpha.12"
   },

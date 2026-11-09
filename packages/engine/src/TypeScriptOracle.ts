@@ -1,53 +1,210 @@
 // Compiler-host boundary: TS requires synchronous native paths; matchesGlob has no Effect Path equivalent.
 // @effect-diagnostics-next-line nodeBuiltinImport:off
 import { dirname, resolve, relative, matchesGlob } from "node:path";
-import ts from "typescript";
+// @effect-diagnostics-next-line nodeBuiltinImport:off
+import { readFileSync } from "node:fs";
+import * as ts from "typescript/unstable/ast";
+import { API, DiagnosticCategory, NodeBuilderFlags, ObjectFlags, SignatureKind, SymbolFlags, TypeFlags, type Checker, type Diagnostic, Signature, type InterfaceType, type NodeHandle, type ObjectType, type Project, type Snapshot, Symbol as TsSymbol, type Type, type TypeReference, type UnionOrIntersectionType, type LiteralType, type StringLiteralType, type NumberLiteralType } from "typescript/unstable/sync";
 import { ProgramLoadError, type Mutant, type NotMutated, type RunConfig, type Viability } from "@mutant-cafe/core";
 import type { MutableFunction, ReturnShape, TaggedValue, TypeOracle, Value } from "./TypeOracle.ts";
 
 type FunctionNode = ts.FunctionDeclaration | ts.ArrowFunction | ts.FunctionExpression | ts.MethodDeclaration;
 type Family = "Effect" | "Option" | "Stream" | "Layer";
 
-const diagnosticsText = (items: ReadonlyArray<ts.Diagnostic>): string[] => items.map((d) => {
-  const message = ts.flattenDiagnosticMessageText(d.messageText, "\n");
-  if (!d.file || d.start === undefined) return `TS${d.code}: ${message}`;
-  const position = d.file.getLineAndCharacterOfPosition(d.start);
-  return `${d.file.fileName}:${position.line + 1}:${position.character + 1} TS${d.code}: ${message}`;
-});
+// TypeScript 7 runs the compiler in a native process. Its API mirrors types,
+// symbols, and declarations as client objects, so identity is by id or position.
+const isUnion = (type: Type): type is UnionOrIntersectionType => (type.flags & TypeFlags.Union) !== 0;
+const isIntersection = (type: Type): type is UnionOrIntersectionType => (type.flags & TypeFlags.Intersection) !== 0;
+const isLiteral = (type: Type): type is LiteralType => (type.flags & (TypeFlags.StringLiteral | TypeFlags.NumberLiteral | TypeFlags.BigIntLiteral)) !== 0;
+const isStringLiteral = (type: Type): type is StringLiteralType => (type.flags & TypeFlags.StringLiteral) !== 0;
+const isNumberLiteral = (type: Type): type is NumberLiteralType => (type.flags & TypeFlags.NumberLiteral) !== 0;
+const sameType = (a: Type | undefined, b: Type | undefined): boolean => a !== undefined && b !== undefined && a.id === b.id;
+const sameSymbol = (a: TsSymbol | undefined, b: TsSymbol | undefined): boolean => a !== undefined && b !== undefined && a.id === b.id;
+const sameDeclaration = (a: NodeHandle | undefined, b: NodeHandle | undefined): boolean => a !== undefined && b !== undefined && a.path === b.path && a.index === b.index;
+
+function declares(handle: NodeHandle | undefined, node: ts.Node): boolean {
+  if (!handle || handle.kind !== node.kind || handle.path !== node.getSourceFile().path) return false;
+  const resolved = handle.resolve();
+  return resolved !== undefined && resolved.pos === node.pos && resolved.end === node.end;
+}
+
+function typeAt(checker: Checker, node: ts.Node): Type {
+  const type = checker.getTypeAtLocation(node);
+  if (!type) throw new Error(`compiler returned no type for ${ts.SyntaxKind[node.kind]}`);
+  return type;
+}
+
+function returnType(checker: Checker, signature: Signature): Type {
+  const type = checker.getReturnTypeOfSignature(signature);
+  if (!type) throw new Error("compiler returned no return type for a signature");
+  return type;
+}
+
+const typeOnly = (clause: ts.ImportClause | undefined): boolean => clause?.phaseModifier === ts.SyntaxKind.TypeKeyword;
+
+function findAncestor<T extends ts.Node>(node: ts.Node | undefined, test: ((node: ts.Node) => node is T) | ((node: ts.Node) => boolean)): T | undefined {
+  while (node) {
+    if (test(node)) return node as T;
+    node = node.kind === ts.SyntaxKind.SourceFile ? undefined : node.parent;
+  }
+  return undefined;
+}
+
+// TypeScript 7's API has no getSymbolsInScope. The names a mutation can spell
+// are the ones the file already uses, so resolve each identifier it contains.
+// Only names the file imports or declares can alias a type or reach a constructor;
+// global types always resolve by name, so they never need an alias.
+const declaredNames = new Set([ts.SyntaxKind.ImportSpecifier, ts.SyntaxKind.ImportClause, ts.SyntaxKind.NamespaceImport, ts.SyntaxKind.ImportEqualsDeclaration,
+  ts.SyntaxKind.ClassDeclaration, ts.SyntaxKind.InterfaceDeclaration, ts.SyntaxKind.TypeAliasDeclaration, ts.SyntaxKind.EnumDeclaration,
+  ts.SyntaxKind.FunctionDeclaration, ts.SyntaxKind.VariableDeclaration, ts.SyntaxKind.ModuleDeclaration, ts.SyntaxKind.BindingElement,
+  ts.SyntaxKind.Parameter, ts.SyntaxKind.TypeParameter]);
+
+const isScope = (node: ts.Node): boolean => isFunction(node) || ts.isClassDeclaration(node) || ts.isModuleBlock(node) || ts.isSourceFile(node);
+
+// Each name crosses a process boundary, so a name is resolved once, at the function,
+// class, or module that declares it; block-level shadowing does not matter here.
+const declaredByScope = new WeakMap<ts.SourceFile, Map<ts.Node, ReadonlyArray<string>>>();
+const scopes = new WeakMap<Checker, Map<string, TsSymbol[]>>();
+function symbolsInScope(checker: Checker, location: ts.Node, meaning: SymbolFlags): TsSymbol[] {
+  const source = location.getSourceFile();
+  let declared = declaredByScope.get(source);
+  if (!declared) {
+    const names = new Map<ts.Node, string[]>();
+    const visit = (node: ts.Node): void => {
+      if (ts.isIdentifier(node) && declaredNames.has(node.parent.kind) && (node.parent as { readonly name?: ts.Node }).name === node) {
+        // A parameter belongs to its function; a declaration's name to the scope around it.
+        const scope = findAncestor(node.parent.parent, isScope)!;
+        names.set(scope, [...names.get(scope) ?? [], node.text]);
+      }
+      node.forEachChild(visit);
+    };
+    visit(source);
+    declaredByScope.set(source, declared = names);
+  }
+  const container = findAncestor(location, isScope)!;
+  const key = `${source.path}:${container.pos}:${container.kind}:${meaning}`;
+  let cache = scopes.get(checker);
+  if (!cache) scopes.set(checker, cache = new Map());
+  const cached = cache.get(key);
+  if (cached) return cached;
+  const symbols = new Map<number, TsSymbol>();
+  const shadowed = new Set<string>();
+  for (let scope: ts.Node | undefined = container; scope; scope = scope.parent && findAncestor(scope.parent, isScope)) {
+    for (const name of declared.get(scope) ?? []) {
+      if (shadowed.has(name)) continue;
+      shadowed.add(name);
+      const symbol = checker.resolveName(name, meaning, scope, false);
+      if (symbol && symbol.name === name) symbols.set(symbol.id, symbol);
+    }
+  }
+  const result = [...symbols.values()];
+  cache.set(key, result);
+  return result;
+}
+
+// Every checker query crosses a process boundary, and discovery asks the same ones of
+// one snapshot many times, so answers are memoized per checker by their arguments.
+const cachedQueries = ["resolveName", "getPropertiesOfType", "getPropertyOfType", "typeToString", "getTypeAtLocation", "getTypeOfSymbolAtLocation",
+  "getSignaturesOfType", "isTupleType", "isArrayType", "isArrayLikeType", "getBaseTypes", "getTypeArguments", "getReturnTypeOfSignature", "getIndexInfosOfType"] as const;
+const objectKeys = new WeakMap<object, number>();
+let nextObjectKey = 0;
+const argumentKey = (value: unknown): string => {
+  if (typeof value !== "object" || value === null) return `${typeof value}:${String(value)}`;
+  if (value instanceof Signature) return `g${value.id}`;
+  if (value instanceof TsSymbol) return `s${value.id}`;
+  if ("objectFlags" in value && "id" in value) return `t${String(value.id)}`;
+  let key = objectKeys.get(value);
+  if (key === undefined) objectKeys.set(value, key = nextObjectKey++);
+  return `n${key}`;
+};
+const cachedCheckers = new WeakMap<Checker, Checker>();
+function cachedChecker(checker: Checker): Checker {
+  let cached = cachedCheckers.get(checker);
+  if (cached) return cached;
+  const overrides: Record<string, unknown> = {};
+  for (const name of cachedQueries) {
+    const answers = new Map<string, unknown>();
+    const query = (checker[name] as (...args: unknown[]) => unknown).bind(checker);
+    overrides[name] = (...args: unknown[]) => {
+      const key = args.map(argumentKey).join("|");
+      if (!answers.has(key)) answers.set(key, query(...args));
+      return answers.get(key);
+    };
+  }
+  cached = Object.assign(Object.create(checker) as Checker, overrides);
+  cachedCheckers.set(checker, cached);
+  return cached;
+}
+
+const memo = <T>(cache: WeakMap<Checker, Map<number, T>>, checker: Checker, id: number, compute: () => T): T => {
+  let entries = cache.get(checker);
+  if (!entries) cache.set(checker, entries = new Map());
+  if (!entries.has(id)) entries.set(id, compute());
+  return entries.get(id)!;
+};
+const aliasTargets = new WeakMap<Checker, Map<number, TsSymbol>>();
+const declaredTypes = new WeakMap<Checker, Map<number, number | undefined>>();
+const aliasTarget = (checker: Checker, symbol: TsSymbol): TsSymbol =>
+  symbol.flags & SymbolFlags.Alias ? memo(aliasTargets, checker, symbol.id, () => checker.getAliasedSymbol(symbol)) : symbol;
+const declaredTypeId = (checker: Checker, symbol: TsSymbol): number | undefined =>
+  memo(declaredTypes, checker, symbol.id, () => checker.getDeclaredTypeOfSymbol(symbol)?.id);
+
+function diagnosticsText(items: ReadonlyArray<Diagnostic>, project?: Project): string[] {
+  return items.map((d) => {
+    if (!d.fileName) return `TS${d.code}: ${d.text}`;
+    const position = lineAndCharacter(d.fileName, d.pos, project);
+    return position ? `${d.fileName}:${position.line + 1}:${position.character + 1} TS${d.code}: ${d.text}` : `${d.fileName} TS${d.code}: ${d.text}`;
+  });
+}
+
+// Config diagnostics point into the tsconfig, which is not a program source file.
+function lineAndCharacter(fileName: string, position: number, project?: Project): ts.LineAndCharacter | undefined {
+  const source = project?.program.getSourceFile(fileName);
+  if (source) return source.getLineAndCharacterOfPosition(position);
+  try {
+    const before = readFileSync(fileName, "utf8").slice(0, position).split(/\r?\n/);
+    return { line: before.length - 1, character: before.at(-1)!.length };
+  } catch {
+    return undefined;
+  }
+}
+
+const errors = (items: ReadonlyArray<Diagnostic>): Diagnostic[] => items.filter((d) => d.category === DiagnosticCategory.Error);
 
 class ProgramSession {
-  readonly host: ts.CompilerHost;
-  readonly originals = new Map<string, ts.SourceFile>();
-  program: ts.Program;
-  overlay: { file: string; text: string } | undefined;
-
+  readonly api: API;
   readonly configPath: string;
+  readonly snapshot: Snapshot;
+  readonly project: Project;
+  readonly overlay = new Map<string, string>();
+  /** The file a viability check left mutated in the compiler's latest snapshot. */
+  private dirty: string | undefined;
 
   constructor(configPath: string) {
     this.configPath = configPath;
-    const config = ts.readConfigFile(configPath, ts.sys.readFile);
-    if (config.error) throw new ProgramLoadError({ tsconfig: configPath, diagnostics: diagnosticsText([config.error]) });
-    const parsed = ts.parseJsonConfigFileContent(config.config, ts.sys, resolve(configPath, ".."));
-    if (parsed.errors.length) throw new ProgramLoadError({ tsconfig: configPath, diagnostics: diagnosticsText(parsed.errors) });
-    this.host = ts.createCompilerHost(parsed.options, true);
-    const read = this.host.getSourceFile;
-    this.host.getSourceFile = (file, languageVersion, onError, shouldCreateNewSourceFile) => {
-      const absolute = resolve(file);
-      if (this.overlay?.file === absolute) return ts.createSourceFile(file, this.overlay.text, languageVersion, true);
-      const cached = this.originals.get(absolute);
-      if (cached) return cached;
-      const source = read(file, languageVersion, onError, shouldCreateNewSourceFile);
-      if (source) this.originals.set(absolute, source);
-      return source;
+    this.api = new API({ cwd: dirname(configPath), fs: { readFile: (file) => this.overlay.get(resolve(file)) } });
+    // TypeScript 7 loads no project for a config it cannot read; report it the way tsc does.
+    const unreadable = (): ProgramLoadError => {
+      this.api.close();
+      return new ProgramLoadError({ tsconfig: configPath, diagnostics: [`TS5083: Cannot read file '${configPath}'.`] });
     };
-    this.program = ts.createProgram(parsed.fileNames, parsed.options, this.host);
-    const errors = [...this.program.getOptionsDiagnostics(), ...this.program.getSyntacticDiagnostics()];
-    if (errors.length) throw new ProgramLoadError({ tsconfig: configPath, diagnostics: diagnosticsText(errors) });
+    try {
+      this.snapshot = this.api.updateSnapshot({ openProjects: [configPath] });
+    } catch {
+      throw unreadable();
+    }
+    const project = this.snapshot.getProject(configPath);
+    if (!project) throw unreadable();
+    this.project = project;
+    const config = errors(project.program.getConfigFileParsingDiagnostics());
+    if (config.length) throw new ProgramLoadError({ tsconfig: configPath, diagnostics: diagnosticsText(config, project) });
+    const failures = errors([...project.program.getProgramDiagnostics(), ...project.program.getSyntacticDiagnostics()]);
+    if (failures.length) throw new ProgramLoadError({ tsconfig: configPath, diagnostics: diagnosticsText(failures, project) });
   }
 
   check(mutant: Mutant): Viability {
     const file = resolve(mutant.file);
-    const source = this.originals.get(file);
+    const source = this.project.program.getSourceFile(file);
     if (!source) return { viable: false, diagnostics: [], analysisFailed: { file: mutant.file, functionName: mutant.functionName, span: mutant.span, reason: "analysis failed: source file was not loaded" } };
     const { startOffset, endOffset, text } = mutant.replacement;
     if (startOffset < 0 || endOffset < startOffset || endOffset > source.text.length) {
@@ -55,24 +212,35 @@ class ProgramSession {
     }
     const analysisFailed = (reason: string): Viability => ({ viable: false, diagnostics: [],
       analysisFailed: { file: mutant.file, functionName: mutant.functionName, span: mutant.span, reason } });
-    this.overlay = { file, text: source.text.slice(0, startOffset) + text + source.text.slice(endOffset) };
+    this.overlay.set(file, source.text.slice(0, startOffset) + text + source.text.slice(endOffset));
+    // A file the previous check mutated reads from disk again.
+    const changed = this.dirty && this.dirty !== file ? [file, this.dirty] : [file];
     try {
-      const mutated = ts.createProgram({ rootNames: this.program.getRootFileNames(), options: this.program.getCompilerOptions(), host: this.host, oldProgram: this.program });
-      const changed = mutated.getSourceFile(file);
-      if (!changed) throw new Error(`Mutated source not found: ${file}`);
-      const issue = typedCallIssue(changed, mutated.getTypeChecker(), true);
-      if (issue) return analysisFailed(issue);
-      const diagnostics = [...mutated.getSyntacticDiagnostics(changed), ...mutated.getSemanticDiagnostics(changed)];
-      return { viable: diagnostics.length === 0, diagnostics: diagnosticsText(diagnostics) };
+      const snapshot = this.api.updateSnapshot({ fileChanges: { changed } });
+      this.dirty = file;
+      try {
+        // The API client can hand back a cached AST of the original file for a
+        // snapshot that changed it, so read the mutated file from the server.
+        this.api.clearSourceFileCache();
+        const mutated = snapshot.getProject(this.configPath);
+        const changedSource = mutated?.program.getSourceFile(file);
+        if (!mutated || !changedSource) throw new Error(`Mutated source not found: ${file}`);
+        const issue = typedCallIssue(changedSource, mutated.checker, true);
+        if (issue) return analysisFailed(issue);
+        const diagnostics = errors([...mutated.program.getSyntacticDiagnostics(file), ...mutated.program.getSemanticDiagnostics(file)]);
+        return { viable: diagnostics.length === 0, diagnostics: diagnosticsText(diagnostics, mutated) };
+      } finally {
+        snapshot.dispose();
+      }
     } catch (error) {
       return analysisFailed(`analysis failed: ${error instanceof Error ? error.message : String(error)}`);
     } finally {
-      this.overlay = undefined;
+      this.overlay.delete(file);
     }
   }
 }
 
-/** TS 6 is intentionally a runtime analysis dependency, not the workspace compiler. */
+/** TypeScript 7 runs as a native analysis process beside the workspace compiler. */
 export function makeTypeScriptOracle(): TypeOracle {
   const sessions = new Map<string, ProgramSession>();
   const owners = new Map<string, ProgramSession>();
@@ -86,14 +254,17 @@ export function makeTypeScriptOracle(): TypeOracle {
         session = new ProgramSession(configPath);
         sessions.set(configPath, session);
       }
-      const checker = session.program.getTypeChecker();
+      const checker = cachedChecker(session.project.checker);
       const matched = new Set<string>();
-      for (const source of session.program.getSourceFiles()) {
-        const file = resolve(source.fileName);
+      for (const fileName of session.project.program.getSourceFileNames()) {
+        const file = resolve(fileName);
         const local = relative(config.root, file).replaceAll("\\", "/");
         // Test support lives beside the project, so judge it relative to the tsconfig.
         const project = relative(dirname(configPath), file).replaceAll("\\", "/");
-        if (source.isDeclarationFile || local.startsWith("../") || /(?:^|\/)(?:node_modules|__tests__|__mocks__|tests?)\//.test(project) || /\.(?:test|spec)\.[cm]?[jt]sx?$/.test(local)) continue;
+        // Judge the name before fetching the file, since each source crosses a process boundary.
+        if (/\.d\.[cm]?ts$/.test(local) || local.startsWith("../") || /(?:^|\/)(?:node_modules|__tests__|__mocks__|tests?)\//.test(project) || /\.(?:test|spec)\.[cm]?[jt]sx?$/.test(local)) continue;
+        const source = session.project.program.getSourceFile(fileName);
+        if (!source || source.isDeclarationFile) continue;
         for (const glob of config.include) if (matchesGlob(local, glob)) matched.add(glob);
         if (config.include.length && !config.include.some((glob) => matchesGlob(local, glob))) continue;
         if (config.exclude.some((glob) => matchesGlob(local, glob))) continue;
@@ -103,7 +274,7 @@ export function makeTypeScriptOracle(): TypeOracle {
         const visit = (node: ts.Node): void => {
           try {
             if (isFunction(node) && node.body && !mutable(node, checker)) {
-              if (!ts.findAncestor(node.parent, parent => excluded.has(parent))) notMutated.push({ file, functionName: `${functionName(node, checker)}.<callback>`, span: nodeSpan(node), reason: "callback position (not mutated yet)" });
+              if (!findAncestor(node.parent, parent => excluded.has(parent))) notMutated.push({ file, functionName: `${functionName(node, checker)}.<callback>`, span: nodeSpan(node), reason: "callback position (not mutated yet)" });
             }
             if (isFunction(node) && node.body && mutable(node, checker)) {
               const name = functionName(node, checker);
@@ -116,7 +287,7 @@ export function makeTypeScriptOracle(): TypeOracle {
                 const signature = checker.getSignatureFromDeclaration(node);
                 if (signature) {
                   const wrapped = wrappedEffect(node, checker);
-                  const type = wrapped ?? checker.getReturnTypeOfSignature(signature);
+                  const type = wrapped ?? returnType(checker, signature);
                   const generator = wrapped && ts.isFunctionExpression(node) ? node : generatorBody(node, checker);
                   const body = generator?.body ?? node.body;
                   const start = body.getStart(source);
@@ -126,7 +297,7 @@ export function makeTypeScriptOracle(): TypeOracle {
                   const beforePipeables = wrapped && ts.isFunctionExpression(node) ? generatorContract(node, checker) : undefined;
                   const shape = beforePipeables?.shape ?? shapeOf(type, checker, node, body);
                   const originals = equivalentSuccessValues(body, api);
-                  if ((!beforePipeables && (type.flags & ts.TypeFlags.TypeParameter) && !("values" in shape && shape.values.length)) || (beforePipeables ? !nameableContract(beforePipeables, checker, node) : hasUnnameableType(type, checker, node))) {
+                  if ((!beforePipeables && (type.flags & TypeFlags.TypeParameter) && !("values" in shape && shape.values.length)) || (beforePipeables ? !nameableContract(beforePipeables, checker, node) : hasUnnameableType(type, checker, node))) {
                     notMutated.push({ file, functionName: name, span: nodeSpan(node), reason: "generic: naked or context-only type-parameter return" });
                   } else found.push({
                     file, name, functionLike: true, functionSpan: nodeSpan(body), generationIssue: () => typedCallIssue(body, checker), notices: shapeNotices(shape, type, checker, node), returnType: beforePipeables?.text ?? returnTypeText(type, checker, node),
@@ -146,7 +317,7 @@ export function makeTypeScriptOracle(): TypeOracle {
             }
             // A Layer value is a buildable program even when it is not a function.
             if ((ts.isVariableDeclaration(node) || ts.isPropertyDeclaration(node) || ts.isPropertyAssignment(node)) && node.initializer) {
-              const type = checker.getTypeAtLocation(node.initializer);
+              const type = typeAt(checker, node.initializer);
               if (family(type, checker)?.kind === "Layer") {
                 const name = valuePath(node);
                 const reason = skippedNode(node) ? "excluded by @mutants-skip"
@@ -173,7 +344,7 @@ export function makeTypeScriptOracle(): TypeOracle {
             if (target) notMutated.push({ file, functionName: valuePath(node), span: nodeSpan(target),
               reason: `analysis failed: ${error instanceof Error ? error.message : String(error)}` });
           }
-          ts.forEachChild(node, visit);
+          node.forEachChild(visit);
         };
         const found: MutableFunction[] = [];
         visit(source);
@@ -200,7 +371,7 @@ export function makeTypeScriptOracle(): TypeOracle {
   };
 }
 
-function typedCallIssue(body: ts.Node, checker: ts.TypeChecker, includeNested = false): string | undefined {
+function typedCallIssue(body: ts.Node, checker: Checker, includeNested = false): string | undefined {
   let issue: string | undefined;
   const visit = (node: ts.Node): void => {
     if (isFunction(node) && !includeNested) return; // Nested implementations have their own discovery boundary.
@@ -208,12 +379,12 @@ function typedCallIssue(body: ts.Node, checker: ts.TypeChecker, includeNested = 
       const signature = checker.getResolvedSignature(node);
       // Unresolved imports and any-typed receivers may produce a synthetic signature with no declaration.
       // A missing declaration is data, not an exception manufactured to exercise a catch.
-      if (!signature || (!signature.declaration && checker.getTypeAtLocation(node.expression).flags & ts.TypeFlags.Any)) {
+      if (!signature || (!signature.declaration && typeAt(checker, node.expression).flags & TypeFlags.Any)) {
         issue = `analysis failed: compiler supplied no declaration for typed call ${node.expression.getText()}; check its import or receiver type`;
         return;
       }
     }
-    ts.forEachChild(node, visit);
+    node.forEachChild(visit);
   };
   visit(body);
   return issue;
@@ -231,13 +402,13 @@ function isFunction(node: ts.Node): node is FunctionNode {
 }
 
 
-function functionValue(node: FunctionNode, checker: ts.TypeChecker): ts.Node {
+function functionValue(node: FunctionNode, checker: Checker): ts.Node {
   const wrapper = wrappedEffect(node, checker);
   // A generator passed to Effect.gen is an implementation, not a curried value.
-  return wrapper && checker.getTypeAtLocation(node.parent).getCallSignatures().length ? node.parent : node;
+  return wrapper && checker.getSignaturesOfType(typeAt(checker, node.parent), SignatureKind.Call).length ? node.parent : node;
 }
 
-function returnedBy(node: FunctionNode, checker: ts.TypeChecker): FunctionNode | undefined {
+function returnedBy(node: FunctionNode, checker: Checker): FunctionNode | undefined {
   let value = functionValue(node, checker);
   while (ts.isParenthesizedExpression(value.parent)) value = value.parent;
   const parent = value.parent;
@@ -246,30 +417,30 @@ function returnedBy(node: FunctionNode, checker: ts.TypeChecker): FunctionNode |
   return undefined;
 }
 
-function mutable(node: FunctionNode, checker: ts.TypeChecker): boolean {
+function mutable(node: FunctionNode, checker: Checker): boolean {
   if (ts.isMethodDeclaration(node) || ts.isFunctionDeclaration(node)) return true;
   let current: ts.Node = wrappedEffect(node, checker) ? node.parent : node;
   while (ts.isParenthesizedExpression(current.parent)) current = current.parent;
   return returnedBy(node, checker) !== undefined || ((ts.isVariableDeclaration(current.parent) || ts.isPropertyAssignment(current.parent) || ts.isPropertyDeclaration(current.parent)) && current.parent.initializer === current);
 }
 
-function layerBody(boundary: FunctionNode, checker: ts.TypeChecker): boolean {
+function layerBody(boundary: FunctionNode, checker: Checker): boolean {
   let enclosing: ts.Node = boundary.parent;
   while (!ts.isSourceFile(enclosing) && !isFunction(enclosing)) {
-    if (ts.isCallExpression(enclosing) && family(checker.getTypeAtLocation(enclosing), checker)?.kind === "Layer") return true;
+    if (ts.isCallExpression(enclosing) && family(typeAt(checker, enclosing), checker)?.kind === "Layer") return true;
     enclosing = enclosing.parent;
   }
   return false;
 }
 
-function returnsLayer(node: FunctionNode, checker: ts.TypeChecker): boolean {
+function returnsLayer(node: FunctionNode, checker: Checker): boolean {
   const signature = checker.getSignatureFromDeclaration(node);
   if (!signature) return false;
-  const type = checker.getReturnTypeOfSignature(signature);
-  return (type.isUnion() ? type.types : [type]).every(member => family(member, checker)?.kind === "Layer");
+  const type = returnType(checker, signature);
+  return (isUnion(type) ? type.getTypes() : [type]).every(member => family(member, checker)?.kind === "Layer");
 }
 
-function serviceProperty(node: ts.Node, boundary: FunctionNode, checker: ts.TypeChecker): boolean {
+function serviceProperty(node: ts.Node, boundary: FunctionNode, checker: Checker): boolean {
   if (!(ts.isPropertyAssignment(node) || ts.isShorthandPropertyAssignment(node)) || !ts.isObjectLiteralExpression(node.parent)) return false;
   const object = node.parent;
   const call = object.parent;
@@ -278,9 +449,9 @@ function serviceProperty(node: ts.Node, boundary: FunctionNode, checker: ts.Type
     && ts.isReturnStatement(call.parent) && call.parent.parent === boundary.body && layerBody(boundary, checker);
 }
 
-function serviceMethod(node: FunctionNode, boundary: FunctionNode, checker: ts.TypeChecker): boolean {
+function serviceMethod(node: FunctionNode, boundary: FunctionNode, checker: Checker): boolean {
   if (!layerBody(boundary, checker) || !boundary.body) return false;
-  const declaration = ts.findAncestor(node, ts.isVariableDeclaration);
+  const declaration = findAncestor(node, ts.isVariableDeclaration);
   let returned = false;
   const visit = (child: ts.Node): void => {
     if (isFunction(child)) return;
@@ -290,39 +461,39 @@ function serviceMethod(node: FunctionNode, boundary: FunctionNode, checker: ts.T
       if (ts.isPropertyAccessExpression(call.expression) && call.expression.name.text === "of" && object && ts.isObjectLiteralExpression(object)) {
         returned ||= object.properties.some(prop => {
           if (ts.isPropertyAssignment(prop) && (prop.initializer === functionValue(node, checker)
-            || (declaration && ts.isIdentifier(prop.initializer) && checker.getSymbolAtLocation(prop.initializer)?.valueDeclaration === declaration))) return true;
-          if (ts.isShorthandPropertyAssignment(prop)) return checker.getShorthandAssignmentValueSymbol(prop)?.valueDeclaration === declaration;
+            || (declaration && ts.isIdentifier(prop.initializer) && declares(checker.getSymbolAtLocation(prop.initializer)?.valueDeclaration, declaration)))) return true;
+          if (ts.isShorthandPropertyAssignment(prop)) return declaration !== undefined && declares(checker.getShorthandAssignmentValueSymbol(prop)?.valueDeclaration, declaration);
           return false;
         });
       }
     }
-    ts.forEachChild(child, visit);
+    child.forEachChild(visit);
   };
   visit(boundary.body);
   return returned;
 }
 
-function exportedBinding(binding: ts.VariableDeclaration | ts.FunctionDeclaration | ts.ClassDeclaration, checker: ts.TypeChecker): boolean {
+function exportedBinding(binding: ts.VariableDeclaration | ts.FunctionDeclaration | ts.ClassDeclaration, checker: Checker): boolean {
   let declaration: ts.Declaration = binding;
   let symbol = binding.name ? checker.getSymbolAtLocation(binding.name) : undefined;
-  let container = ts.findAncestor(binding, node => ts.isSourceFile(node) || ts.isModuleBlock(node));
+  let container = findAncestor(binding, node => ts.isSourceFile(node) || ts.isModuleBlock(node));
   while (container) {
     const module = ts.isSourceFile(container) ? checker.getSymbolAtLocation(container)
       : ts.isModuleBlock(container) && ts.isModuleDeclaration(container.parent) ? checker.getSymbolAtLocation(container.parent.name) : undefined;
     if (!module || !checker.getExportsOfModule(module).some(item => {
-      const target = item.flags & ts.SymbolFlags.Alias ? checker.getAliasedSymbol(item) : item;
-      return target === symbol || target.valueDeclaration === declaration;
+      const target = item.flags & SymbolFlags.Alias ? checker.getAliasedSymbol(item) : item;
+      return sameSymbol(target, symbol) || declares(target.valueDeclaration, declaration);
     })) return false;
     if (ts.isSourceFile(container)) return true;
     if (!ts.isModuleBlock(container) || !ts.isModuleDeclaration(container.parent)) return false;
     declaration = container.parent;
     symbol = module;
-    container = ts.findAncestor(container.parent, node => ts.isSourceFile(node) || ts.isModuleBlock(node));
+    container = findAncestor(container.parent, node => ts.isSourceFile(node) || ts.isModuleBlock(node));
   }
   return false;
 }
 
-function publicOwner(node: ts.Node, checker: ts.TypeChecker, seen = new Set<ts.Node>()): boolean {
+function publicOwner(node: ts.Node, checker: Checker, seen = new Set<ts.Node>()): boolean {
   if (seen.has(node)) return false;
   seen.add(node);
   let current = node;
@@ -350,10 +521,10 @@ function publicOwner(node: ts.Node, checker: ts.TypeChecker, seen = new Set<ts.N
     const referenced = ts.isShorthandPropertyAssignment(child) ? checker.getShorthandAssignmentValueSymbol(child)
       : ts.isPropertyAssignment(child) && ts.isIdentifier(child.initializer) ? checker.getSymbolAtLocation(child.initializer)
       : ts.isExportAssignment(child) && ts.isIdentifier(child.expression) ? checker.getSymbolAtLocation(child.expression) : undefined;
-    if (referenced?.valueDeclaration === declaration) {
+    if (declares(referenced?.valueDeclaration, declaration)) {
       exposed = ts.isExportAssignment(child) || publicOwner(child, checker, seen);
     }
-    ts.forEachChild(child, visit);
+    child.forEachChild(visit);
   };
   visit(current);
   return exposed;
@@ -379,52 +550,99 @@ function valuePath(node: ts.Node): string {
   return parts.join(".") || "default";
 }
 
-function functionName(node: FunctionNode, checker: ts.TypeChecker): string {
+function functionName(node: FunctionNode, checker: Checker): string {
   let path = valuePath(node);
   let parent = returnedBy(node, checker);
   while (parent) { path += ".<inner>"; parent = returnedBy(parent, checker); }
   return path;
 }
 
-function wrappedEffect(node: FunctionNode, checker: ts.TypeChecker): ts.Type | undefined {
+function wrappedEffect(node: FunctionNode, checker: Checker): Type | undefined {
   if (!ts.isFunctionExpression(node) || !node.asteriskToken || !ts.isCallExpression(node.parent)) return undefined;
-  const result = checker.getTypeAtLocation(node.parent);
+  const result = typeAt(checker, node.parent);
   if (family(result, checker)?.kind === "Effect") return result;
-  const signature = result.getCallSignatures()[0];
+  const signature = checker.getSignaturesOfType(result, SignatureKind.Call)[0];
   if (!signature) return undefined;
-  const returned = checker.getReturnTypeOfSignature(signature);
+  const returned = returnType(checker, signature);
   return family(returned, checker)?.kind === "Effect" ? returned : undefined;
 }
 
-function nameableContract(contract: { readonly types: ReadonlyArray<ts.Type> }, checker: ts.TypeChecker, node: ts.Node): boolean {
+function nameableContract(contract: { readonly types: ReadonlyArray<Type> }, checker: Checker, node: ts.Node): boolean {
   return contract.types.every(type => !hasUnnameableType(type, checker, node));
 }
 
-function hasUnnameableType(type: ts.Type, checker: ts.TypeChecker, location: ts.Node): boolean {
+function hasUnnameableType(type: Type, checker: Checker, location: ts.Node): boolean {
   // An explicit return annotation already supplies an in-scope spelling (including type-only aliases).
   if (isFunction(location) && location.type && !location.asteriskToken) return false;
-  const printed = ts.createSourceFile("contract.ts", `type Contract = ${returnTypeText(type, checker, location)};`, ts.ScriptTarget.Latest, true);
-  let missing = false;
-  const visit = (node: ts.Node): void => {
-    if (ts.isTypeReferenceNode(node) && ts.isIdentifier(node.typeName) && !checker.resolveName(node.typeName.text, location, ts.SymbolFlags.Type, false)) missing = true;
-    ts.forEachChild(node, visit);
-  };
-  visit(printed);
-  return missing;
+  return typeReferenceNames(returnTypeText(type, checker, location)).some((name) => !checker.resolveName(name, SymbolFlags.Type, location, false));
 }
 
-function generatorContract(node: ts.FunctionExpression, checker: ts.TypeChecker): { shape: ReturnShape; text: string; types: ReadonlyArray<ts.Type> } | undefined {
+interface Token { readonly kind: ts.SyntaxKind; readonly text: string; readonly value: string }
+
+/** TypeScript 7 ships a scanner but no parser, so printed types and synthesized values are read from tokens. */
+function tokensOf(text: string): Token[] {
+  const scanner = ts.createScanner(true, ts.LanguageVariant.Standard, text);
+  const tokens: Token[] = [];
+  // Brace depth at each open template span, so `}` resumes the template text.
+  const templates: number[] = [];
+  let depth = 0;
+  for (let kind = scanner.scan(); kind !== ts.SyntaxKind.EndOfFile; kind = scanner.scan()) {
+    if (kind === ts.SyntaxKind.CloseBraceToken && templates.at(-1) === depth) {
+      kind = scanner.reScanTemplateToken(false);
+      if (kind === ts.SyntaxKind.TemplateTail) templates.pop();
+    } else if (kind === ts.SyntaxKind.OpenBraceToken) depth++;
+    else if (kind === ts.SyntaxKind.CloseBraceToken) depth--;
+    if (kind === ts.SyntaxKind.TemplateHead) templates.push(depth);
+    tokens.push({ kind, text: scanner.getTokenText(), value: scanner.getTokenValue() });
+  }
+  return tokens;
+}
+
+const memberStarts = new Set([ts.SyntaxKind.OpenBraceToken, ts.SyntaxKind.CommaToken, ts.SyntaxKind.SemicolonToken, ts.SyntaxKind.OpenParenToken,
+  ts.SyntaxKind.OpenBracketToken, ts.SyntaxKind.ReadonlyKeyword, ts.SyntaxKind.DotDotDotToken]);
+
+/** The unqualified names a printed type refers to, which a parse would show as identifier type references. */
+function typeReferenceNames(text: string): string[] {
+  const tokens = tokensOf(text);
+  // A top-level type predicate is not a type; a parse reads its parameter as the reference.
+  if (tokens[0] && tokens[1]?.kind === ts.SyntaxKind.IsKeyword && /^[A-Za-z_$][\w$]*$/.test(tokens[0].text)) return [tokens[0].text];
+  if (tokens[0]?.kind === ts.SyntaxKind.AssertsKeyword) return ["asserts"];
+  const brackets: ts.SyntaxKind[] = [];
+  return tokens.flatMap((token, index) => {
+    if (token.kind === ts.SyntaxKind.OpenBraceToken || token.kind === ts.SyntaxKind.OpenBracketToken || token.kind === ts.SyntaxKind.OpenParenToken) brackets.push(token.kind);
+    else if (token.kind === ts.SyntaxKind.CloseBraceToken || token.kind === ts.SyntaxKind.CloseBracketToken || token.kind === ts.SyntaxKind.CloseParenToken) brackets.pop();
+    if (token.kind !== ts.SyntaxKind.Identifier) return [];
+    const previous = tokens[index - 1]?.kind;
+    const next = tokens[index + 1]?.kind;
+    // Destructured parameters: object type members always carry a colon, so a bare name in braces is a binding.
+    if (brackets.at(-1) === ts.SyntaxKind.OpenBraceToken && (previous === ts.SyntaxKind.OpenBraceToken || previous === ts.SyntaxKind.CommaToken)
+      && (next === ts.SyntaxKind.CommaToken || next === ts.SyntaxKind.CloseBraceToken)) return [];
+    // Qualified names, import("…").Name, and typeof queries are not plain references.
+    if (previous === ts.SyntaxKind.DotToken || next === ts.SyntaxKind.DotToken || previous === ts.SyntaxKind.TypeOfKeyword) return [];
+    // Type predicates, mapped type keys, and infer declarations name values or new parameters.
+    if (next === ts.SyntaxKind.IsKeyword || previous === ts.SyntaxKind.AssertsKeyword || next === ts.SyntaxKind.InKeyword || previous === ts.SyntaxKind.InferKeyword) return [];
+    // Property, parameter, index, and tuple member names precede a colon.
+    const labelled = next === ts.SyntaxKind.ColonToken || (next === ts.SyntaxKind.QuestionToken && tokens[index + 2]?.kind === ts.SyntaxKind.ColonToken);
+    if (labelled && (previous === undefined || memberStarts.has(previous))) return [];
+    // Method signatures in object types.
+    if (next === ts.SyntaxKind.OpenParenToken && (previous === ts.SyntaxKind.OpenBraceToken || previous === ts.SyntaxKind.SemicolonToken || previous === ts.SyntaxKind.CommaToken
+      || previous === ts.SyntaxKind.GetKeyword || previous === ts.SyntaxKind.SetKeyword)) return [];
+    return [token.text];
+  });
+}
+
+function generatorContract(node: ts.FunctionExpression, checker: Checker): { shape: ReturnShape; text: string; types: ReadonlyArray<Type> } | undefined {
   const signature = checker.getSignatureFromDeclaration(node);
   if (!signature || !node.body) return undefined;
-  const iterator = checker.getReturnTypeOfSignature(signature);
-  const args = checker.getTypeArguments(iterator as ts.TypeReference);
+  const iterator = returnType(checker, signature);
+  const args = checker.getTypeArguments(iterator as TypeReference);
   const [yielded, success] = args;
   if (!yielded || !success) return undefined;
-  const effects = (yielded.isUnion() ? yielded.types : [yielded]).flatMap(t => {
+  const effects = (isUnion(yielded) ? yielded.getTypes() : [yielded]).flatMap(t => {
     const f = family(t, checker);
     return f?.kind === "Effect" ? [f] : [];
   });
-  const print = (t: ts.Type) => returnTypeText(t, checker, node);
+  const print = (t: Type) => returnTypeText(t, checker, node);
   const union = (index: number) => [...new Set(effects.flatMap(f => f.args[index] ? [print(f.args[index]!)] : []))].join(" | ") || "never";
   return {
     types: [success, ...effects.flatMap(effect => effect.args.slice(1))],
@@ -434,23 +652,25 @@ function generatorContract(node: ts.FunctionExpression, checker: ts.TypeChecker)
   };
 }
 
-function literalOfBody(body: ts.ConciseBody, checker: ts.TypeChecker): string | undefined {
+function literalOfBody(body: ts.ConciseBody, checker: Checker): string | undefined {
   const first = ts.isBlock(body) && body.statements.length === 1 ? body.statements[0] : undefined;
   const expression = ts.isBlock(body) ? first && ts.isReturnStatement(first) ? first.expression : undefined : body;
-  if (!expression) return undefined;
-  const type = checker.getTypeAtLocation(expression);
-  return type.isStringLiteral() ? JSON.stringify(type.value) : type.isNumberLiteral() ? String(type.value)
-    : type.flags & ts.TypeFlags.BooleanLiteral ? checker.typeToString(type) : undefined;
+  // An array or object literal never has a literal type, and typing an arrow's `[]`
+  // body panics the TypeScript 7.0 API server.
+  if (!expression || ts.isArrayLiteralExpression(expression) || ts.isObjectLiteralExpression(expression)) return undefined;
+  const type = typeAt(checker, expression);
+  return isStringLiteral(type) ? JSON.stringify(type.value) : isNumberLiteral(type) ? String(type.value)
+    : type.flags & TypeFlags.BooleanLiteral ? checker.typeToString(type) : undefined;
 }
 
-function generatorBody(node: FunctionNode, checker: ts.TypeChecker): ts.FunctionExpression | undefined {
+function generatorBody(node: FunctionNode, checker: Checker): ts.FunctionExpression | undefined {
   if (!node.body) return undefined;
   const expression = ts.isBlock(node.body)
     ? node.body.statements.length === 1 && ts.isReturnStatement(node.body.statements[0]!) ? node.body.statements[0]!.expression : undefined
     : node.body;
   // The return type identifies Effect; only select a direct generator callback of the wrapper.
   const signature = checker.getSignatureFromDeclaration(node);
-  if (!signature || family(checker.getReturnTypeOfSignature(signature), checker)?.kind !== "Effect") return undefined;
+  if (!signature || family(returnType(checker, signature), checker)?.kind !== "Effect") return undefined;
   if (expression && ts.isCallExpression(expression)) {
     return expression.arguments.find((arg): arg is ts.FunctionExpression => ts.isFunctionExpression(arg) && arg.asteriskToken !== undefined);
   }
@@ -461,7 +681,7 @@ function imports(source: ts.SourceFile): MutableFunction["api"] {
   const namespaces = new Map<string, string>();
   const named = new Map<string, string>();
   for (const statement of source.statements) {
-    if (!ts.isImportDeclaration(statement) || !ts.isStringLiteral(statement.moduleSpecifier) || statement.importClause?.isTypeOnly) continue;
+    if (!ts.isImportDeclaration(statement) || !ts.isStringLiteral(statement.moduleSpecifier) || typeOnly(statement.importClause)) continue;
     const path = statement.moduleSpecifier.text;
     const bindings = statement.importClause?.namedBindings;
     if (!bindings) continue;
@@ -504,36 +724,37 @@ function mutationImports(source: ts.SourceFile): NonNullable<MutableFunction["ex
   });
 }
 
-function family(type: ts.Type, checker: ts.TypeChecker): { kind: Family; args: ReadonlyArray<ts.Type> } | undefined {
-  const symbol = type.aliasSymbol ?? type.getSymbol();
-  const name = symbol?.getName();
+function family(type: Type, checker: Checker): { kind: Family; args: ReadonlyArray<Type> } | undefined {
+  const symbol = type.getAliasSymbol() ?? type.getSymbol();
+  const name = symbol?.name;
   // Declaration provenance prevents a user-defined Effect-shaped name from being mistaken for Effect.
-  const fromEffect = symbol?.declarations?.some((d) => /(?:^|\/)effect\/(?:.*\/)?(?:Effect|Option|Stream|Layer)\.(?:d\.)?ts$/.test(d.getSourceFile().fileName));
+  const fromEffect = symbol?.declarations?.some((d) => /(?:^|\/)effect\/(?:.*\/)?(?:Effect|Option|Stream|Layer)\.(?:d\.)?ts$/.test(d.path));
   if (fromEffect && (name === "Effect" || name === "Option" || name === "Stream" || name === "Layer")) {
-    const args = type.aliasTypeArguments ?? ((type.flags & ts.TypeFlags.Object) && (type as ts.ObjectType).objectFlags & ts.ObjectFlags.Reference ? checker.getTypeArguments(type as ts.TypeReference) : []);
+    const aliasArguments = type.getAliasTypeArguments();
+    const args = aliasArguments.length ? aliasArguments : ((type.flags & TypeFlags.Object) && (type as ObjectType).objectFlags & ObjectFlags.Reference ? checker.getTypeArguments(type as TypeReference) : []);
     return { kind: name, args };
   }
   // Type aliases may hide a referenced interface; union aliases retain their own type arguments.
   const direct = type.getSymbol();
   if (direct && direct !== symbol) {
-    const name = direct.getName();
-    if ((name === "Effect" || name === "Stream" || name === "Layer") && direct.declarations?.some((d) => d.getSourceFile().fileName.includes("/effect/"))) {
-      return { kind: name, args: checker.getTypeArguments(type as ts.TypeReference) };
+    const name = direct.name;
+    if ((name === "Effect" || name === "Stream" || name === "Layer") && direct.declarations?.some((d) => d.path.includes("/effect/"))) {
+      return { kind: name, args: checker.getTypeArguments(type as TypeReference) };
     }
   }
-  if (type.isUnion()) {
-    const members = type.types;
+  if (isUnion(type)) {
+    const members = type.getTypes();
     const option = members.every((member) => {
       const symbol = member.getSymbol();
-      return (symbol?.name === "Some" || symbol?.name === "None") && symbol.declarations?.some((d) => /\/effect\/.*Option\.(?:d\.)?ts$/.test(d.getSourceFile().fileName));
+      return (symbol?.name === "Some" || symbol?.name === "None") && symbol.declarations?.some((d) => /\/effect\/.*Option\.(?:d\.)?ts$/.test(d.path));
     });
     if (option && members[0]) {
       const first = members.find((m) => m.getSymbol()?.name === "Some") ?? members[0];
-      return { kind: "Option", args: checker.getTypeArguments(first as ts.TypeReference) };
+      return { kind: "Option", args: checker.getTypeArguments(first as TypeReference) };
     }
   }
-  if (type.flags & ts.TypeFlags.Object && (type as ts.ObjectType).objectFlags & (ts.ObjectFlags.Class | ts.ObjectFlags.Interface)) {
-    for (const base of checker.getBaseTypes(type as ts.InterfaceType) ?? []) {
+  if (type.flags & TypeFlags.Object && (type as ObjectType).objectFlags & (ObjectFlags.Class | ObjectFlags.Interface)) {
+    for (const base of checker.getBaseTypes(type as InterfaceType) ?? []) {
       const detected = family(base, checker);
       if (detected) return detected;
     }
@@ -541,10 +762,10 @@ function family(type: ts.Type, checker: ts.TypeChecker): { kind: Family; args: R
   return undefined;
 }
 
-function shapeOf(type: ts.Type, checker: ts.TypeChecker, node: ts.Node, body: ts.ConciseBody): ReturnShape {
-  if (type.isUnion() && type.types.every((member) => family(member, checker)?.kind === "Effect")) {
-    const shapes = type.types.map((member) => shapeOf(member, checker, node, body));
-    const successes = type.types.flatMap(member => family(member, checker)?.args[0] ?? []);
+function shapeOf(type: Type, checker: Checker, node: ts.Node, body: ts.ConciseBody): ReturnShape {
+  if (isUnion(type) && type.getTypes().every((member) => family(member, checker)?.kind === "Effect")) {
+    const shapes = type.getTypes().map((member) => shapeOf(member, checker, node, body));
+    const successes = type.getTypes().flatMap(member => family(member, checker)?.args[0] ?? []);
     const bounded = boundCandidates(successes.flatMap(success => valuesOf(success, checker, node)), successes, node);
     const errors = shapes.flatMap((shape) => shape.kind === "Effect" ? shape.errors : []);
     return { kind: "Effect",
@@ -562,53 +783,56 @@ function shapeOf(type: ts.Type, checker: ts.TypeChecker, node: ts.Node, body: ts
     const errors = e ? taggedValues(e, checker, node) : [];
     return { kind: detected.kind, values, errors, omittedValues: bounded.omitted, synthesisIssues: bounded.issues, enumerateRecoveries: a !== undefined && smallFinite(a) };
   }
-  if (type.flags & ts.TypeFlags.Void) return { kind: "Void", values: [] };
-  const members = type.isUnion() ? type.types : [type];
-  const boolean = members.every((t) => (t.flags & (ts.TypeFlags.Boolean | ts.TypeFlags.BooleanLiteral)) !== 0);
-  const literal = members.every((t) => t.isLiteral());
+  if (type.flags & TypeFlags.Void) return { kind: "Void", values: [] };
+  const members = isUnion(type) ? type.getTypes() : [type];
+  const boolean = members.every((t) => (t.flags & (TypeFlags.Boolean | TypeFlags.BooleanLiteral)) !== 0);
+  const literal = members.every((t) => isLiteral(t));
   const bounded = boundedValues(type, checker, node);
   const values = bounded.values;
   if (isFunction(node)) for (const parameter of node.parameters) {
-    if (ts.isIdentifier(parameter.name) && checker.isTypeAssignableTo(checker.getTypeAtLocation(parameter), type)) {
+    if (ts.isIdentifier(parameter.name) && checker.isTypeAssignableTo(typeAt(checker, parameter), type)) {
       values.push({ text: parameter.name.text, synthetic: false });
     }
   }
   return { kind: boolean ? "Boolean" : literal ? "Literal" : "Value", values, omittedValues: bounded.omitted, synthesisIssues: bounded.issues };
 }
 
-function taggedValues(type: ts.Type, checker: ts.TypeChecker, location: ts.Node): TaggedValue[] {
-  return (type.isUnion() ? type.types : [type]).flatMap((member) => {
-    const tag = member.getProperty("_tag");
+function taggedValues(type: Type, checker: Checker, location: ts.Node): TaggedValue[] {
+  return (isUnion(type) ? type.getTypes() : [type]).flatMap((member) => {
+    const tag = checker.getPropertyOfType(member, "_tag");
     if (!tag) return [];
     const tagType = checker.getTypeOfSymbolAtLocation(tag, location);
-    if (!tagType.isStringLiteral()) return [];
+    if (!isStringLiteral(tagType)) return [];
     const value = constructError(member, checker, location, tagType.value);
     return [{ ...value, tag: tagType.value }];
   });
 }
 
-function constructError(type: ts.Type, checker: ts.TypeChecker, location: ts.Node, tag: string): Value & { readonly reason?: string } {
+function constructError(type: Type, checker: Checker, location: ts.Node, tag: string): Value & { readonly reason?: string } {
   const synthetic = (reason?: string): Value & { readonly reason?: string } => ({
     text: `({ _tag: ${JSON.stringify(tag)} } as unknown as ${returnTypeText(type, checker, location)})`, synthetic: true,
     ...(reason ? { reason } : {}),
   });
   const symbol = type.getSymbol();
   if (symbol) {
-    const visible = checker.getSymbolsInScope(location, ts.SymbolFlags.Value | ts.SymbolFlags.Alias).find((candidate) => {
-      if (candidate.declarations?.some((declaration) => (ts.isImportClause(declaration) && declaration.isTypeOnly)
-        || (ts.isImportSpecifier(declaration) && (declaration.isTypeOnly || declaration.parent.parent.isTypeOnly)))) return false;
-      const target = candidate.flags & ts.SymbolFlags.Alias ? checker.getAliasedSymbol(candidate) : candidate;
+    const visible = symbolsInScope(checker, location, SymbolFlags.Value | SymbolFlags.Alias).find((candidate) => {
+      if (candidate.declarations?.some((handle) => {
+        const declaration = handle.resolve();
+        return declaration !== undefined && ((ts.isImportClause(declaration) && typeOnly(declaration))
+          || (ts.isImportSpecifier(declaration) && (declaration.isTypeOnly || typeOnly(declaration.parent.parent as ts.ImportClause))));
+      })) return false;
+      const target = aliasTarget(checker, candidate);
       // Exported Data.TaggedError classes may expose distinct value/type
       // symbols for the same class declaration.
-      return target === symbol || (symbol.declarations?.some((declaration) => target.declarations?.includes(declaration)) ?? false);
+      return sameSymbol(target, symbol) || (symbol.declarations?.some((declaration) => target.declarations?.some((other) => sameDeclaration(other, declaration))) ?? false);
     });
     if (visible) {
-      const constructor = checker.getTypeOfSymbolAtLocation(visible, location).getConstructSignatures()[0];
+      const constructor = checker.getSignaturesOfType(checker.getTypeOfSymbolAtLocation(visible, location), SignatureKind.Construct)[0];
       if (constructor) {
         const arguments_: string[] = [];
-        for (const param of constructor.parameters) {
+        for (const param of constructor.getParameters()) {
           const fields = checker.getTypeOfSymbolAtLocation(param, location);
-          if (fields.flags & (ts.TypeFlags.Void | ts.TypeFlags.Undefined)) continue;
+          if (fields.flags & (TypeFlags.Void | TypeFlags.Undefined)) continue;
           const issues = new Set<string>();
           const value = valuesOf(fields, checker, location, new Set(), 0, issues)[0];
           if (!value || value.synthetic) {
@@ -617,14 +841,14 @@ function constructError(type: ts.Type, checker: ts.TypeChecker, location: ts.Nod
             const detail = field ? `field ${field}` : `argument ${param.name} is not synthesizable`;
             return synthetic(detail + (issues.size ? ` (${[...issues].join("; ")})` : ""));
           }
-          const declaration = param.valueDeclaration;
-          const rest = declaration && ts.isParameter(declaration) && declaration.dotDotDotToken;
+          const declaration = param.valueDeclaration?.resolve();
+          const rest = declaration && ts.isParameterDeclaration(declaration) && declaration.dotDotDotToken;
           arguments_.push(`${rest ? "..." : ""}${value.text}`);
         }
         return { text: `new ${visible.name}(${arguments_.join(", ")})`, synthetic: false };
       }
     }
-    if (symbol.declarations?.some(ts.isClassDeclaration)) {
+    if (symbol.declarations?.some((declaration) => declaration.kind === ts.SyntaxKind.ClassDeclaration)) {
       return synthetic(visible ? "constructor arguments are not synthesizable" : "class is not available as a value; import its constructor");
     }
   }
@@ -633,22 +857,22 @@ function constructError(type: ts.Type, checker: ts.TypeChecker, location: ts.Nod
 
 // Without UseAliasDefinedOutsideCurrentScope the checker emits import("./module").Name
 // for names not visible here, including transitive error and Brand references.
-function returnTypeText(type: ts.Type, checker: ts.TypeChecker, node: ts.Node): string {
-  if (isFunction(node) && node.type && !node.asteriskToken && checker.getTypeFromTypeNode(node.type) === type) return node.type.getText();
-  const print = (t: ts.Type): string => {
-    if (t.isUnion()) return t.types.map(print).join(" | ");
+function returnTypeText(type: Type, checker: Checker, node: ts.Node): string {
+  if (isFunction(node) && node.type && !node.asteriskToken && sameType(checker.getTypeFromTypeNode(node.type), type)) return node.type.getText();
+  const print = (t: Type): string => {
+    if (isUnion(t)) return t.getTypes().map(print).join(" | ");
     const symbol = t.getSymbol();
-    if (symbol && !checker.resolveName(symbol.name, node, ts.SymbolFlags.Type, false)) {
-      const alias = checker.getSymbolsInScope(node, ts.SymbolFlags.Type | ts.SymbolFlags.Alias).find(candidate => {
-        const target = candidate.flags & ts.SymbolFlags.Alias ? checker.getAliasedSymbol(candidate) : candidate;
-        return !!target.declarations?.length && checker.getDeclaredTypeOfSymbol(target) === t;
+    if (symbol && !checker.resolveName(symbol.name, SymbolFlags.Type, node, false)) {
+      const alias = symbolsInScope(checker, node, SymbolFlags.Type | SymbolFlags.Alias).find(candidate => {
+        const target = aliasTarget(checker, candidate);
+        return !!target.declarations?.length && declaredTypeId(checker, target) === t.id;
       });
       if (alias) return alias.name;
     }
-    return checker.typeToString(t, node, ts.TypeFormatFlags.NoTruncation);
+    return checker.typeToString(t, node, NodeBuilderFlags.NoTruncation);
   };
-  if (type.isUnion()) {
-    const members = type.types.map((member) => family(member, checker));
+  if (isUnion(type)) {
+    const members = type.getTypes().map((member) => family(member, checker));
     if (members.every((member) => member?.kind === "Effect")) {
       const args = [0, 1, 2].map((index) => [...new Set(members.flatMap((member) => member?.args[index] ? [print(member.args[index]!)] : []))].sort().join(" | ") || "never");
       return `import("effect/Effect").Effect<${args.join(", ")}>`;
@@ -691,57 +915,151 @@ function equivalentSuccessValues(body: ts.ConciseBody, api: MutableFunction["api
       const value = literalData(node.arguments[0]);
       if (value !== undefined) values.push(JSON.stringify(value));
     }
-    ts.forEachChild(node, visit);
+    node.forEachChild(visit);
   };
   visit(body);
   return values;
 }
 
 function isEquivalentSuccess(text: string, values: ReadonlyArray<string>): boolean {
-  const source = ts.createSourceFile("literal.ts", `(${text})`, ts.ScriptTarget.Latest, true);
-  const statement = source.statements[0];
-  if (!statement || !ts.isExpressionStatement(statement)) return false;
-  const value = literalData(statement.expression);
+  const value = literalData(parseValue(text));
   return value !== undefined && values.includes(JSON.stringify(value));
 }
 
-function synthesisReason(type: ts.Type, checker: ts.TypeChecker, node: ts.Node): string {
-  if (type.flags & (ts.TypeFlags.TypeParameter | ts.TypeFlags.IndexedAccess)) return "generic return cannot be synthesized";
+/** The literal structure of a synthesized value, as the nodes literalData reads. Anything else is an unknown node. */
+function parseValue(text: string): ts.Node {
+  const tokens = tokensOf(`(${text})`);
+  let index = 0;
+  const peek = (): ts.SyntaxKind | undefined => tokens[index]?.kind;
+  const node = (fields: Record<string, unknown>): ts.Node => fields as unknown as ts.Node;
+  const unknown = (): ts.Node => node({ kind: ts.SyntaxKind.Unknown });
+  const terminators = new Set([ts.SyntaxKind.CommaToken, ts.SyntaxKind.CloseParenToken, ts.SyntaxKind.CloseBracketToken, ts.SyntaxKind.CloseBraceToken]);
+  const opens = new Set([ts.SyntaxKind.OpenParenToken, ts.SyntaxKind.OpenBracketToken, ts.SyntaxKind.OpenBraceToken, ts.SyntaxKind.TemplateHead]);
+  const closes = new Set([ts.SyntaxKind.CloseParenToken, ts.SyntaxKind.CloseBracketToken, ts.SyntaxKind.CloseBraceToken, ts.SyntaxKind.TemplateTail]);
+  const skipToTerminator = (): void => {
+    let depth = 0;
+    while (index < tokens.length && (depth > 0 || !terminators.has(peek()!))) {
+      if (opens.has(peek()!)) depth++;
+      else if (closes.has(peek()!)) depth--;
+      index++;
+    }
+  };
+  const expression = (): ts.Node => {
+    let value = unary();
+    while (peek() === ts.SyntaxKind.AsKeyword || peek() === ts.SyntaxKind.SatisfiesKeyword) {
+      index++;
+      skipToTerminator();
+      value = node({ kind: ts.SyntaxKind.AsExpression, expression: value });
+    }
+    if (index < tokens.length && !terminators.has(peek()!)) {
+      skipToTerminator();
+      return unknown();
+    }
+    return value;
+  };
+  const unary = (): ts.Node => {
+    const operator = peek();
+    if (operator === ts.SyntaxKind.MinusToken || operator === ts.SyntaxKind.PlusToken || operator === ts.SyntaxKind.TildeToken || operator === ts.SyntaxKind.ExclamationToken) {
+      index++;
+      return node({ kind: ts.SyntaxKind.PrefixUnaryExpression, operator, operand: unary() });
+    }
+    return primary();
+  };
+  const list = (close: ts.SyntaxKind, item: () => ts.Node): ts.Node[] => {
+    const items: ts.Node[] = [];
+    index++;
+    while (index < tokens.length && peek() !== close) {
+      items.push(item());
+      if (peek() === ts.SyntaxKind.CommaToken) index++;
+      else if (peek() !== close) { skipToTerminator(); if (peek() === ts.SyntaxKind.CommaToken) index++; }
+    }
+    index++;
+    return items;
+  };
+  const property = (): ts.Node => {
+    const name = tokens[index];
+    if (name?.kind === ts.SyntaxKind.OpenBracketToken) {
+      skipToTerminator();
+      return unknown();
+    }
+    if (!name || !(name.kind === ts.SyntaxKind.Identifier || name.kind === ts.SyntaxKind.StringLiteral || name.kind === ts.SyntaxKind.NumericLiteral)
+      || tokens[index + 1]?.kind !== ts.SyntaxKind.ColonToken) {
+      skipToTerminator();
+      return unknown();
+    }
+    index += 2;
+    return node({ kind: ts.SyntaxKind.PropertyAssignment, name: node({ kind: name.kind, text: name.value, getText: () => name.text }), initializer: expression() });
+  };
+  const primary = (): ts.Node => {
+    const token = tokens[index];
+    switch (token?.kind) {
+      case ts.SyntaxKind.OpenParenToken: {
+        index++;
+        const inner = expression();
+        if (peek() !== ts.SyntaxKind.CloseParenToken) return unknown();
+        index++;
+        return node({ kind: ts.SyntaxKind.ParenthesizedExpression, expression: inner });
+      }
+      case ts.SyntaxKind.StringLiteral:
+      case ts.SyntaxKind.NumericLiteral:
+        index++;
+        return node({ kind: token.kind, text: token.value });
+      case ts.SyntaxKind.Identifier:
+      case ts.SyntaxKind.UndefinedKeyword:
+        index++;
+        return node({ kind: ts.SyntaxKind.Identifier, text: token.text });
+      case ts.SyntaxKind.TrueKeyword:
+      case ts.SyntaxKind.FalseKeyword:
+      case ts.SyntaxKind.NullKeyword:
+        index++;
+        return node({ kind: token.kind });
+      case ts.SyntaxKind.OpenBracketToken:
+        return node({ kind: ts.SyntaxKind.ArrayLiteralExpression, elements: list(ts.SyntaxKind.CloseBracketToken, expression) });
+      case ts.SyntaxKind.OpenBraceToken:
+        return node({ kind: ts.SyntaxKind.ObjectLiteralExpression, properties: list(ts.SyntaxKind.CloseBraceToken, property) });
+      default:
+        skipToTerminator();
+        return unknown();
+    }
+  };
+  return expression();
+}
+
+function synthesisReason(type: Type, checker: Checker, node: ts.Node): string {
+  if (type.flags & (TypeFlags.TypeParameter | TypeFlags.IndexedAccess)) return "generic return cannot be synthesized";
   const valueType = family(type, checker)?.args[0] ?? type;
   // Protocol properties are implementation details, not fields a caller can supply.
-  const field = valueType.getProperties().find(field => /^[$\w]+$/.test(field.name)
-    && !(field.flags & ts.SymbolFlags.Optional) && !valuesOf(checker.getTypeOfSymbolAtLocation(field, node), checker, node).length);
-  const symbol = valueType.aliasSymbol ?? valueType.getSymbol();
+  const field = checker.getPropertiesOfType(valueType).find(field => /^[$\w]+$/.test(field.name)
+    && !(field.flags & SymbolFlags.Optional) && !valuesOf(checker.getTypeOfSymbolAtLocation(field, node), checker, node).length);
+  const symbol = valueType.getAliasSymbol() ?? valueType.getSymbol();
   const name = symbol && !symbol.name.startsWith("__") ? symbol.name
-    : valueType.isUnion() ? "union" : valueType.flags & ts.TypeFlags.Object || valueType.isIntersection() ? "object" : checker.typeToString(valueType, node);
+    : isUnion(valueType) ? "union" : valueType.flags & TypeFlags.Object || isIntersection(valueType) ? "object" : checker.typeToString(valueType, node);
   return field ? `return not synthesizable (field ${field.name})` : `return not synthesizable (type ${name})`;
 }
 
 function valueKey(text: string): string {
-  const source = ts.createSourceFile("value.ts", `(${text})`, ts.ScriptTarget.Latest, true);
-  const statement = source.statements[0];
-  const data = statement && ts.isExpressionStatement(statement) ? literalData(statement.expression) : undefined;
+  const data = literalData(parseValue(text));
   return data === undefined ? text : JSON.stringify(data);
 }
 
 /** Finite literal sets are exhaustive up to eight; open/recursive shapes use six representatives.
  * Undefined is retained separately, so optional returns keep their absence path. */
-function boundedValues(type: ts.Type, checker: ts.TypeChecker, node: ts.Node): { values: Value[]; omitted: number; issues: string[] } {
+function boundedValues(type: Type, checker: Checker, node: ts.Node): { values: Value[]; omitted: number; issues: string[] } {
   const issues = new Set<string>();
   return { ...boundCandidates(valuesOf(type, checker, node, new Set(), 0, issues), [type], node), issues: [...issues] };
 }
 
-function smallFinite(type: ts.Type): boolean {
-  const members = type.isUnion() ? type.types : [type];
-  return members.length <= 4 && members.every(member => member.isLiteral()
-    || !!(member.flags & (ts.TypeFlags.Boolean | ts.TypeFlags.BooleanLiteral | ts.TypeFlags.Null | ts.TypeFlags.Undefined | ts.TypeFlags.Void)));
+function smallFinite(type: Type): boolean {
+  const members = isUnion(type) ? type.getTypes() : [type];
+  return members.length <= 4 && members.every(member => isLiteral(member)
+    || !!(member.flags & (TypeFlags.Boolean | TypeFlags.BooleanLiteral | TypeFlags.Null | TypeFlags.Undefined | TypeFlags.Void)));
 }
 
-function boundCandidates(candidates: ReadonlyArray<Value>, types: ReadonlyArray<ts.Type>, node: ts.Node): { values: Value[]; omitted: number } {
+function boundCandidates(candidates: ReadonlyArray<Value>, types: ReadonlyArray<Type>, node: ts.Node): { values: Value[]; omitted: number } {
   const unique = [...new Map(candidates.map(value => [valueKey(value.text), value])).values()];
-  const members = types.flatMap(type => type.isUnion() ? type.types : [type]);
-  const finite = members.length <= 8 && members.every(member => member.isLiteral()
-    || !!(member.flags & (ts.TypeFlags.Boolean | ts.TypeFlags.BooleanLiteral | ts.TypeFlags.Null | ts.TypeFlags.Undefined)));
+  const members = types.flatMap(type => isUnion(type) ? type.getTypes() : [type]);
+  const finite = members.length <= 8 && members.every(member => isLiteral(member)
+    || !!(member.flags & (TypeFlags.Boolean | TypeFlags.BooleanLiteral | TypeFlags.Null | TypeFlags.Undefined)));
   if (finite || unique.length <= 6) return { values: unique, omitted: 0 };
   const absence = unique.find(value => value.text === "undefined");
   const defined = unique.filter(value => value !== absence);
@@ -750,11 +1068,7 @@ function boundCandidates(candidates: ReadonlyArray<Value>, types: ReadonlyArray<
     return candidate ? [candidate] : [];
   });
   const original = returnedDiscriminants(node);
-  const priority = defined.filter(candidate => {
-    const source = ts.createSourceFile("value.ts", `(${candidate.text})`, ts.ScriptTarget.Latest, true);
-    const statement = source.statements[0];
-    return statement && ts.isExpressionStatement(statement) && objectDiscriminants(statement.expression).some(key => original.has(key));
-  });
+  const priority = defined.filter(candidate => objectDiscriminants(parseValue(candidate.text)).some(key => original.has(key)));
   const selected = [...new Set([...priority, ...preferred, ...defined])].slice(0, 6);
   if (absence) selected.push(absence);
   return { values: selected, omitted: unique.length - selected.length };
@@ -778,13 +1092,13 @@ function returnedDiscriminants(node: ts.Node): Set<string> {
   const visit = (child: ts.Node): void => {
     if (isFunction(child)) return;
     if (ts.isReturnStatement(child) && child.expression) for (const key of objectDiscriminants(child.expression)) result.add(key);
-    ts.forEachChild(child, visit);
+    child.forEachChild(visit);
   };
   visit(node.body);
   return result;
 }
 
-function shapeNotices(shape: ReturnShape, type: ts.Type, checker: ts.TypeChecker, node: ts.Node): string[] {
+function shapeNotices(shape: ReturnShape, type: Type, checker: Checker, node: ts.Node): string[] {
   const notices: string[] = [...(shape.synthesisIssues ?? [])];
   const valueType = family(type, checker)?.args[0] ?? type;
   if ("values" in shape && shape.values.some(value => new TextEncoder().encode(value.text).byteLength > 2048)) notices.push("synthesized value exceeds 2048 bytes");
@@ -794,24 +1108,24 @@ function shapeNotices(shape: ReturnShape, type: ts.Type, checker: ts.TypeChecker
     if (error.reason !== undefined) notices.push(`cannot construct ${error.tag}: ${error.reason}`);
     if (new TextEncoder().encode(error.text).byteLength > 2048) notices.push(`cannot construct ${error.tag}: synthesized value exceeds 2048 bytes`);
   }
-  if ("values" in shape && !shape.values.length && !(valueType.flags & ts.TypeFlags.Never) && shape.kind !== "Void") {
+  if ("values" in shape && !shape.values.length && !(valueType.flags & TypeFlags.Never) && shape.kind !== "Void") {
     notices.push(synthesisReason(type, checker, node));
   }
   return notices;
 }
 
 /** Bounded synthesis: cycles or unavailable required fields produce no fabricated value. */
-function valuesOf(type: ts.Type, checker: ts.TypeChecker, location: ts.Node, ancestors: ReadonlySet<ts.Type> = new Set(), depth = 0, issues = new Set<string>()): Value[] {
+function valuesOf(type: Type, checker: Checker, location: ts.Node, ancestors: ReadonlySet<number> = new Set(), depth = 0, issues = new Set<string>()): Value[] {
   if (depth > 4) { issues.add("synthesis depth limit (4) reached"); return []; }
-  if (ancestors.has(type) || type.flags & ts.TypeFlags.Never) return [];
+  if (ancestors.has(type.id) || type.flags & TypeFlags.Never) return [];
   const values = synthesizeValues(type, checker, location, ancestors, depth, issues);
   const bounded = values.filter(value => new TextEncoder().encode(value.text).byteLength <= 2048);
   if (bounded.length !== values.length) issues.add("synthesized value exceeds 2048 bytes");
   return bounded;
 }
 
-function synthesizeValues(type: ts.Type, checker: ts.TypeChecker, location: ts.Node, ancestors: ReadonlySet<ts.Type>, depth: number, issues: Set<string>): Value[] {
-  const descend = (inner: ts.Type): Value[] => valuesOf(inner, checker, location, new Set([...ancestors, type]), depth + 1, issues);
+function synthesizeValues(type: Type, checker: Checker, location: ts.Node, ancestors: ReadonlySet<number>, depth: number, issues: Set<string>): Value[] {
+  const descend = (inner: Type): Value[] => valuesOf(inner, checker, location, new Set([...ancestors, type.id]), depth + 1, issues);
   const value = (text: string): Value => ({ text, synthetic: false });
   const detected = family(type, checker);
   if (detected && (detected.kind === "Option" || detected.kind === "Effect")) {
@@ -825,59 +1139,59 @@ function synthesizeValues(type: ts.Type, checker: ts.TypeChecker, location: ts.N
       ...(wrap ? values.map((v) => ({ text: `${wrap}(${v.text})`, synthetic: v.synthetic })) : []),
     ];
   }
-  if (type.isIntersection()) {
+  if (isIntersection(type)) {
     // Primitive brands need a cast. Structural intersections synthesize their required fields below.
-    const primitive = type.types.find(member => member.flags & (ts.TypeFlags.String | ts.TypeFlags.Number));
-    const brand = type.types.some(member => member.getProperties().some(prop => prop.name.includes("Brand")));
+    const primitive = type.getTypes().find(member => member.flags & (TypeFlags.String | TypeFlags.Number));
+    const brand = type.getTypes().some(member => checker.getPropertiesOfType(member).some(prop => prop.name.includes("Brand")));
     if (primitive && brand) return descend(primitive).map(v => ({ ...v, text: `(${v.text} as ${returnTypeText(type, checker, location)})` }));
   }
   const symbol = type.getSymbol();
   if ((symbol?.name === "ReadonlySet" || symbol?.name === "Set" || symbol?.name === "ReadonlyMap" || symbol?.name === "Map")
-    && symbol.declarations?.some(d => /\/lib\.es.*\.d\.ts$/.test(d.getSourceFile().fileName))) {
+    && symbol.declarations?.some(d => /\/lib\.es.*\.d\.ts$/.test(d.path))) {
     return [value(symbol.name.endsWith("Set") ? "new Set()" : "new Map()")];
   }
-  if (type.isUnion()) {
-    const members = [...type.types];
+  if (isUnion(type)) {
+    const members = [...type.getTypes()];
     // The checker can intern scalar unions in different orders across selections.
     // Tagged structural variants retain their declaration order for cap selection.
-    if (members.every(member => member.isLiteral() || !!(member.flags & (ts.TypeFlags.BooleanLiteral | ts.TypeFlags.Null | ts.TypeFlags.Undefined)))) {
-      members.sort((a, b) => a.isNumberLiteral() && b.isNumberLiteral() ? a.value - b.value : checker.typeToString(a).localeCompare(checker.typeToString(b), "en"));
+    if (members.every(member => isLiteral(member) || !!(member.flags & (TypeFlags.BooleanLiteral | TypeFlags.Null | TypeFlags.Undefined)))) {
+      members.sort((a, b) => isNumberLiteral(a) && isNumberLiteral(b) ? a.value - b.value : checker.typeToString(a).localeCompare(checker.typeToString(b), "en"));
     }
     return members.flatMap(member => descend(member));
   }
-  if (type.isStringLiteral()) return [value(JSON.stringify(type.value))];
-  if (type.isNumberLiteral()) return [value(String(type.value))];
-  if (type.flags & ts.TypeFlags.BooleanLiteral) return [value(checker.typeToString(type))];
-  if (type.flags & ts.TypeFlags.Boolean) return [value("true"), value("false")];
-  if (type.flags & ts.TypeFlags.String) return [value('""'), value('"xyzzy"')];
-  if (type.flags & ts.TypeFlags.Number) return [value("0"), value("1"), value("-1")];
-  if (type.flags & ts.TypeFlags.BigInt) return [value("0n"), value("1n")];
-  if (type.flags & ts.TypeFlags.Null) return [value("null")];
-  if (type.flags & (ts.TypeFlags.Unknown | ts.TypeFlags.Any)) return [value("undefined")];
-  if (type.flags & (ts.TypeFlags.Undefined | ts.TypeFlags.Void)) return [value("undefined")];
+  if (isStringLiteral(type)) return [value(JSON.stringify(type.value))];
+  if (isNumberLiteral(type)) return [value(String(type.value))];
+  if (type.flags & TypeFlags.BooleanLiteral) return [value(checker.typeToString(type))];
+  if (type.flags & TypeFlags.Boolean) return [value("true"), value("false")];
+  if (type.flags & TypeFlags.String) return [value('""'), value('"xyzzy"')];
+  if (type.flags & TypeFlags.Number) return [value("0"), value("1"), value("-1")];
+  if (type.flags & TypeFlags.BigInt) return [value("0n"), value("1n")];
+  if (type.flags & TypeFlags.Null) return [value("null")];
+  if (type.flags & (TypeFlags.Unknown | TypeFlags.Any)) return [value("undefined")];
+  if (type.flags & (TypeFlags.Undefined | TypeFlags.Void)) return [value("undefined")];
   if (checker.isTupleType(type)) {
-    const elements = checker.getTypeArguments(type as ts.TypeReference).map((t) => descend(t)[0]);
+    const elements = checker.getTypeArguments(type as TypeReference).map((t) => descend(t)[0]);
     return elements.every((v) => v !== undefined) ? [value(`[${elements.map((v) => v.text).join(", ")}]`)] : [];
   }
   if (checker.isArrayType(type) || checker.isArrayLikeType(type)) {
-    const element = checker.getIndexTypeOfType(type, ts.IndexKind.Number);
+    const element = checker.getIndexInfosOfType(type).find((info) => info.keyType.flags & TypeFlags.Number)?.valueType;
     const elements = element ? descend(element) : [];
     return [value("[]"), ...elements.map((v) => ({ text: `[${v.text}]`, synthetic: v.synthetic }))];
   }
-  if ((type.flags & ts.TypeFlags.Object || type.isIntersection()) && !type.getCallSignatures().length && !type.getConstructSignatures().length) {
+  if ((type.flags & TypeFlags.Object || isIntersection(type)) && !checker.getSignaturesOfType(type, SignatureKind.Call).length && !checker.getSignaturesOfType(type, SignatureKind.Construct).length) {
     const fields: Array<{ name: string; values: Value[] }> = [];
-    for (const prop of type.getProperties()) {
-      if (prop.flags & ts.SymbolFlags.Optional) continue;
+    for (const prop of checker.getPropertiesOfType(type)) {
+      if (prop.flags & SymbolFlags.Optional) continue;
       if (!/^[$\w]+$/.test(prop.name)) return [];
       const values = descend(checker.getTypeOfSymbolAtLocation(prop, location));
       if (!values.length) return [];
       fields.push({ name: prop.name, values });
     }
     const literalFields = fields.filter(field => {
-      const prop = type.getProperty(field.name);
+      const prop = checker.getPropertyOfType(type, field.name);
       if (!prop) return false;
       const t = checker.getTypeOfSymbolAtLocation(prop, location);
-      return (t.isUnion() ? t.types : [t]).every(member => member.isLiteral() || !!(member.flags & ts.TypeFlags.BooleanLiteral));
+      return (isUnion(t) ? t.getTypes() : [t]).every(member => isLiteral(member) || !!(member.flags & TypeFlags.BooleanLiteral));
     });
     const render = (changed?: typeof fields[number], replacement?: Value): Value | undefined => {
       const parts: string[] = [];
@@ -893,7 +1207,7 @@ function synthesizeValues(type: ts.Type, checker: ts.TypeChecker, location: ts.N
     };
     const first = render();
     if (!first) return []; // Do not expand a wide object into thousands of oversized variants.
-    const anonymous = !type.aliasSymbol && (!type.getSymbol() || ["__type", "__object"].includes(type.getSymbol()!.name));
+    const anonymous = !type.getAliasSymbol() && (!type.getSymbol() || ["__type", "__object"].includes(type.getSymbol()!.name));
     return [first, ...(anonymous ? literalFields.flatMap(field => field.values.slice(1).map(v => render(field, v))).filter(value => value !== undefined) : [])];
   }
   return [];
