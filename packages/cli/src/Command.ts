@@ -102,9 +102,14 @@ export const makeCommand = (options: {
   const skipped = yield* source.notMutated(config);
   const selected = inDiff === undefined && diffText === undefined ? { mutants: generated, notMutated: skipped }
     : yield* selectDiffScope({ root, diffPath: inDiff ?? `git diff ${range}`, ...(diffText === undefined ? {} : { diffText }), mutants: generated, notMutated: skipped });
+  const excluded = yield* Effect.try({
+    try: () => (fileConfig.excludeMutations ?? []).map(pattern => new RegExp(pattern, "u")),
+    catch: error => new UsageError({ message: `Invalid excludeMutations pattern in mutants.config.json: ${String(error)}` }),
+  });
+  const kept = selected.mutants.filter(mutant => !excluded.some(pattern => pattern.test(mutant.description)));
   const relative = (mutant: Mutant) => path.relative(gitRoot, path.resolve(root, mutant.file)).replaceAll("\\", "/");
   const compare = (a: string, b: string) => a < b ? -1 : a > b ? 1 : 0;
-  const ordered = [...selected.mutants].sort((a, b) => compare(relative(a), relative(b)) || a.span.start.line - b.span.start.line || a.span.start.column - b.span.start.column || compare(a.id, b.id));
+  const ordered = [...kept].sort((a, b) => compare(relative(a), relative(b)) || a.span.start.line - b.span.start.line || a.span.start.column - b.span.start.column || compare(a.id, b.id));
   const mutants = ordered.slice(0, maxMutants);
   const notMutated = selected.notMutated;
   const counts = { selected: ordered.length, run: 0, budgetSkipped: ordered.length - mutants.length };
@@ -183,7 +188,7 @@ export const runCli = Effect.fn("runCli")(function*(options: {
 }) {
   const code = yield* Ref.make(0);
   const command = makeCommand({ ...options, onExit: (value) => Ref.set(code, value) });
-  yield* Command.runWith(command, { version: "0.1.6-buildr.2" })(options.args).pipe(
+  yield* Command.runWith(command, { version: "0.1.6-buildr.3" })(options.args).pipe(
     Effect.catch((error) => Effect.gen(function*() {
       yield* Console.error(error._tag === "ProgramLoadError" ? `${error.tsconfig}:\n${error.diagnostics.join("\n")}`
         : error._tag === "BaselineTimedOut" ? error.message

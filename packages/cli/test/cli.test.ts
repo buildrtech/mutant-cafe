@@ -419,6 +419,24 @@ it.effect("flags win over config and timeout flags use seconds", () => Effect.ge
   expect(yield* invoke(root, ["--list"], [])).toBe(1);
 }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)));
 
+it.effect("drops the mutants whose description an excludeMutations pattern matches", () => Effect.gen(function*() {
+  const fs = yield* FileSystem.FileSystem;
+  const root = yield* project;
+  yield* fs.writeFileString(`${root}/mutants.config.json`, JSON.stringify({ excludeMutations: ["with Effect\\.never$", "catchTag\\(\"SqlError\""] }));
+  const never = { ...mutant({ id: "never" }), description: "replace withdraw -> Effect.Effect<void> with Effect.never" };
+  const swallow = { ...mutant({ id: "swallow" }), description: "replace withdraw -> Effect.Effect<void> with body.pipe(Effect.catchTag(\"SqlError\", () => Effect.void))" };
+  const neverInside = { ...mutant({ id: "never-inside" }), description: "replace withdraw -> Effect.Effect<void> with Effect.never.pipe(Effect.as(1))" };
+  const ran: Array<string> = [];
+  const run: Run = (config, mutants) => Effect.sync(() => {
+    ran.push(...mutants.map(item => item.id));
+    return report(config.root, mutants);
+  });
+  expect(yield* invoke(root, [], [never, swallow, neverInside, mutant()], run)).toBe(2);
+  expect(ran.toSorted()).toEqual(["never-inside", "withdraw-missed"]);
+  yield* fs.writeFileString(`${root}/mutants.config.json`, JSON.stringify({ excludeMutations: ["("] }));
+  expect(yield* invoke(root, [], [mutant()], run)).toBe(1);
+}).pipe(Effect.scoped, Effect.provide(NodeServices.layer)));
+
 it.effect("maps baseline failure, timeouts, unviable mutants and internal defects for CI", () => Effect.gen(function*() {
   const root = yield* project;
   const baselineFailure: Run = () => Effect.fail(new BaselineFailed({ exitCode: 1, output: "Failing original suite", command: ["vitest", "run"] }));
