@@ -23,6 +23,7 @@ export const RunConfig = Schema.Struct({
 export type RunConfig = typeof RunConfig.Type;
 
 export const ConfigFile = Schema.Struct({
+  extends: Schema.optional(Schema.String),
   include: Schema.optional(Schema.Array(Schema.String)),
   exclude: Schema.optional(Schema.Array(Schema.String)),
   functionFilter: Schema.optional(Schema.Array(Schema.String)),
