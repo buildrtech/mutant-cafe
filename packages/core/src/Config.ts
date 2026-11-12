@@ -26,6 +26,7 @@ export const ConfigFile = Schema.Struct({
   include: Schema.optional(Schema.Array(Schema.String)),
   exclude: Schema.optional(Schema.Array(Schema.String)),
   functionFilter: Schema.optional(Schema.Array(Schema.String)),
+  excludeMutations: Schema.optional(Schema.Array(Schema.String)),
   jobs: Schema.optional(Schema.Int),
   timeoutMultiplier: Schema.optional(Schema.Finite),
   minimumTimeoutMs: Schema.optional(Schema.Int),
