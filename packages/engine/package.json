@@ -11,12 +11,12 @@
     "test": "vitest run"
   },
   "devDependencies": {
-    "@effect/vitest": "4.1.2",
+    "@effect/vitest": "4.1.4",
     "typescript6": "npm:typescript@6.0.2"
   },
   "dependencies": {
     "@mutant-cafe/core": "workspace:*",
-    "effect": "4.1.2",
+    "effect": "4.1.4",
     "typescript": "7.0.2"
   }
 }

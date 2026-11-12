@@ -23,4 +23,4 @@ The fork can't publish `mutant-cafe` to npm. A version tag instead builds the pa
 
 ## Taking upstream changes
 
-Merge upstream's `main` into the fork's, then rerun the engine suite (`pnpm --filter @mutant-cafe/engine test`), which checks the TypeScript 7 oracle. `packages/engine/test/engine.test.ts` builds its fixtures with TypeScript 6 through the `typescript6` alias, because TypeScript 7 has no JavaScript compiler API.
+Merge upstream's `main` into the fork's, keeping `effect` and `@effect/platform-node` as caret ranges in `packages/mutant-cafe/package.json` so consumers such as Bedrock share their own Effect 4.x without overrides. Then rerun the engine suite (`pnpm --filter @mutant-cafe/engine test`), which checks the TypeScript 7 oracle. `packages/engine/test/engine.test.ts` builds its fixtures with TypeScript 6 through the `typescript6` alias, because TypeScript 7 has no JavaScript compiler API.
