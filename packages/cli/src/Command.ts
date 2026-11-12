@@ -44,6 +44,30 @@ const flags = {
   tsconfig: Flag.String("tsconfig").pipe(Flag.withDefault("tsconfig.json"), Flag.withDescription("TypeScript project path; default tsconfig.json")),
 };
 
+// A config's arrays add to the ones it extends; its other settings replace them.
+const extendConfig = (base: typeof ConfigFile.Type, config: typeof ConfigFile.Type): typeof ConfigFile.Type => {
+  const merged: Record<string, unknown> = { ...base };
+  for (const [key, value] of Object.entries(config)) {
+    if (key === "extends" || value === undefined) continue;
+    const inherited = merged[key];
+    merged[key] = Array.isArray(value) && Array.isArray(inherited) ? [...inherited, ...value] : value;
+  }
+  return merged as typeof ConfigFile.Type;
+};
+
+const readConfigFile = (file: string, chain: ReadonlyArray<string>): Effect.Effect<typeof ConfigFile.Type, UsageError, FileSystem.FileSystem | Path.Path> => Effect.gen(function* () {
+  const fs = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  if (chain.includes(file)) return yield* new UsageError({ message: `mutants.config.json extends itself: ${[...chain, file].join(" -> ")}` });
+  const config = yield* fs.readFileString(file).pipe(
+    Effect.flatMap(Schema.decodeEffect(Schema.fromJsonString(ConfigFile))),
+    Effect.mapError((error) => new UsageError({ message: `Invalid mutants config ${file}: ${String(error)}` })),
+  );
+  if (config.extends === undefined) return config;
+  const base = yield* readConfigFile(path.resolve(path.dirname(file), config.extends), [...chain, file]);
+  return extendConfig(base, config);
+});
+
 export const makeCommand = (options: {
   readonly root: string;
   readonly run: Run;
@@ -67,11 +91,7 @@ export const makeCommand = (options: {
   const gitRoot = range !== undefined ? yield* repositoryRoot(root) : yield* repositoryRoot(root).pipe(Effect.catch(() => Effect.succeed(root)));
   const diffText = range === undefined ? undefined : yield* git(gitRoot, ["diff", "--no-ext-diff", "--no-color", range, "--"]);
   const configPath = path.join(root, "mutants.config.json");
-  const fileConfig = (yield* fs.exists(configPath))
-    ? yield* fs.readFileString(configPath).pipe(
-      Effect.flatMap(Schema.decodeEffect(Schema.fromJsonString(ConfigFile))),
-      Effect.mapError((error) => new UsageError({ message: `Invalid mutants.config.json: ${String(error)}` })),
-    ) : {};
+  const fileConfig = (yield* fs.exists(configPath)) ? yield* readConfigFile(configPath, []) : {};
   const timeoutMs = Option.map(input.timeout, (seconds) => Math.ceil(seconds * 1000));
   const config = yield* Schema.decodeEffect(RunConfig)({
     root,
@@ -188,7 +208,7 @@ export const runCli = Effect.fn("runCli")(function*(options: {
 }) {
   const code = yield* Ref.make(0);
   const command = makeCommand({ ...options, onExit: (value) => Ref.set(code, value) });
-  yield* Command.runWith(command, { version: "0.1.6-buildr.3" })(options.args).pipe(
+  yield* Command.runWith(command, { version: "0.1.6-buildr.4" })(options.args).pipe(
     Effect.catch((error) => Effect.gen(function*() {
       yield* Console.error(error._tag === "ProgramLoadError" ? `${error.tsconfig}:\n${error.diagnostics.join("\n")}`
         : error._tag === "BaselineTimedOut" ? error.message

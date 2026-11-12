@@ -437,6 +437,28 @@ it.effect("drops the mutants whose description an excludeMutations pattern match
   expect(yield* invoke(root, [], [mutant()], run)).toBe(1);
 }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)));
 
+it.effect("a config extends another, adding to its lists and replacing its other settings", () => Effect.gen(function*() {
+  const fs = yield* FileSystem.FileSystem;
+  const root = yield* project;
+  yield* fs.makeDirectory(`${root}/shared/base`, { recursive: true });
+  yield* fs.writeFileString(`${root}/shared/base/root.json`, JSON.stringify({ excludeMutations: ["with Effect\\.never$"], jobs: 3, timeoutMultiplier: 7 }));
+  yield* fs.writeFileString(`${root}/shared/middle.json`, JSON.stringify({ extends: "./base/root.json", jobs: 4 }));
+  yield* fs.writeFileString(`${root}/mutants.config.json`, JSON.stringify({ extends: "./shared/middle.json", excludeMutations: ["catchTag\\(\"SqlError\""], timeoutMultiplier: 2 }));
+  const never = { ...mutant({ id: "never" }), description: "replace withdraw -> Effect.Effect<void> with Effect.never" };
+  const swallow = { ...mutant({ id: "swallow" }), description: "replace withdraw -> Effect.Effect<void> with body.pipe(Effect.catchTag(\"SqlError\", () => Effect.void))" };
+  const observed: Array<{ readonly ids: ReadonlyArray<string>; readonly jobs: number; readonly timeoutMultiplier: number }> = [];
+  const run: Run = (config, mutants) => Effect.sync(() => {
+    observed.push({ ids: mutants.map(item => item.id), jobs: config.jobs, timeoutMultiplier: config.timeoutMultiplier });
+    return report(config.root, mutants);
+  });
+  expect(yield* invoke(root, [], [never, swallow, mutant()], run)).toBe(2);
+  expect(observed).toEqual([{ ids: ["withdraw-missed"], jobs: 4, timeoutMultiplier: 2 }]);
+  yield* fs.writeFileString(`${root}/shared/base/root.json`, JSON.stringify({ extends: "../../mutants.config.json" }));
+  expect(yield* invoke(root, [], [mutant()], run)).toBe(1);
+  yield* fs.writeFileString(`${root}/mutants.config.json`, JSON.stringify({ extends: "./missing.json" }));
+  expect(yield* invoke(root, [], [mutant()], run)).toBe(1);
+}).pipe(Effect.scoped, Effect.provide(NodeServices.layer)));
+
 it.effect("maps baseline failure, timeouts, unviable mutants and internal defects for CI", () => Effect.gen(function*() {
   const root = yield* project;
   const baselineFailure: Run = () => Effect.fail(new BaselineFailed({ exitCode: 1, output: "Failing original suite", command: ["vitest", "run"] }));
