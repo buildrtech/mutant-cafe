@@ -141,7 +141,7 @@ export function makeTypeScriptOracle(): TypeOracle {
                     startOffset: start, endOffset: end, original: body.getText(source),
                     identityFile: local, logicalSpan: { offset: start - node.getStart(source), length: end - start },
                     sourcePrefix: source.text.slice(0, start), importInsertionOffset: importInsertionOffset(source), extraImports: mutationImports(source),
-                    literal: literalOfBody(body),
+                    literal: literalOfBody(body, checker),
                     block: ts.isBlock(body), generator: generator !== undefined,
                     shape, api,
                   });
@@ -438,7 +438,7 @@ function generatorContract(node: ts.FunctionExpression, checker: ts.TypeChecker)
   };
 }
 
-function literalOfBody(body: ts.ConciseBody): string | undefined {
+function literalOfBody(body: ts.ConciseBody, checker: ts.TypeChecker): string | undefined {
   const expression = returnedExpression(body);
   if (!expression) return undefined;
   // Type assertions do not change runtime values. Never infer equivalence
@@ -448,6 +448,18 @@ function literalOfBody(body: ts.ConciseBody): string | undefined {
   if (expression.kind === ts.SyntaxKind.TrueKeyword) return "true";
   if (expression.kind === ts.SyntaxKind.FalseKeyword) return "false";
   if (expression.kind === ts.SyntaxKind.NullKeyword) return "null";
+  if (ts.isIdentifier(expression)) {
+    let symbol = checker.getSymbolAtLocation(expression);
+    if (symbol && symbol.flags & ts.SymbolFlags.Alias) symbol = checker.getAliasedSymbol(symbol);
+    const constant = symbol?.declarations?.some(declaration => ts.isEnumMember(declaration)
+      || (ts.isVariableDeclaration(declaration) && ts.isVariableDeclarationList(declaration.parent) && !!(declaration.parent.flags & ts.NodeFlags.Const)));
+    if (constant) {
+      const type = checker.getTypeAtLocation(expression);
+      if (type.isStringLiteral()) return JSON.stringify(type.value);
+      if (type.isNumberLiteral()) return String(type.value);
+      if (type.flags & ts.TypeFlags.BooleanLiteral) return checker.typeToString(type);
+    }
+  }
   return undefined;
 }
 
@@ -727,7 +739,7 @@ function equivalentSuccessValues(body: ts.ConciseBody, checker: ts.TypeChecker):
     seen.add(symbol);
     if (symbol.flags & ts.SymbolFlags.Alias) symbol = checker.getAliasedSymbol(symbol);
     return symbol.declarations?.some(declaration => {
-      if (ts.isSourceFile(declaration)) return /(?:^|\/)effect\/(?:.*\/)?(?:Effect|index)\.(?:d\.)?ts$/.test(declaration.fileName);
+      if (ts.isSourceFile(declaration)) return /\/node_modules\/effect\/(?:.*\/)?(?:Effect|index)\.(?:d\.)?ts$/.test(declaration.fileName);
       return ts.isVariableDeclaration(declaration) && !!declaration.initializer && ts.isVariableDeclarationList(declaration.parent)
         && !!(declaration.parent.flags & ts.NodeFlags.Const) && namespace(declaration.initializer, seen);
     }) ?? false;
@@ -741,7 +753,7 @@ function equivalentSuccessValues(body: ts.ConciseBody, checker: ts.TypeChecker):
     seen.add(symbol);
     if (symbol.flags & ts.SymbolFlags.Alias) symbol = checker.getAliasedSymbol(symbol);
     for (const declaration of symbol.declarations ?? []) {
-      if (/(?:^|\/)effect\/(?:.*\/)?Effect\.(?:d\.)?ts$/.test(declaration.getSourceFile().fileName)) return symbol.name === "void_" ? "void" : symbol.name;
+      if (/\/node_modules\/effect\/(?:.*\/)?Effect\.(?:d\.)?ts$/.test(declaration.getSourceFile().fileName)) return symbol.name === "void_" ? "void" : symbol.name;
       if (ts.isVariableDeclaration(declaration) && declaration.initializer && ts.isVariableDeclarationList(declaration.parent)
         && declaration.parent.flags & ts.NodeFlags.Const) return member(declaration.initializer, seen);
     }

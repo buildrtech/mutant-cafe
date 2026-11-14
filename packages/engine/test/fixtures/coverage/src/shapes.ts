@@ -78,6 +78,7 @@ export const genericElement = <const T extends readonly unknown[]>(xs: T): T[num
 interface Reader { readonly get: <A>(fallback: A) => Effect.Effect<A> }
 export const reader: Reader = { get: fallback => Effect.succeed(fallback) };
 export const opaque = (): { call: () => void } => ({ call: () => {} });
+export const opaqueWithWork = (work: () => void): { call: () => void } => ({ call: () => { work(); } });
 
 interface Finding { readonly key: string }
 export const report = Effect.fn("report")(function* (xs: readonly string[]) {

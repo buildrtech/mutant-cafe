@@ -37,6 +37,12 @@ it("exercises new shapes with deliberately weak assertions", async () => {
   expect(typeof s.weakIdentity(1, 2)).toBe("number");
 });
 
+it("observes the inner callback work", () => {
+  let calls = 0;
+  s.opaqueWithWork(() => { calls++; }).call();
+  expect(calls).toBe(1);
+});
+
 it("checks synthesized values", () => {
   expect(s.brand("real").length).toBeGreaterThan(0);
   expect(s.set().size).toBe(1);

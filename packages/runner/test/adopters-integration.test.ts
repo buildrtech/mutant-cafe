@@ -1,6 +1,6 @@
 import { expect, it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { MutantSource, Reporter, ReportWriteError, RunReport, type Mutant, type RunConfig } from "@mutant-cafe/core";
+import { MutantSource, Reporter, ReportWriteError, RunReport, Scratch, TestRunner, type Mutant, type RunConfig } from "@mutant-cafe/core";
 import * as Console from "effect/Console";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -8,6 +8,20 @@ import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import { runMutants, ScratchLive, TestRunnerLive } from "../src/index.ts";
+import { builtWorkspace } from "./WorkspaceOutput.ts";
+
+it.live("passes the scratch baseline when tests import prebuilt ignored sibling workspace exports", () => Effect.gen(function* () {
+  const { consumer } = yield* builtWorkspace();
+  yield* Effect.gen(function* () {
+    const scratch = yield* Scratch;
+    const tests = yield* TestRunner;
+    const copied = yield* scratch.acquire(consumer);
+    if (tests.open) yield* tests.open(copied, true);
+    const baseline = yield* tests.baseline(copied);
+    expect(Object.keys(baseline.testDurations ?? {})).toHaveLength(1);
+    expect(baseline.testCommand).toContain("run");
+  }).pipe(Effect.provide(Layer.mergeAll(ScratchLive, TestRunnerLive)));
+}).pipe(Effect.scoped, Effect.provide(NodeServices.layer)), 30_000);
 
 // Integration proof: executes replacements. Use an approved mutation-test host.
 const dependencies = decodeURIComponent(new URL("../../../fixtures/tagged-errors/node_modules", import.meta.url).pathname);

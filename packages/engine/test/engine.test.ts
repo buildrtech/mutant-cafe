@@ -405,7 +405,7 @@ export const serviceFactory = () => {
     expect(mutants.some(m => m.functionName === "inner")).toBe(false);
     const read = mutants.filter(m => m.functionName === "read");
     // An unconditional success removes the failing branch: it is not a no-op.
-    const removedFailure = read.find(m => m.genre === "EffectSucceed" && m.replacement.text.includes('"on"'));
+    const removedFailure = read.find(m => m.genre === "EffectSucceed");
     expect(removedFailure).toBeDefined();
     if (removedFailure) {
       const module = yield* loadMutation<{ read: (ok: boolean) => Effect.Effect<unknown, Error> }>(removedFailure);

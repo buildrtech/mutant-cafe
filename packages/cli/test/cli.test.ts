@@ -134,7 +134,12 @@ it.live("runs all coverage shapes and writes honest skips, with caught and misse
   }
   const skipped = yield* fs.readFileString(path.join(output, "report/not-mutated.txt"));
   expect(skipped).toContain("generic: generic");
-  expect(skipped).toMatch(/src\/shapes\.ts:\d+:\d+: opaque: return not synthesizable \(field call\); inner functions mutated/);
+  expect(skipped).toMatch(/src\/shapes\.ts:\d+:\d+: opaque: return not synthesizable \(field call\)(?:\r?\n|$)/);
+  expect(report.results.some(result => result.mutant.functionName === "opaque.call")).toBe(false);
+  expect(skipped).toMatch(/src\/shapes\.ts:\d+:\d+: opaqueWithWork: return not synthesizable \(field call\); inner functions mutated/);
+  const callback = report.results.filter(result => result.mutant.functionName === "opaqueWithWork.call");
+  expect(callback).toHaveLength(1);
+  expect(callback[0]?.outcome).toBe("caught");
   expect(logs).toContain("Baseline command:");
   expect(logs).toContain("not mutated");
 }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)), 300_000);
