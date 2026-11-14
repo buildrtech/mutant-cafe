@@ -94,30 +94,37 @@ it.live("preserves ignored workspace exports, generated files and environment wi
   expect(visited.some(path => path.includes("/.vendor/checkout"))).toBe(false);
 }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)));
 
-for (const phase of ["readDirectory", "child-lstat", "ignored-lstat"] as const) it.live(`prunes unreadable ignored trees with a warning instead of falling back (${phase})`, () => Effect.gen(function* () {
+for (const phase of ["exists", "readDirectory", "child-lstat", "ignored-lstat", "copy"] as const) it.live(`prunes unreadable ignored trees with a warning instead of falling back (${phase})`, () => Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem;
   const console = yield* Console.Console;
   const root = yield* fs.realPath(yield* fs.makeTempDirectoryScoped({ prefix: "ignored-permissions-" }));
   yield* git(root, ["init", "--quiet"]);
-  yield* fs.writeFileString(`${root}/.gitignore`, "docker-data/\n");
+  yield* fs.writeFileString(`${root}/.gitignore`, "dist/\n");
+  yield* fs.writeFileString(`${root}/package.json`, '{"exports":"./dist/index.js"}');
   yield* fs.writeFileString(`${root}/keep.txt`, "keep");
-  yield* fs.makeDirectory(`${root}/docker-data/postgres`, { recursive: true });
-  yield* fs.writeFileString(`${root}/docker-data/postgres/data`, "not scratch input");
-  const denied = `${root}/docker-data${phase === "ignored-lstat" ? "" : "/postgres"}`;
+  yield* fs.makeDirectory(`${root}/dist/postgres`, { recursive: true });
+  yield* fs.writeFileString(`${root}/dist/index.js`, "export const value = 1;");
+  yield* fs.writeFileString(`${root}/dist/postgres/data`, "not scratch input");
+  // Force entry retention to override the early independent-tree decision.
+  if (phase === "copy") yield* fs.makeDirectory(`${root}/dist/node_modules`);
+  const denied = `${root}/dist${phase === "ignored-lstat" ? "" : "/postgres"}`;
   const permission = (method: string) => Effect.fail(new PlatformError.PlatformError(new PlatformError.SystemError({
     _tag: "PermissionDenied", module: "FileSystem", method, pathOrDescriptor: denied
   })));
   const tracked: FileSystem.FileSystem = { ...fs,
-    readDirectory: path => phase === "readDirectory" && path === denied ? permission("readDirectory") : fs.readDirectory(path),
-    lstat: path => phase !== "readDirectory" && path === denied ? permission("lstat") : fs.lstat(path)
+    exists: path => phase === "exists" && path.startsWith(`${denied}/`) ? permission("exists") : fs.exists(path),
+    readDirectory: path => (phase === "readDirectory" || phase === "copy") && path === denied ? permission("readDirectory") : fs.readDirectory(path),
+    lstat: path => (phase === "child-lstat" || phase === "ignored-lstat") && path === denied ? permission("lstat") : fs.lstat(path)
   };
   const warnings: string[] = [];
   const copied = yield* Scratch.use(scratch => scratch.acquire(root)).pipe(Effect.provide(ScratchLive),
     Effect.provideService(FileSystem.FileSystem, tracked),
     Effect.provideService(Console.Console, { ...console, warn: (...args: ReadonlyArray<unknown>) => { warnings.push(args.join(" ")); } }));
   expect(yield* fs.readFileString(`${copied.path}/keep.txt`)).toBe("keep");
-  expect(yield* fs.exists(`${copied.path}/docker-data`)).toBe(false);
-  expect(warnings.some(message => message.includes("skipped an unreadable ignored tree"))).toBe(true);
+  expect(yield* fs.exists(`${copied.path}/dist/postgres`)).toBe(false);
+  if (phase === "ignored-lstat") expect(yield* fs.exists(`${copied.path}/dist`)).toBe(false);
+  else expect(yield* fs.readFileString(`${copied.path}/dist/index.js`)).toBe("export const value = 1;");
+  expect(warnings).toContain(`Warning: scratch copy skipped an unreadable ignored tree: ${denied}`);
   expect(warnings.some(message => message.includes("using recursive copy"))).toBe(false);
 }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)));
 

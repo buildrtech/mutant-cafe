@@ -28,6 +28,8 @@ export class MutantSource extends Context.Service<
 
 export interface ScratchDir {
   readonly path: string;
+  /** Package-relative original-path links that are not mutation targets. */
+  readonly linkedRoots?: ReadonlyArray<string>;
   readonly apply: (mutant: Mutant) => Effect.Effect<void, ScratchError>;
   readonly revert: (mutant: Mutant) => Effect.Effect<void, ScratchError>;
   readonly poison?: (mutant: Mutant, signal: string, token: string) => Effect.Effect<void, ScratchError>;

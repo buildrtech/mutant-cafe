@@ -72,6 +72,7 @@ export const ScratchLive = Layer.effect(Scratch, Effect.gen(function* () {
       let directories: Set<string> | undefined;
       const linked = new Set<string>();
       const unreadable = new Set<string>();
+      const ignoredRoots = new Set<string>();
       const pruneUnreadable = (location: string) => Effect.gen(function* () {
         unreadable.add(location);
         yield* Console.warn(`Warning: scratch copy skipped an unreadable ignored tree: ${location}`);
@@ -96,14 +97,20 @@ export const ScratchLive = Layer.effect(Scratch, Effect.gen(function* () {
           if ((yield* fs.exists(path.join(dir, ".git"))) || (yield* fs.exists(path.join(dir, "node_modules")))) return true;
           for (const name of yield* fs.readDirectory(dir)) {
             const child = path.join(dir, name);
-            const info = yield* fs.lstat(child);
-            if (info.type === "Directory" && (yield* independent(child))) return true;
+            const info = yield* fs.lstat(child).pipe(Effect.result);
+            if (info._tag === "Failure") {
+              if (info.failure.reason._tag === "PermissionDenied") { yield* pruneUnreadable(child); continue; }
+              return yield* info.failure;
+            }
+            if (info.success.type === "Directory" && (yield* independent(child))) return true;
           }
           return false;
-        });
+        }).pipe(Effect.catch(error => error.reason._tag === "PermissionDenied"
+          ? pruneUnreadable(dir).pipe(Effect.as(false)) : Effect.fail(error)));
         for (const file of ignored.output.split("\0").filter(Boolean)) {
           const target = path.resolve(copyRoot, file);
           if (path.relative(copyRoot, target).split(path.sep).some(part => ["node_modules", ".git", "mutants.out", ".agent_sources", ".agent-sources", ".brain", ".pi", ".rift"].includes(part))) continue;
+          ignoredRoots.add(target);
           const info = yield* fs.lstat(target).pipe(Effect.result);
           if (info._tag === "Failure") {
             if (info.failure.reason._tag === "NotFound") continue;
@@ -111,12 +118,7 @@ export const ScratchLive = Layer.effect(Scratch, Effect.gen(function* () {
             return yield* info.failure;
           }
           if (info.success.type !== "Directory") { selected.add(target); continue; }
-          const separate = yield* independent(target).pipe(Effect.result);
-          if (separate._tag === "Failure") {
-            if (separate.failure.reason._tag === "PermissionDenied") { yield* pruneUnreadable(target); continue; }
-            return yield* separate.failure;
-          }
-          if (separate.success) linked.add(target);
+          if (yield* independent(target)) linked.add(target);
           else selected.add(target);
         }
         // Ignored does not mean unused: a workspace dependency may export
@@ -160,6 +162,7 @@ export const ScratchLive = Layer.effect(Scratch, Effect.gen(function* () {
         directories = undefined;
         linked.clear();
         unreadable.clear();
+        ignoredRoots.clear();
       })));
       const temp = yield* Effect.acquireRelease(
         fs.makeTempDirectory({ prefix: "mutant-cafe-" }).pipe(
@@ -168,7 +171,7 @@ export const ScratchLive = Layer.effect(Scratch, Effect.gen(function* () {
       );
       // Materialize editable source symlinks. Dependencies and pruned trees
       // remain linked; target() rejects writes through links out of scratch.
-      const copy = (from: string, to: string, ancestors: ReadonlyArray<string>, filter = true): Effect.Effect<void, ScratchError> =>
+      const copy = (from: string, to: string, ancestors: ReadonlyArray<string>, filter = true, ignored = false): Effect.Effect<void, ScratchError> =>
         Effect.gen(function* () {
           if (unreadable.has(from)) return;
           // Declared package entry trees must be copied, even when they hold
@@ -215,13 +218,15 @@ export const ScratchLive = Layer.effect(Scratch, Effect.gen(function* () {
                 });
                 yield* linkDependencies(src, dest).pipe(skipVanished(src, dest));
               } else {
-                yield* copy(src, dest, [...ancestors, real], filterChildren);
+                yield* copy(src, dest, [...ancestors, real], filterChildren, ignored || ignoredRoots.has(from));
               }
             }
           } else if (info.type === "File") {
             yield* fs.copyFile(from, to);
           }
-        }).pipe(skipVanished(from, to), Effect.mapError((error) => failure("copy", from, error)));
+        }).pipe(skipVanished(from, to), Effect.catch(error => error._tag === "PlatformError" && error.reason._tag === "PermissionDenied" && (ignored || ignoredRoots.has(from))
+          ? pruneUnreadable(from).pipe(Effect.andThen(fs.remove(to, { recursive: true, force: true })))
+          : Effect.fail(error)), Effect.mapError((error) => failure("copy", from, error)));
       yield* copy(copyRoot, temp, []);
       const packageRoot = yield* fs.realPath(path.join(temp, path.relative(copyRoot, source))).pipe(
         Effect.mapError((error) => failure("resolve", source, error)));
@@ -248,6 +253,8 @@ export const ScratchLive = Layer.effect(Scratch, Effect.gen(function* () {
       });
       const dir: ScratchDir = {
         path: packageRoot,
+        linkedRoots: [...linked].filter(root => !selected?.has(root) && !unreadable.has(root)).map(root => path.relative(source, root))
+          .filter(root => root !== ".." && !root.startsWith(`..${path.sep}`) && !path.isAbsolute(root)),
         apply: Effect.fn("Scratch.apply")(function* (mutant: Mutant) {
           const location = yield* target(mutant);
           const bytes = yield* fs.readFile(location);
