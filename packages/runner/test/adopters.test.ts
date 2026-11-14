@@ -63,7 +63,9 @@ for (const separate of [false, true]) it.live(`copies the Git file set and packa
   expect(yield* fs.readFileString(`${copied.path}/src/space in name.ts`)).toContain("spaced = 3");
   expect(yield* fs.readFileString(`${copied.path}/../../ignored.txt`)).toBe("tracked despite ignore");
   expect(yield* fs.readFileString(`${copied.path}/../../tsconfig.json`)).toBe("{}");
-  expect(yield* fs.exists(`${copied.path}/../../.vendor`)).toBe(false);
+  expect((yield* fs.lstat(`${copied.path}/../../.vendor`)).type).toBe("SymbolicLink");
+  expect(yield* fs.realPath(`${copied.path}/../../.vendor`)).toBe(`${root}/.vendor`);
+  expect(yield* fs.readFileString(`${copied.path}/../../.vendor/checkout/index.js`)).toContain("vendored = true");
   expect(visited.some(path => path.includes("/.vendor/checkout"))).toBe(false);
   expect(yield* fs.readFileString(`${copied.path}/../../node_modules/dependency/index.js`)).toContain("dependency = true");
   expect(yield* fs.readFileString(`${copied.path}/../../node_modules/vendored/index.js`)).toContain("vendored = true");
@@ -85,8 +87,69 @@ it.live("preserves ignored workspace exports, generated files and environment wi
   expect(copiedLibrary).toBe(yield* fs.realPath(`${copied.path}/../library`));
   for (const [file, text] of Object.entries(artifacts)) expect(yield* fs.readFileString(`${copiedLibrary}/${file}`), file).toBe(text);
   expect(yield* fs.readFileString(`${copied.path}/.env.test`)).toBe("VITE_FIXTURE_VALUE=present\n");
-  expect(yield* fs.exists(`${copied.path}/../../.vendor`)).toBe(false);
+  expect((yield* fs.lstat(`${copied.path}/../../.vendor`)).type).toBe("SymbolicLink");
+  expect(yield* fs.realPath(`${copiedLibrary}/dist`)).not.toBe(`${library}/dist`);
+  yield* fs.writeFileString(`${copiedLibrary}/dist/index.js`, "scratch only");
+  expect(yield* fs.readFileString(`${library}/dist/index.js`)).toBe(artifacts["dist/index.js"]);
   expect(visited.some(path => path.includes("/.vendor/checkout"))).toBe(false);
+}).pipe(Effect.scoped, Effect.provide(NodeServices.layer)));
+
+for (const phase of ["readDirectory", "child-lstat", "ignored-lstat"] as const) it.live(`prunes unreadable ignored trees with a warning instead of falling back (${phase})`, () => Effect.gen(function* () {
+  const fs = yield* FileSystem.FileSystem;
+  const console = yield* Console.Console;
+  const root = yield* fs.realPath(yield* fs.makeTempDirectoryScoped({ prefix: "ignored-permissions-" }));
+  yield* git(root, ["init", "--quiet"]);
+  yield* fs.writeFileString(`${root}/.gitignore`, "docker-data/\n");
+  yield* fs.writeFileString(`${root}/keep.txt`, "keep");
+  yield* fs.makeDirectory(`${root}/docker-data/postgres`, { recursive: true });
+  yield* fs.writeFileString(`${root}/docker-data/postgres/data`, "not scratch input");
+  const denied = `${root}/docker-data${phase === "ignored-lstat" ? "" : "/postgres"}`;
+  const permission = (method: string) => Effect.fail(new PlatformError.PlatformError(new PlatformError.SystemError({
+    _tag: "PermissionDenied", module: "FileSystem", method, pathOrDescriptor: denied
+  })));
+  const tracked: FileSystem.FileSystem = { ...fs,
+    readDirectory: path => phase === "readDirectory" && path === denied ? permission("readDirectory") : fs.readDirectory(path),
+    lstat: path => phase !== "readDirectory" && path === denied ? permission("lstat") : fs.lstat(path)
+  };
+  const warnings: string[] = [];
+  const copied = yield* Scratch.use(scratch => scratch.acquire(root)).pipe(Effect.provide(ScratchLive),
+    Effect.provideService(FileSystem.FileSystem, tracked),
+    Effect.provideService(Console.Console, { ...console, warn: (...args: ReadonlyArray<unknown>) => { warnings.push(args.join(" ")); } }));
+  expect(yield* fs.readFileString(`${copied.path}/keep.txt`)).toBe("keep");
+  expect(yield* fs.exists(`${copied.path}/docker-data`)).toBe(false);
+  expect(warnings.some(message => message.includes("skipped an unreadable ignored tree"))).toBe(true);
+  expect(warnings.some(message => message.includes("using recursive copy"))).toBe(false);
+}).pipe(Effect.scoped, Effect.provide(NodeServices.layer)));
+
+it.live("retains relative vendor paths without walking them and refuses mutation through their links", () => Effect.gen(function* () {
+  const fs = yield* FileSystem.FileSystem;
+  const root = yield* fs.realPath(yield* fs.makeTempDirectoryScoped({ prefix: "linked-vendor-" }));
+  yield* git(root, ["init", "--quiet"]);
+  yield* fs.writeFileString(`${root}/.gitignore`, ".vendor/\n");
+  yield* fs.makeDirectory(`${root}/.vendor/shared/node_modules`, { recursive: true });
+  const original = "export const value = 1;";
+  yield* fs.writeFileString(`${root}/.vendor/shared/value.ts`, original);
+  yield* fs.writeFileString(`${root}/.vendor/shared/tsconfig.json`, '{"compilerOptions":{"strict":true}}');
+  yield* fs.writeFileString(`${root}/tsconfig.json`, '{"extends":"./.vendor/shared/tsconfig.json","compilerOptions":{"paths":{"shared/*":["./.vendor/shared/*"]}}}');
+  const visited: string[] = [];
+  const tracked: FileSystem.FileSystem = { ...fs, readDirectory: path => {
+    if (path.startsWith(`${root}/.vendor/shared`)) visited.push(path);
+    return fs.readDirectory(path);
+  } };
+  const scratch = yield* Scratch.use(Effect.succeed).pipe(Effect.provide(ScratchLive), Effect.provideService(FileSystem.FileSystem, tracked));
+  const copied = yield* scratch.acquire(root);
+  expect(yield* fs.realPath(`${copied.path}/.vendor/shared/value.ts`)).toBe(`${root}/.vendor/shared/value.ts`);
+  expect(yield* fs.readFileString(`${copied.path}/.vendor/shared/tsconfig.json`)).toContain('"strict":true');
+  const attempted = yield* copied.apply({ id: "outside", file: ".vendor/shared/value.ts", functionName: "value", returnType: "number", genre: "FnValue",
+    description: "must refuse external target", synthetic: false, span: { start: { line: 1, column: 1 }, end: { line: 1, column: 24 } },
+    replacement: { startOffset: 21, endOffset: 22, text: "2" } }).pipe(Effect.result);
+  expect(attempted._tag).toBe("Failure");
+  if (attempted._tag === "Failure") expect(attempted.failure.message).toContain("resolves outside the scratch package");
+  expect(yield* fs.readFileString(`${root}/.vendor/shared/value.ts`)).toBe(original);
+  const linkedPackage = yield* scratch.acquire(`${root}/.vendor/shared`).pipe(Effect.result);
+  expect(linkedPackage._tag).toBe("Failure");
+  if (linkedPackage._tag === "Failure") expect(linkedPackage.failure.message).toContain("refusing to mutate the original checkout");
+  expect(visited).toEqual([]);
 }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)));
 
 for (const phase of ["spawn", "rev-parse", "ls-files", "ignored-ls-files"] as const) it.live(`warns and copies recursively when Git discovery fails (${phase})`, () => Effect.gen(function* () {

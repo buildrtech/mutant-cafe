@@ -18,8 +18,10 @@ export const builtWorkspace = (withIgnoredCheckout = false) => Effect.gen(functi
     exports: { ".": { import: "./dist/index.js", default: "./dist/index.js" }, "./feature/*": "./dist/features/*.js" },
     imports: { "#generated": "./generated/value.js" } }));
   const artifacts = {
-    "dist/index.js": 'import { value } from "#generated"; import { bonus } from "../private-generated/bonus.js"; export { feature } from "./util.js"; export const answer = value + bonus;',
+    "dist/index.js": 'import { value } from "#generated"; import { bonus } from "../private-generated/bonus.js"; import { embedded } from "./node_modules/embedded/index.js"; export { feature } from "./util.js"; export const answer = value + bonus + embedded;',
     "dist/util.js": "export const feature = 5;",
+    "dist/node_modules/embedded/package.json": '{"type":"module"}',
+    "dist/node_modules/embedded/index.js": "export const embedded = 0;",
     "dist/features/extra.js": "export const extra = 17;",
     "generated/value.js": "export const value = 40;",
     "private-generated/bonus.js": "export const bonus = 2;",

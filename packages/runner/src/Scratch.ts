@@ -70,6 +70,12 @@ export const ScratchLive = Layer.effect(Scratch, Effect.gen(function* () {
       }
       let selected: Set<string> | undefined;
       let directories: Set<string> | undefined;
+      const linked = new Set<string>();
+      const unreadable = new Set<string>();
+      const pruneUnreadable = (location: string) => Effect.gen(function* () {
+        unreadable.add(location);
+        yield* Console.warn(`Warning: scratch copy skipped an unreadable ignored tree: ${location}`);
+      });
       const originalSource = source;
       const originalCopyRoot = copyRoot;
       if (inRepository) yield* Effect.gen(function* () {
@@ -101,9 +107,17 @@ export const ScratchLive = Layer.effect(Scratch, Effect.gen(function* () {
           const info = yield* fs.lstat(target).pipe(Effect.result);
           if (info._tag === "Failure") {
             if (info.failure.reason._tag === "NotFound") continue;
+            if (info.failure.reason._tag === "PermissionDenied") { yield* pruneUnreadable(target); continue; }
             return yield* info.failure;
           }
-          if (info.success.type !== "Directory" || !(yield* independent(target))) selected.add(target);
+          if (info.success.type !== "Directory") { selected.add(target); continue; }
+          const separate = yield* independent(target).pipe(Effect.result);
+          if (separate._tag === "Failure") {
+            if (separate.failure.reason._tag === "PermissionDenied") { yield* pruneUnreadable(target); continue; }
+            return yield* separate.failure;
+          }
+          if (separate.success) linked.add(target);
+          else selected.add(target);
         }
         // Ignored does not mean unused: a workspace dependency may export
         // prebuilt output. Preserve each declared entry's top-level tree so
@@ -134,7 +148,7 @@ export const ScratchLive = Layer.effect(Scratch, Effect.gen(function* () {
           }
         }
         directories = new Set([copyRoot]);
-        for (const file of selected) {
+        for (const file of [...selected, ...linked]) {
           let parent = path.dirname(file);
           while (parent !== copyRoot && parent !== path.dirname(parent)) { directories.add(parent); parent = path.dirname(parent); }
         }
@@ -144,16 +158,22 @@ export const ScratchLive = Layer.effect(Scratch, Effect.gen(function* () {
         copyRoot = originalCopyRoot;
         selected = undefined;
         directories = undefined;
+        linked.clear();
+        unreadable.clear();
       })));
       const temp = yield* Effect.acquireRelease(
         fs.makeTempDirectory({ prefix: "mutant-cafe-" }).pipe(
           Effect.mapError((error) => failure("create", source, error))),
         (dir) => fs.remove(dir, { recursive: true, force: true }).pipe(Effect.interruptible, Effect.timeout(30_000), Effect.catch(error => Console.warn(`Warning: scratch removal did not complete within its cleanup budget: ${error.message}`, { path: dir })))
       );
-      // Materialize source symlinks, except dependencies. No editable file in
-      // the scratch tree may point back into the original checkout.
+      // Materialize editable source symlinks. Dependencies and pruned trees
+      // remain linked; target() rejects writes through links out of scratch.
       const copy = (from: string, to: string, ancestors: ReadonlyArray<string>, filter = true): Effect.Effect<void, ScratchError> =>
         Effect.gen(function* () {
+          if (unreadable.has(from)) return;
+          // Declared package entry trees must be copied, even when they hold
+          // their own node_modules (for example preserveModules output).
+          if (linked.has(from) && !selected?.has(from)) { yield* fs.symlink(from, to); return; }
           const real = yield* fs.realPath(from);
           const info = yield* fs.stat(from);
           if (info.type === "Directory") {
@@ -169,7 +189,7 @@ export const ScratchLive = Layer.effect(Scratch, Effect.gen(function* () {
               // Never descend into ignored trees just to discover dependency folders.
               // Dependency links are needed only at the selected package ancestors.
               const filterChildren = filter && !selected?.has(from);
-              if (filterChildren && selected && directories && !selected.has(src) && !directories.has(src) && entry !== "node_modules") continue;
+              if (filterChildren && selected && directories && !selected.has(src) && !directories.has(src) && !linked.has(src) && entry !== "node_modules") continue;
               if (entry === "node_modules") {
                 // Own the directory so workspace/self links can point at the
                 // copied package. Linking node_modules wholesale sends tests
@@ -205,6 +225,11 @@ export const ScratchLive = Layer.effect(Scratch, Effect.gen(function* () {
       yield* copy(copyRoot, temp, []);
       const packageRoot = yield* fs.realPath(path.join(temp, path.relative(copyRoot, source))).pipe(
         Effect.mapError((error) => failure("resolve", source, error)));
+
+      const packageRelative = path.relative(yield* fs.realPath(temp), packageRoot);
+      if (packageRelative === ".." || packageRelative.startsWith(`..${path.sep}`) || path.isAbsolute(packageRelative)) {
+        return yield* new ScratchError({ operation: "resolve", path: source, message: "Requested package is inside a linked ignored tree; refusing to mutate the original checkout. Choose an editable source package outside that tree." });
+      }
 
       const originals = new Map<string, Uint8Array>();
       const target = (mutant: Mutant) => Effect.gen(function* () {
