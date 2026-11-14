@@ -35,8 +35,7 @@ export const ScratchLive = Layer.effect(Scratch, Effect.gen(function* () {
     });
   }));
 
-  return Scratch.of({
-    acquire: Effect.fn("Scratch.acquire")(function* (root: string) {
+  const discover = Effect.fn("Scratch.discover")(function* (root: string) {
       let source = path.resolve(root);
       // Preserve workspace-relative tsconfig extends and local package imports.
       // Vitest still runs in the requested package, not at the workspace root.
@@ -164,6 +163,22 @@ export const ScratchLive = Layer.effect(Scratch, Effect.gen(function* () {
         unreadable.clear();
         ignoredRoots.clear();
       })));
+      const linkedRoots = () => [...linked].filter(root => !selected?.has(root) && !unreadable.has(root)).map(root => path.relative(source, root))
+        .filter(root => root !== ".." && !root.startsWith(`..${path.sep}`) && !path.isAbsolute(root));
+      return { source, copyRoot, selected, directories, linked, unreadable, ignoredRoots, pruneUnreadable, linkedRoots };
+  }, (effect, root) => effect.pipe(Effect.mapError(error => failure("discover", root, error))));
+
+  return Scratch.of({
+    inspect: Effect.fn("Scratch.inspect")(function* (root: string) { return (yield* discover(root)).linkedRoots(); }),
+    acquire: Effect.fn("Scratch.acquire")(function* (root: string) {
+      const plan = yield* discover(root);
+      const { source, copyRoot, selected, directories, linked, unreadable, ignoredRoots, pruneUnreadable } = plan;
+      // Only failures of source-side reads may be skipped. Node's adapter uses
+      // the first argument as the error path even for copyFile/symlink writes.
+      const skipUnreadable = (from: string, to: string, enabled: boolean) => <E extends PlatformError.PlatformError | ScratchError>(effect: Effect.Effect<void, E>): Effect.Effect<void, E | PlatformError.PlatformError> => effect.pipe(Effect.catch((error): Effect.Effect<void, E | PlatformError.PlatformError> =>
+        enabled && error._tag === "PlatformError" && error.reason._tag === "PermissionDenied" && error.reason.pathOrDescriptor === from
+          && ["access", "realPath", "stat", "lstat", "readDirectory"].includes(error.reason.method)
+          ? pruneUnreadable(from).pipe(Effect.andThen(fs.remove(to, { recursive: true, force: true }))) : Effect.fail(error)));
       const temp = yield* Effect.acquireRelease(
         fs.makeTempDirectory({ prefix: "mutant-cafe-" }).pipe(
           Effect.mapError((error) => failure("create", source, error))),
@@ -197,7 +212,7 @@ export const ScratchLive = Layer.effect(Scratch, Effect.gen(function* () {
                 // Own the directory so workspace/self links can point at the
                 // copied package. Linking node_modules wholesale sends tests
                 // importing their package name back to the original checkout.
-                const linkDependencies = (from: string, to: string): Effect.Effect<void, PlatformError.PlatformError> => Effect.gen(function* () {
+                const linkDependencies = (from: string, to: string, ignored: boolean): Effect.Effect<void, PlatformError.PlatformError> => Effect.gen(function* () {
                   yield* fs.makeDirectory(to, { recursive: true });
                   for (const name of yield* fs.readDirectory(from)) {
                     if ([".vite", ".vite-temp", ".vitest", ".cache"].includes(name)) continue;
@@ -205,7 +220,7 @@ export const ScratchLive = Layer.effect(Scratch, Effect.gen(function* () {
                     const destination = path.join(to, name);
                     yield* Effect.gen(function* () {
                       if (name.startsWith("@")) {
-                        yield* linkDependencies(dependency, destination);
+                        yield* linkDependencies(dependency, destination, ignored);
                         return;
                       }
                       const realDependency = yield* fs.realPath(dependency);
@@ -213,20 +228,19 @@ export const ScratchLive = Layer.effect(Scratch, Effect.gen(function* () {
                       const inside = rel !== ".." && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel) && !rel.split(path.sep).includes("node_modules")
                         && (!selected || selected.has(realDependency) || directories?.has(realDependency));
                       yield* fs.symlink(inside ? path.join(temp, rel) : realDependency, destination);
-                    }).pipe(skipVanished(dependency, destination));
+                    }).pipe(skipVanished(dependency, destination), skipUnreadable(dependency, destination, ignored));
                   }
                 });
-                yield* linkDependencies(src, dest).pipe(skipVanished(src, dest));
+                yield* linkDependencies(src, dest, ignored || ignoredRoots.has(from)).pipe(skipVanished(src, dest), skipUnreadable(src, dest, ignored || ignoredRoots.has(from)));
               } else {
                 yield* copy(src, dest, [...ancestors, real], filterChildren, ignored || ignoredRoots.has(from));
               }
             }
           } else if (info.type === "File") {
+            if (ignored || ignoredRoots.has(from)) yield* fs.access(from, { readable: true });
             yield* fs.copyFile(from, to);
           }
-        }).pipe(skipVanished(from, to), Effect.catch(error => error._tag === "PlatformError" && error.reason._tag === "PermissionDenied" && (ignored || ignoredRoots.has(from))
-          ? pruneUnreadable(from).pipe(Effect.andThen(fs.remove(to, { recursive: true, force: true })))
-          : Effect.fail(error)), Effect.mapError((error) => failure("copy", from, error)));
+        }).pipe(skipVanished(from, to), skipUnreadable(from, to, ignored || ignoredRoots.has(from)), Effect.mapError((error) => failure("copy", from, error)));
       yield* copy(copyRoot, temp, []);
       const packageRoot = yield* fs.realPath(path.join(temp, path.relative(copyRoot, source))).pipe(
         Effect.mapError((error) => failure("resolve", source, error)));
@@ -253,8 +267,7 @@ export const ScratchLive = Layer.effect(Scratch, Effect.gen(function* () {
       });
       const dir: ScratchDir = {
         path: packageRoot,
-        linkedRoots: [...linked].filter(root => !selected?.has(root) && !unreadable.has(root)).map(root => path.relative(source, root))
-          .filter(root => root !== ".." && !root.startsWith(`..${path.sep}`) && !path.isAbsolute(root)),
+        linkedRoots: plan.linkedRoots(),
         apply: Effect.fn("Scratch.apply")(function* (mutant: Mutant) {
           const location = yield* target(mutant);
           const bytes = yield* fs.readFile(location);

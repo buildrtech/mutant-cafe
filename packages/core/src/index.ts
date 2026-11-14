@@ -3,3 +3,4 @@ export * from "./Errors.ts";
 export * from "./Mutant.ts";
 export * from "./Services.ts";
 export * from "./Telemetry.ts";
+export * from "./Selection.ts";
