@@ -7,6 +7,7 @@ import {
 import { createEffectActor, createEffectLogic, join, send, setupEffect } from "@xstate/effect";
 import { types } from "xstate";
 import * as Effect from "effect/Effect";
+import * as Console from "effect/Console";
 import * as Pool from "effect/Pool";
 import * as Path from "effect/Path";
 import * as Result from "effect/Result";
@@ -139,6 +140,7 @@ export const runMutants = Effect.fn("Runner.runMutants")(function* (
       baseline = { ...baseline, ...selected };
       yield* input.updateBaseline(baseline);
     }
+    if (!config.cold && !config.warm) yield* Console.warn(`Vitest auto mode: ${baseline.runnerMode ?? "cold"}; ${baseline.runnerModeReason ?? "Cold execution; no warm session"}`);
     // Measure the original related selection once per file before applying any
     // mutant. Slow unrelated tests must not manufacture a caught never mutant.
     const neverBudgets = new Map<string, number>();

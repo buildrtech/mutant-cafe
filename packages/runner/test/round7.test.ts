@@ -39,14 +39,13 @@ for (const error of [
   if (result._tag === "Failure") expect(result.failure._tag).toBe("TestSpawnError");
 }));
 
-it.live("keeps dangling source symlinks as copy failures", () => Effect.gen(function* () {
+it.live("skips dangling source symlinks without changing the source", () => Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem;
   const root = yield* fs.makeTempDirectoryScoped({ prefix: "scratch-dangling-" });
   yield* fs.symlink(`${root}/absent`, `${root}/dangling`);
   const scratch = yield* Scratch.use(Effect.succeed).pipe(Effect.provide(ScratchLive));
-  const result = yield* scratch.acquire(root).pipe(Effect.result);
-  expect(result._tag).toBe("Failure");
-  if (result._tag === "Failure") expect(result.failure.message).toContain("NotFound");
+  const copied = yield* scratch.acquire(root);
+  expect(yield* fs.exists(`${copied.path}/dangling`)).toBe(false);
   expect((yield* fs.lstat(`${root}/dangling`)).type).toBe("SymbolicLink");
 }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)));
 

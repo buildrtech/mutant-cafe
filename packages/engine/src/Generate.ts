@@ -85,12 +85,12 @@ export function* generateFunction(fn: MutableFunction): Generator<Mutant, string
       break;
     }
     case "Void":
-      yield makeMutant(fn, "FnValue", "{}", false, "an empty body");
+      if (!fn.equivalentValues.includes("{}")) yield makeMutant(fn, "FnValue", "{}", false, "an empty body");
       break;
     default: {
       const genre = shape.kind === "Boolean" ? "BooleanFlip" : shape.kind === "Literal" ? "LiteralCycle" : "FnValue";
       for (const value of values) {
-        if (value.text === fn.literal) continue;
+        if (value.text === fn.literal || fn.equivalentValues.includes(value.text)) continue;
         yield candidate(genre, value.text, value);
       }
     }

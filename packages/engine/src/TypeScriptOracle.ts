@@ -29,6 +29,9 @@ class ProgramSession {
     if (config.error) throw new ProgramLoadError({ tsconfig: configPath, diagnostics: diagnosticsText([config.error]) });
     const parsed = ts.parseJsonConfigFileContent(config.config, ts.sys, resolve(configPath, ".."));
     if (parsed.errors.length) throw new ProgramLoadError({ tsconfig: configPath, diagnostics: diagnosticsText(parsed.errors) });
+    // Analysis never emits or persists build state, even for incremental/noEmit projects.
+    parsed.options.incremental = false;
+    delete parsed.options.tsBuildInfoFile;
     this.host = ts.createCompilerHost(parsed.options, true);
     const read = this.host.getSourceFile;
     this.host.getSourceFile = (file, languageVersion, onError, shouldCreateNewSourceFile) => {
@@ -125,19 +128,20 @@ export function makeTypeScriptOracle(): TypeOracle {
                   const b = source.getLineAndCharacterOfPosition(end);
                   const beforePipeables = wrapped && ts.isFunctionExpression(node) ? generatorContract(node, checker) : undefined;
                   const shape = beforePipeables?.shape ?? shapeOf(type, checker, node, body);
-                  const originals = equivalentSuccessValues(body, api);
+                  const originals = generator ? equivalentLiteralValues(body) : equivalentSuccessValues(body, checker);
                   if ((!beforePipeables && (type.flags & ts.TypeFlags.TypeParameter) && !("values" in shape && shape.values.length)) || (beforePipeables ? !nameableContract(beforePipeables, checker, node) : hasUnnameableType(type, checker, node))) {
                     notMutated.push({ file, functionName: name, span: nodeSpan(node), reason: "generic: naked or context-only type-parameter return" });
                   } else found.push({
                     file, name, functionLike: true, functionSpan: nodeSpan(body), generationIssue: () => typedCallIssue(body, checker), notices: shapeNotices(shape, type, checker, node), returnType: beforePipeables?.text ?? returnTypeText(type, checker, node),
                     displayReturnType: node.type?.getText(source) ?? checker.typeToString(type, node),
                     skipReason: beforePipeables ? `no synthesizable generator success value: ${beforePipeables.text}` : synthesisReason(type, checker, node),
-                    equivalentValues: shape.kind === "Effect" ? shape.values.filter((value) => isEquivalentSuccess(value.text, originals)).map((value) => value.text) : [],
+                    equivalentValues: shape.kind === "Void" && ts.isBlock(body) && body.statements.length === 0 ? ["{}"]
+                      : "values" in shape ? shape.values.filter((value) => isEquivalentSuccess(value.text, shape.kind === "Effect" ? originals : equivalentLiteralValues(body))).map((value) => value.text) : [],
                     span: { start: { line: a.line + 1, column: a.character + 1 }, end: { line: b.line + 1, column: b.character + 1 } },
                     startOffset: start, endOffset: end, original: body.getText(source),
                     identityFile: local, logicalSpan: { offset: start - node.getStart(source), length: end - start },
                     sourcePrefix: source.text.slice(0, start), importInsertionOffset: importInsertionOffset(source), extraImports: mutationImports(source),
-                    literal: literalOfBody(body, checker),
+                    literal: literalOfBody(body),
                     block: ts.isBlock(body), generator: generator !== undefined,
                     shape, api,
                   });
@@ -434,13 +438,17 @@ function generatorContract(node: ts.FunctionExpression, checker: ts.TypeChecker)
   };
 }
 
-function literalOfBody(body: ts.ConciseBody, checker: ts.TypeChecker): string | undefined {
-  const first = ts.isBlock(body) && body.statements.length === 1 ? body.statements[0] : undefined;
-  const expression = ts.isBlock(body) ? first && ts.isReturnStatement(first) ? first.expression : undefined : body;
+function literalOfBody(body: ts.ConciseBody): string | undefined {
+  const expression = returnedExpression(body);
   if (!expression) return undefined;
-  const type = checker.getTypeAtLocation(expression);
-  return type.isStringLiteral() ? JSON.stringify(type.value) : type.isNumberLiteral() ? String(type.value)
-    : type.flags & ts.TypeFlags.BooleanLiteral ? checker.typeToString(type) : undefined;
+  // Type assertions do not change runtime values. Never infer equivalence
+  // from the return type of a call, getter, or an assertion to another literal.
+  if (ts.isStringLiteral(expression)) return JSON.stringify(expression.text);
+  if (ts.isNumericLiteral(expression)) return String(Number(expression.text));
+  if (expression.kind === ts.SyntaxKind.TrueKeyword) return "true";
+  if (expression.kind === ts.SyntaxKind.FalseKeyword) return "false";
+  if (expression.kind === ts.SyntaxKind.NullKeyword) return "null";
+  return undefined;
 }
 
 function generatorBody(node: FunctionNode, checker: ts.TypeChecker): ts.FunctionExpression | undefined {
@@ -662,10 +670,13 @@ function returnTypeText(type: ts.Type, checker: ts.TypeChecker, node: ts.Node): 
 // Compare only literal data, never evaluate user code. Canonical keys make
 // differently quoted object literals equivalent without treating calls as equal.
 function literalData(node: ts.Node): unknown {
-  if (ts.isParenthesizedExpression(node) || ts.isAsExpression(node) || ts.isSatisfiesExpression(node)) return literalData(node.expression);
+  if (ts.isParenthesizedExpression(node) || ts.isAsExpression(node) || ts.isSatisfiesExpression(node) || ts.isTypeAssertionExpression(node) || ts.isNonNullExpression(node)) return literalData(node.expression);
   if (ts.isStringLiteral(node) || ts.isNumericLiteral(node)) return [node.kind, node.text];
   if (ts.isIdentifier(node) && node.text === "undefined") return ["undefined"];
-  if (ts.isPrefixUnaryExpression(node)) return [node.operator, literalData(node.operand)];
+  if (ts.isPrefixUnaryExpression(node)) {
+    const operand = literalData(node.operand);
+    return operand === undefined ? undefined : [node.operator, operand];
+  }
   if (ts.isArrayLiteralExpression(node)) {
     const items = node.elements.map(literalData);
     return items.every(item => item !== undefined) ? ["array", items] : undefined;
@@ -684,17 +695,62 @@ function literalData(node: ts.Node): unknown {
   return undefined;
 }
 
-function equivalentSuccessValues(body: ts.ConciseBody, api: MutableFunction["api"]): ReadonlyArray<string> {
-  const values: string[] = [];
-  const visit = (node: ts.Node): void => {
-    if (ts.isCallExpression(node) && node.expression.getText() === api("Effect", "succeed") && node.arguments[0]) {
-      const value = literalData(node.arguments[0]);
-      if (value !== undefined) values.push(JSON.stringify(value));
-    }
-    ts.forEachChild(node, visit);
+function unwrapped(node: ts.Expression): ts.Expression {
+  while (ts.isParenthesizedExpression(node) || ts.isAsExpression(node) || ts.isSatisfiesExpression(node) || ts.isTypeAssertionExpression(node) || ts.isNonNullExpression(node)) node = node.expression;
+  return node;
+}
+
+function returnedExpression(body: ts.ConciseBody): ts.Expression | undefined {
+  if (!ts.isBlock(body)) return unwrapped(body);
+  const statement = body.statements.length === 1 ? body.statements[0] : undefined;
+  return statement && ts.isReturnStatement(statement) && statement.expression ? unwrapped(statement.expression) : undefined;
+}
+
+function equivalentLiteralValues(body: ts.ConciseBody): ReadonlyArray<string> {
+  const expression = returnedExpression(body);
+  const value = expression && literalData(expression);
+  return value === undefined ? [] : [JSON.stringify(value)];
+}
+
+/** Only a direct, pure constructor is a no-op. Nested successes, taps and
+ * statements before a return are observable work, not equivalent bodies. */
+function equivalentSuccessValues(body: ts.ConciseBody, checker: ts.TypeChecker): ReadonlyArray<string> {
+  const expression = returnedExpression(body);
+  if (!expression) return [];
+  const namespace = (node: ts.Expression, seen = new Set<ts.Symbol>()): boolean => {
+    node = unwrapped(node);
+    if (!ts.isIdentifier(node) && !ts.isPropertyAccessExpression(node)) return false;
+    // A receiver such as getEffect().succeed may itself do observable work.
+    if (ts.isPropertyAccessExpression(node) && !namespace(node.expression, seen)) return false;
+    let symbol = checker.getSymbolAtLocation(ts.isPropertyAccessExpression(node) ? node.name : node);
+    if (!symbol || seen.has(symbol)) return false;
+    seen.add(symbol);
+    if (symbol.flags & ts.SymbolFlags.Alias) symbol = checker.getAliasedSymbol(symbol);
+    return symbol.declarations?.some(declaration => {
+      if (ts.isSourceFile(declaration)) return /(?:^|\/)effect\/(?:.*\/)?(?:Effect|index)\.(?:d\.)?ts$/.test(declaration.fileName);
+      return ts.isVariableDeclaration(declaration) && !!declaration.initializer && ts.isVariableDeclarationList(declaration.parent)
+        && !!(declaration.parent.flags & ts.NodeFlags.Const) && namespace(declaration.initializer, seen);
+    }) ?? false;
   };
-  visit(body);
-  return values;
+  const member = (node: ts.Expression, seen = new Set<ts.Symbol>()): string | undefined => {
+    node = unwrapped(node);
+    if (!ts.isIdentifier(node) && !ts.isPropertyAccessExpression(node)) return undefined;
+    if (ts.isPropertyAccessExpression(node) && !namespace(node.expression)) return undefined;
+    let symbol = checker.getSymbolAtLocation(ts.isPropertyAccessExpression(node) ? node.name : node);
+    if (!symbol || seen.has(symbol)) return undefined;
+    seen.add(symbol);
+    if (symbol.flags & ts.SymbolFlags.Alias) symbol = checker.getAliasedSymbol(symbol);
+    for (const declaration of symbol.declarations ?? []) {
+      if (/(?:^|\/)effect\/(?:.*\/)?Effect\.(?:d\.)?ts$/.test(declaration.getSourceFile().fileName)) return symbol.name === "void_" ? "void" : symbol.name;
+      if (ts.isVariableDeclaration(declaration) && declaration.initializer && ts.isVariableDeclarationList(declaration.parent)
+        && declaration.parent.flags & ts.NodeFlags.Const) return member(declaration.initializer, seen);
+    }
+    return undefined;
+  };
+  if (member(expression) === "void") return [JSON.stringify(["undefined"])];
+  if (!ts.isCallExpression(expression) || expression.arguments.length !== 1 || member(expression.expression) !== "succeed") return [];
+  const value = literalData(expression.arguments[0]!);
+  return value === undefined ? [] : [JSON.stringify(value)];
 }
 
 function isEquivalentSuccess(text: string, values: ReadonlyArray<string>): boolean {
