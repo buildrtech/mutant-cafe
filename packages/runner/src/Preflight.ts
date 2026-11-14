@@ -1,4 +1,4 @@
-import { DEFAULT_BASELINE_TIMEOUT_MS, SelectionIssue, type Baseline } from "@mutant-cafe/core";
+import { DEFAULT_BASELINE_TIMEOUT_MS, SelectionIssue, TestSpawnError, type Baseline } from "@mutant-cafe/core";
 import * as Effect from "effect/Effect";
 import * as Clock from "effect/Clock";
 import * as Schema from "effect/Schema";
@@ -26,6 +26,14 @@ if (otherRunner) {
   issues.push({ kind: "runner", reason: 'package.json scripts.test = ' + JSON.stringify(script) + '; mutant.cafe only runs Vitest' });
 } else {
   if (!vitestScript) issues.push({ kind: "warning", reason: 'package.json scripts.test = ' + JSON.stringify(script) + (delegated ? '; delegated test runner: Vitest selection is unverified' : '; unknown test wrapper: Vitest selection is unverified') });
+  // Resolve from the adopter's package, not mutant.cafe's bundled dependencies.
+  const require = createRequire(resolve(root, "package.json"));
+  let version;
+  try { version = JSON.parse(await readFile(require.resolve("vitest/package.json"), "utf8")).version; } catch {}
+  if (typeof version === "string" && /^\d+\./.test(version) && Number(version.split(".")[0]) < 5) {
+    console.log("mutant-cafe-vitest-version:" + JSON.stringify(version));
+    process.exit(0);
+  }
   let ctx;
   try {
     const { createVitest } = await import("vitest/node");
@@ -160,6 +168,11 @@ export const preflight = Effect.fn("TestRunner.preflight")(function* (root: stri
   yield* owned.trace("preflight-start", { budgetMs: timeoutMs });
   const output = yield* spawner.string(ChildProcess.make(process.execPath, ["--input-type=module", "--eval", probe, tsconfig], { cwd: root, env: owned.env, detached: true, killSignal: "SIGKILL", forceKillAfter: "100 millis", stdin: "ignore" })).pipe(Effect.onInterrupt(() => owned.cleanup));
   yield* owned.trace("preflight-done");
+  const version = output.split("\n").find(line => line.startsWith("mutant-cafe-vitest-version:"))?.slice("mutant-cafe-vitest-version:".length);
+  if (version !== undefined) {
+    const found = yield* Schema.decodeEffect(Schema.fromJsonString(Schema.String))(version);
+    return yield* new TestSpawnError({ kind: "vitest-version", command: ["vitest"], message: `mutant.cafe needs vitest >= 5.0, found ${found}` });
+  }
   const encoded = output.split("\n").find(line => line.startsWith("mutant-cafe-preflight:"))?.slice("mutant-cafe-preflight:".length);
   const issues = encoded === undefined
     ? [{ kind: "warning" as const, reason: "Vitest selection probe returned no evidence" }]

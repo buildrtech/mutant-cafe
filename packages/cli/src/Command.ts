@@ -186,6 +186,7 @@ export const runCli = Effect.fn("runCli")(function*(options: {
   yield* Command.runWith(command, { version: "0.1.6" })(options.args).pipe(
     Effect.catch((error) => Effect.gen(function*() {
       yield* Console.error(error._tag === "ProgramLoadError" ? `${error.tsconfig}:\n${error.diagnostics.join("\n")}`
+        : error._tag === "TestSpawnError" && error.kind === "vitest-version" ? error.message
         : error._tag === "BaselineTimedOut" ? error.message
         : error._tag === "BaselineFailed" ? `Baseline failed (${error.exitCode}): ${formatTestCommand(error.command)}\n${error.output.slice(-8000)}`
         : String(error));

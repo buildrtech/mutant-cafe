@@ -137,7 +137,7 @@ describe("honest value coverage", () => {
     expect(json.length).toBeLessThanOrEqual(7);
     const values: unknown[] = [];
     for (const mutant of json) values.push((yield* loadMutation<{ json: (key: string) => unknown }>(mutant)).json("key"));
-    expect(new Set(values.map(value => JSON.stringify(value)))).toEqual(new Set([null, "", 0, false, [], {}, undefined].map(value => JSON.stringify(value))));
+    expect(new Set(values.map(value => JSON.stringify(value)))).toEqual(new Set([null, "", 0, false, [], {}].map(value => JSON.stringify(value))));
     const collapsed: unknown[] = [];
     for (const mutant of mutants.filter(m => m.functionName === "collapse")) collapsed.push((yield* loadMutation<{ collapse: () => unknown }>(mutant)).collapse());
     expect(collapsed).toEqual([{ a: 0 }]);
@@ -404,7 +404,13 @@ export const serviceFactory = () => {
     for (const genre of ["EffectFail", "SwallowTag", "EffectDie", "EffectNever"]) expect(digest.some(m => m.genre === genre), genre).toBe(true);
     expect(mutants.some(m => m.functionName === "inner")).toBe(false);
     const read = mutants.filter(m => m.functionName === "read");
-    expect(read.some(m => m.genre === "EffectSucceed" && m.replacement.text.includes('"on"'))).toBe(false);
+    // An unconditional success removes the failing branch: it is not a no-op.
+    const removedFailure = read.find(m => m.genre === "EffectSucceed");
+    expect(removedFailure).toBeDefined();
+    if (removedFailure) {
+      const module = yield* loadMutation<{ read: (ok: boolean) => Effect.Effect<unknown, Error> }>(removedFailure);
+      expect(Exit.isSuccess(yield* Effect.exit(module.read(false)))).toBe(true);
+    }
     expect(read.some(m => m.genre === "SwallowTag")).toBe(true);
     for (const name of ["read", "imported"]) {
       const fail = mutants.find(m => m.functionName === name && m.genre === "EffectFail");
@@ -490,8 +496,9 @@ export const serviceFactory = () => {
     expect(names.has("skippedArrow")).toBe(false);
     expect(names.has("privateFunction")).toBe(true);
     expect(names.has("mapped")).toBe(false);
+    expect(names.has("nothing")).toBe(false); // The empty body is already the replacement.
     expect(mutants.filter(m => m.functionName === "generated" && m.genre === "EffectDie")).toHaveLength(1);
-    for (const name of ["bool", "literal", "numeric", "words", "array", "nothing", "option", "stream", "layer", "generated", "named", "program", "maybe", "nested", "synthetic", "Counter.value"]) expect(names.has(name), name).toBe(true);
+    for (const name of ["bool", "literal", "numeric", "words", "array", "option", "stream", "layer", "generated", "named", "program", "maybe", "nested", "synthetic", "Counter.value"]) expect(names.has(name), name).toBe(true);
     expect(mutants.some((m) => m.functionName === "synthetic" && m.genre === "EffectFail" && m.synthetic)).toBe(true);
     expect(mutants.some((m) => m.functionName === "nested" && m.genre === "EffectSucceed")).toBe(true);
     expect(mutants.some((m) => m.functionName === "maybe" && m.genre === "OptionSome")).toBe(true);

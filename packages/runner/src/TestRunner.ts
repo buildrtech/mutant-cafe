@@ -215,12 +215,12 @@ export const TestRunnerLive = Layer.effect(TestRunner, Effect.gen(function* () {
     baseline: Effect.fn("TestRunner.baseline")(function* (dir: ScratchDir, tsconfig?: string, timeoutMs = DEFAULT_BASELINE_TIMEOUT_MS) {
       baselineBudgetMs = timeoutMs;
       lastCommands.delete(dir.path);
-      const unreliable: ReadonlyArray<SelectionIssue> = yield* preflight(dir.path, tsconfig, timeoutMs, { processesSince: openedAt.get(dir.path), onBackstop: onBackstop(dir.path) }).pipe(Effect.provideService(FileSystem.FileSystem, fs), Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner), Effect.catch(error => Effect.succeed([{ kind: "warning" as const, reason: `Cannot verify runner selection: ${String(error)}` }])));
+      const unreliable: ReadonlyArray<SelectionIssue> = yield* preflight(dir.path, tsconfig, timeoutMs, { processesSince: openedAt.get(dir.path), onBackstop: onBackstop(dir.path) }).pipe(Effect.provideService(FileSystem.FileSystem, fs), Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner), Effect.catch(error => error._tag === "TestSpawnError" && error.kind === "vitest-version" ? Effect.fail(error) : Effect.succeed([{ kind: "warning" as const, reason: `Cannot verify runner selection: ${String(error)}` }])));
       for (const issue of unreliable) yield* Console.warn(`Warning (${issue.kind}): ${issue.reason}`);
       if (unreliable.some(issue => issue.kind === "runner")) {
         const command = ["npx", "--no", "vitest", "run", "--passWithNoTests"];
         yield* Console.warn(`Baseline command (not executed: unsupported runner): ${command.join(" ")}`);
-        return { durationMs: 0, testCommand: command, unreliable };
+        return { durationMs: 0, testCommand: command, unreliable, runnerMode: "cold" as const, runnerModeReason: "Unsupported test runner" };
       }
       const run = yield* execute(dir, ["run", "--passWithNoTests"], undefined, undefined, auto.has(dir.path));
       if (run.status === "timedOut") return yield* baselineTimedOut(timeoutMs, run.command);
@@ -246,7 +246,6 @@ export const TestRunnerLive = Layer.effect(TestRunner, Effect.gen(function* () {
       if (mutants <= (primer.testFiles?.length ?? 0)) {
         modeReason = `Auto: small selection (${mutants} testable mutants across ${primer.testFiles?.length ?? 0} files)`;
         yield* disable;
-        yield* Console.warn(`Vitest auto mode: cold; small selection (${mutants} testable mutants across ${primer.testFiles?.length ?? 0} files), skipping paired calibration`);
         return { runnerMode: "cold" as const, runnerModeReason: modeReason, testableMutants: mutants };
       }
       // A successful primer warmed the filesystem for BOTH measured runs.
@@ -267,7 +266,6 @@ export const TestRunnerLive = Layer.effect(TestRunner, Effect.gen(function* () {
       modeReason = warmDisabled ? (modeReason ?? "Warm execution failed during calibration") : !sameSelection || warm.status !== cold.status ? "Auto: cold/warm selection or status mismatch" : `Auto: paired measurements favor ${choice}`;
       automaticMode = choice;
       auto.clear();
-      yield* Console.warn(`Vitest auto mode: ${choice}; paired cold ${cold.durationMs} ms, warm ${warm.durationMs} ms; ${mutants} testable mutants, ${copies} copies, startup ${calibration.warmStartupMs} ms`);
       if (choice === "cold") yield* disable;
       else if (sessions.has(dir.path)) yield* sessions.get(dir.path)!.invalidate(warm.testFiles?.[0] ?? "package.json");
       const run = choice === "cold" ? cold : warm;

@@ -7,6 +7,7 @@ import {
 import { createEffectActor, createEffectLogic, join, send, setupEffect } from "@xstate/effect";
 import { types } from "xstate";
 import * as Effect from "effect/Effect";
+import * as Console from "effect/Console";
 import * as Pool from "effect/Pool";
 import * as Path from "effect/Path";
 import * as Result from "effect/Result";
@@ -84,13 +85,27 @@ export const runMutants = Effect.fn("Runner.runMutants")(function* (
   } }) => capture(Effect.gen(function* () {
     const dirs = input.state.pool?.value;
     if (dirs === undefined) return yield* Effect.die("Missing scratch pool");
+    // Exclude original-path links before viability, calibration or poisoning.
+    // Reuse the existing SKIP event: linked files are not failed mutations.
+    const linkedRoots = yield* Effect.scoped(Pool.get(dirs).pipe(Effect.map(dir => dir.linkedRoots ?? [])));
+    const pending: Mutant[] = [];
+    for (const mutant of input.state.pending) {
+      const file = path.isAbsolute(mutant.file) ? path.relative(config.root, mutant.file) : mutant.file;
+      const linked = linkedRoots.some(root => {
+        const relative = path.relative(root, file);
+        return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+      });
+      if (linked) yield* input.skip({ file: path.resolve(config.root, file), functionName: mutant.functionName, span: mutant.span,
+        reason: "Source is in a linked ignored tree; original files are not mutation targets" });
+      else pending.push(mutant);
+    }
     let baseline = input.state.baseline;
     const viabilityById = new Map<string, Effect.Success<ReturnType<typeof source.checkViable>>>();
     // Auto needs a count before sampling; forced modes check inside the jobs
     // stream so oracle work overlaps native test processes. Auto preflight is
     // concurrent too, and reports rejected candidates as soon as they finish.
     const preReported = new Set<string>();
-    if (!config.cold && !config.warm && tests.calibrate) yield* Effect.forEach(input.state.pending, mutant => Effect.gen(function* () {
+    if (!config.cold && !config.warm && tests.calibrate) yield* Effect.forEach(pending, mutant => Effect.gen(function* () {
       const viability = yield* source.checkViable(mutant);
       viabilityById.set(mutant.id, viability);
       if (viability.analysisFailed) { preReported.add(mutant.id); yield* input.skip(viability.analysisFailed); }
@@ -107,7 +122,7 @@ export const runMutants = Effect.fn("Runner.runMutants")(function* (
     if (input.state.baseline.probeSupported && selectRelated && probeReachability) {
       const seen = new Set<string>();
       const builtTests = input.state.baseline.unreliable?.flatMap(issue => issue.kind === "built" ? issue.testFiles : []) ?? [];
-      for (const mutant of input.state.pending) {
+      for (const mutant of pending) {
         if (viabilityById.has(mutant.id) && !viabilityById.get(mutant.id)?.viable) continue;
         const file = path.isAbsolute(mutant.file) ? path.relative(config.root, mutant.file) : mutant.file;
         if (seen.has(file)) continue;
@@ -128,7 +143,7 @@ export const runMutants = Effect.fn("Runner.runMutants")(function* (
     }
     const calibrate = tests.calibrate;
     if (calibrate) {
-      const testable = input.state.pending.filter(mutant => {
+      const testable = pending.filter(mutant => {
         const file = path.isAbsolute(mutant.file) ? path.relative(config.root, mutant.file) : mutant.file;
         return viabilityById.get(mutant.id)?.viable && !unreachable.has(file) && !unreliableFor(baseline, file).length;
       }).length;
@@ -139,13 +154,14 @@ export const runMutants = Effect.fn("Runner.runMutants")(function* (
       baseline = { ...baseline, ...selected };
       yield* input.updateBaseline(baseline);
     }
+    if (!config.cold && !config.warm) yield* Console.warn(`Vitest auto mode: ${baseline.runnerMode ?? "cold"}; ${baseline.runnerModeReason ?? "Cold execution; no warm session"}`);
     // Measure the original related selection once per file before applying any
     // mutant. Slow unrelated tests must not manufacture a caught never mutant.
     const neverBudgets = new Map<string, number>();
     const neverLimits = new Map<string, number>();
     const neverBases = new Map<string, number>();
     const neverAllowances = new Map<string, number>();
-    for (const mutant of input.state.pending) {
+    for (const mutant of pending) {
       if (viabilityById.has(mutant.id) && !viabilityById.get(mutant.id)?.viable) continue;
       if (unreachable.has(path.isAbsolute(mutant.file) ? path.relative(config.root, mutant.file) : mutant.file)) continue;
       if (mutant.genre !== "EffectNever" || neverBudgets.has(mutant.file) || unreliableFor(input.state.baseline, path.isAbsolute(mutant.file) ? path.relative(config.root, mutant.file) : mutant.file).length > 0) continue;
@@ -175,7 +191,7 @@ export const runMutants = Effect.fn("Runner.runMutants")(function* (
       const explicit = Object.entries(baseline.testTimeoutDetails ?? {}).filter(([key, value]) => value > 0 && measured.testTimeoutDetails?.[key] === value).map(([, value]) => value);
       neverLimits.set(mutant.file, Math.max(0, ...explicit));
     }
-    yield* Stream.fromIterable(input.state.pending).pipe(
+    yield* Stream.fromIterable(pending).pipe(
       Stream.mapEffect((mutant) => Effect.scoped(Effect.gen(function* () {
         if (preReported.has(mutant.id)) return;
         const viability = viabilityById.get(mutant.id) ?? (yield* source.checkViable(mutant));

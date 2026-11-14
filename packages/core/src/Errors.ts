@@ -30,7 +30,7 @@ export class ScratchError extends Schema.TaggedError<ScratchError>()("ScratchErr
 }) {}
 
 export class TestSpawnError extends Schema.TaggedError<TestSpawnError>()("TestSpawnError", {
-  kind: Schema.optional(Schema.Literal("reporter")),
+  kind: Schema.optional(Schema.Literals(["reporter", "vitest-version"])),
   command: Schema.Array(Schema.String),
   message: Schema.String,
 }) {}

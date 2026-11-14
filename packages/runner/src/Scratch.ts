@@ -5,11 +5,16 @@ import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
 import type * as PlatformError from "effect/PlatformError";
+import * as ChildProcess from "effect/process/ChildProcess";
+import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
+import * as Stream from "effect/Stream";
+import * as Schema from "effect/Schema";
 import { poisonInsertion } from "./Poison.ts";
 
 export const ScratchLive = Layer.effect(Scratch, Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
+  const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
   const failure = (operation: string, location: string, error: { readonly message: string }) =>
     new ScratchError({ operation, path: location, message: error.message });
 
@@ -17,8 +22,13 @@ export const ScratchLive = Layer.effect(Scratch, Effect.gen(function* () {
     if (error._tag !== "PlatformError" || error.reason._tag !== "NotFound") return Effect.fail(error);
     return Effect.gen(function* () {
       const entry = yield* fs.lstat(from).pipe(Effect.result);
-      if (entry._tag === "Success") return yield* Effect.fail(error); // Includes dangling symlinks: the source entry still exists.
-      if (entry.failure.reason._tag !== "NotFound") return yield* Effect.fail(entry.failure);
+      if (entry._tag === "Success") {
+        if (entry.success.type !== "SymbolicLink") return yield* Effect.fail(error);
+        const target = yield* fs.stat(from).pipe(Effect.result);
+        if (target._tag === "Success") return yield* Effect.fail(error);
+        if (target.failure.reason._tag !== "NotFound") return yield* Effect.fail(target.failure);
+        yield* Console.warn(`Warning: scratch copy skipped a dangling symlink: ${from}`);
+      } else if (entry.failure.reason._tag !== "NotFound") return yield* Effect.fail(entry.failure);
       // Only our partial destination is removed, never a source entry.
       yield* fs.remove(to, { recursive: true, force: true });
       yield* Effect.logDebug("Scratch copy skipped a vanished source", { source: from });
@@ -27,7 +37,7 @@ export const ScratchLive = Layer.effect(Scratch, Effect.gen(function* () {
 
   return Scratch.of({
     acquire: Effect.fn("Scratch.acquire")(function* (root: string) {
-      const source = path.resolve(root);
+      let source = path.resolve(root);
       // Preserve workspace-relative tsconfig extends and local package imports.
       // Vitest still runs in the requested package, not at the workspace root.
       let copyRoot = source;
@@ -41,15 +51,132 @@ export const ScratchLive = Layer.effect(Scratch, Effect.gen(function* () {
         if (parent === ancestor) break;
         ancestor = parent;
       }
+      const git = (args: ReadonlyArray<string>, cwd = source) => Effect.scoped(Effect.gen(function* () {
+        const env = { ...process.env };
+        for (const key of ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"]) delete env[key];
+        const child = yield* spawner.spawn(ChildProcess.make("git", ["-C", cwd, ...args], { stdin: "ignore", env, extendEnv: false }));
+        const [code, output] = yield* Effect.all([child.exitCode, child.stdout.pipe(Stream.decodeText(), Stream.mkString), child.stderr.pipe(Stream.runDrain)], { concurrency: "unbounded" });
+        return { code, output };
+      }));
+      // Git is optional outside repositories. Do not make a non-Git project
+      // depend on a Git executable merely to retain the recursive fallback.
+      let gitAncestor = source;
+      let inRepository = false;
+      while (true) {
+        if (yield* fs.exists(path.join(gitAncestor, ".git"))) { inRepository = true; break; }
+        const parent = path.dirname(gitAncestor);
+        if (parent === gitAncestor) break;
+        gitAncestor = parent;
+      }
+      let selected: Set<string> | undefined;
+      let directories: Set<string> | undefined;
+      const linked = new Set<string>();
+      const unreadable = new Set<string>();
+      const ignoredRoots = new Set<string>();
+      const pruneUnreadable = (location: string) => Effect.gen(function* () {
+        unreadable.add(location);
+        yield* Console.warn(`Warning: scratch copy skipped an unreadable ignored tree: ${location}`);
+      });
+      const originalSource = source;
+      const originalCopyRoot = copyRoot;
+      if (inRepository) yield* Effect.gen(function* () {
+        const repository = yield* git(["rev-parse", "--show-toplevel"]);
+        if (repository.code !== 0) return yield* new ScratchError({ operation: "git rev-parse", path: source, message: `Git exited ${repository.code}` });
+        // Git returns physical paths (not /tmp aliases); use the same basis
+        // before deriving the scratch package path or remapping self-links.
+        source = yield* fs.realPath(source);
+        copyRoot = path.resolve(repository.output.trim());
+        const files = yield* git(["ls-files", "--cached", "--others", "--exclude-standard", "--full-name", "-z"], copyRoot).pipe(Effect.mapError(error => failure("git", source, error)));
+        if (files.code !== 0) return yield* Effect.fail(new ScratchError({ operation: "git ls-files", path: source, message: `Git exited ${files.code}` }));
+        selected = new Set(files.output.split("\0").filter(Boolean).map(file => path.resolve(copyRoot, file)));
+        const ignored = yield* git(["ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "-z"], copyRoot);
+        if (ignored.code !== 0) return yield* new ScratchError({ operation: "git ls-files", path: source, message: `Git exited ${ignored.code}` });
+        // Keep ignored environment, build and generated files. Only prune
+        // independent ignored checkouts/dependency trees, never their contents.
+        const independent = (dir: string): Effect.Effect<boolean, PlatformError.PlatformError> => Effect.gen(function* () {
+          if ((yield* fs.exists(path.join(dir, ".git"))) || (yield* fs.exists(path.join(dir, "node_modules")))) return true;
+          for (const name of yield* fs.readDirectory(dir)) {
+            const child = path.join(dir, name);
+            const info = yield* fs.lstat(child).pipe(Effect.result);
+            if (info._tag === "Failure") {
+              if (info.failure.reason._tag === "PermissionDenied") { yield* pruneUnreadable(child); continue; }
+              return yield* info.failure;
+            }
+            if (info.success.type === "Directory" && (yield* independent(child))) return true;
+          }
+          return false;
+        }).pipe(Effect.catch(error => error.reason._tag === "PermissionDenied"
+          ? pruneUnreadable(dir).pipe(Effect.as(false)) : Effect.fail(error)));
+        for (const file of ignored.output.split("\0").filter(Boolean)) {
+          const target = path.resolve(copyRoot, file);
+          if (path.relative(copyRoot, target).split(path.sep).some(part => ["node_modules", ".git", "mutants.out", ".agent_sources", ".agent-sources", ".brain", ".pi", ".rift"].includes(part))) continue;
+          ignoredRoots.add(target);
+          const info = yield* fs.lstat(target).pipe(Effect.result);
+          if (info._tag === "Failure") {
+            if (info.failure.reason._tag === "NotFound") continue;
+            if (info.failure.reason._tag === "PermissionDenied") { yield* pruneUnreadable(target); continue; }
+            return yield* info.failure;
+          }
+          if (info.success.type !== "Directory") { selected.add(target); continue; }
+          if (yield* independent(target)) linked.add(target);
+          else selected.add(target);
+        }
+        // Ignored does not mean unused: a workspace dependency may export
+        // prebuilt output. Preserve each declared entry's top-level tree so
+        // relative imports and wildcard/conditional exports stay loadable.
+        const PackageEntries = Schema.fromJsonString(Schema.Struct({
+          exports: Schema.optional(Schema.Unknown), imports: Schema.optional(Schema.Unknown),
+          main: Schema.optional(Schema.String), module: Schema.optional(Schema.String), types: Schema.optional(Schema.String)
+        }));
+        const targets = (entry: unknown): ReadonlyArray<string> => typeof entry === "string" ? [entry]
+          : Array.isArray(entry) ? entry.flatMap(targets)
+          : entry !== null && typeof entry === "object" ? Object.values(entry).flatMap(targets) : [];
+        for (const file of [...selected]) {
+          if (path.basename(file) !== "package.json" || !(yield* fs.exists(file))) continue;
+          const decoded = yield* Schema.decodeEffect(PackageEntries)(yield* fs.readFileString(file)).pipe(Effect.result);
+          if (decoded._tag === "Failure") {
+            yield* Console.warn(`Warning: cannot inspect package entry points for scratch copying: ${file}`);
+            continue;
+          }
+          const pkg = decoded.success;
+          const root = path.dirname(file);
+          const entries = [...targets(pkg.exports), ...targets(pkg.imports)].filter(entry => entry.startsWith("./"));
+          entries.push(...[pkg.main, pkg.module, pkg.types].filter((entry): entry is string => entry !== undefined));
+          for (const entry of entries) {
+            const relative = path.relative(root, path.resolve(root, entry));
+            if (!relative || relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) continue;
+            const first = relative.split(path.sep)[0]!;
+            if (!["node_modules", ".git"].includes(first)) selected.add(path.join(root, first));
+          }
+        }
+        directories = new Set([copyRoot]);
+        for (const file of [...selected, ...linked]) {
+          let parent = path.dirname(file);
+          while (parent !== copyRoot && parent !== path.dirname(parent)) { directories.add(parent); parent = path.dirname(parent); }
+        }
+      }).pipe(Effect.catch(error => Effect.gen(function* () {
+        yield* Console.warn(`Warning: Git scratch discovery failed; using recursive copy: ${error.message}`);
+        source = originalSource;
+        copyRoot = originalCopyRoot;
+        selected = undefined;
+        directories = undefined;
+        linked.clear();
+        unreadable.clear();
+        ignoredRoots.clear();
+      })));
       const temp = yield* Effect.acquireRelease(
         fs.makeTempDirectory({ prefix: "mutant-cafe-" }).pipe(
           Effect.mapError((error) => failure("create", source, error))),
         (dir) => fs.remove(dir, { recursive: true, force: true }).pipe(Effect.interruptible, Effect.timeout(30_000), Effect.catch(error => Console.warn(`Warning: scratch removal did not complete within its cleanup budget: ${error.message}`, { path: dir })))
       );
-      // Materialize source symlinks, except dependencies. No editable file in
-      // the scratch tree may point back into the original checkout.
-      const copy = (from: string, to: string, ancestors: ReadonlyArray<string>): Effect.Effect<void, ScratchError> =>
+      // Materialize editable source symlinks. Dependencies and pruned trees
+      // remain linked; target() rejects writes through links out of scratch.
+      const copy = (from: string, to: string, ancestors: ReadonlyArray<string>, filter = true, ignored = false): Effect.Effect<void, ScratchError> =>
         Effect.gen(function* () {
+          if (unreadable.has(from)) return;
+          // Declared package entry trees must be copied, even when they hold
+          // their own node_modules (for example preserveModules output).
+          if (linked.has(from) && !selected?.has(from)) { yield* fs.symlink(from, to); return; }
           const real = yield* fs.realPath(from);
           const info = yield* fs.stat(from);
           if (info.type === "Directory") {
@@ -62,6 +189,10 @@ export const ScratchLive = Layer.effect(Scratch, Effect.gen(function* () {
               if ([".git", "mutants.out", ".agent_sources", ".agent-sources", ".brain", ".pi", ".rift"].includes(entry)) continue;
               const src = path.join(from, entry);
               const dest = path.join(to, entry);
+              // Never descend into ignored trees just to discover dependency folders.
+              // Dependency links are needed only at the selected package ancestors.
+              const filterChildren = filter && !selected?.has(from);
+              if (filterChildren && selected && directories && !selected.has(src) && !directories.has(src) && !linked.has(src) && entry !== "node_modules") continue;
               if (entry === "node_modules") {
                 // Own the directory so workspace/self links can point at the
                 // copied package. Linking node_modules wholesale sends tests
@@ -79,23 +210,31 @@ export const ScratchLive = Layer.effect(Scratch, Effect.gen(function* () {
                       }
                       const realDependency = yield* fs.realPath(dependency);
                       const rel = path.relative(copyRoot, realDependency);
-                      const inside = rel !== ".." && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel) && !rel.split(path.sep).includes("node_modules");
+                      const inside = rel !== ".." && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel) && !rel.split(path.sep).includes("node_modules")
+                        && (!selected || selected.has(realDependency) || directories?.has(realDependency));
                       yield* fs.symlink(inside ? path.join(temp, rel) : realDependency, destination);
                     }).pipe(skipVanished(dependency, destination));
                   }
                 });
                 yield* linkDependencies(src, dest).pipe(skipVanished(src, dest));
               } else {
-                yield* copy(src, dest, [...ancestors, real]);
+                yield* copy(src, dest, [...ancestors, real], filterChildren, ignored || ignoredRoots.has(from));
               }
             }
           } else if (info.type === "File") {
             yield* fs.copyFile(from, to);
           }
-        }).pipe(skipVanished(from, to), Effect.mapError((error) => failure("copy", from, error)));
+        }).pipe(skipVanished(from, to), Effect.catch(error => error._tag === "PlatformError" && error.reason._tag === "PermissionDenied" && (ignored || ignoredRoots.has(from))
+          ? pruneUnreadable(from).pipe(Effect.andThen(fs.remove(to, { recursive: true, force: true })))
+          : Effect.fail(error)), Effect.mapError((error) => failure("copy", from, error)));
       yield* copy(copyRoot, temp, []);
       const packageRoot = yield* fs.realPath(path.join(temp, path.relative(copyRoot, source))).pipe(
         Effect.mapError((error) => failure("resolve", source, error)));
+
+      const packageRelative = path.relative(yield* fs.realPath(temp), packageRoot);
+      if (packageRelative === ".." || packageRelative.startsWith(`..${path.sep}`) || path.isAbsolute(packageRelative)) {
+        return yield* new ScratchError({ operation: "resolve", path: source, message: "Requested package is inside a linked ignored tree; refusing to mutate the original checkout. Choose an editable source package outside that tree." });
+      }
 
       const originals = new Map<string, Uint8Array>();
       const target = (mutant: Mutant) => Effect.gen(function* () {
@@ -114,6 +253,8 @@ export const ScratchLive = Layer.effect(Scratch, Effect.gen(function* () {
       });
       const dir: ScratchDir = {
         path: packageRoot,
+        linkedRoots: [...linked].filter(root => !selected?.has(root) && !unreadable.has(root)).map(root => path.relative(source, root))
+          .filter(root => root !== ".." && !root.startsWith(`..${path.sep}`) && !path.isAbsolute(root)),
         apply: Effect.fn("Scratch.apply")(function* (mutant: Mutant) {
           const location = yield* target(mutant);
           const bytes = yield* fs.readFile(location);
