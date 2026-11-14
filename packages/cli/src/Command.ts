@@ -1,4 +1,4 @@
-import { DEFAULT_BASELINE_TIMEOUT_MS, formatTestCommand, ConfigFile, MutantList, MutantSource, Reporter, RunConfig, type BaselineFailed, type BaselineTimedOut, type Mutant, type ProgramLoadError, ReportWriteError, type RunReport, type Scratch, type ScratchError, type TestRunner, type TestSpawnError } from "@mutant-cafe/core";
+import { excludeLinkedCandidates, DEFAULT_BASELINE_TIMEOUT_MS, formatTestCommand, ConfigFile, MutantList, MutantSource, Reporter, RunConfig, type BaselineFailed, type BaselineTimedOut, type Mutant, type ProgramLoadError, ReportWriteError, type RunReport, Scratch, type ScratchError, type TestRunner, type TestSpawnError } from "@mutant-cafe/core";
 import * as Console from "effect/Console";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -102,14 +102,17 @@ export const makeCommand = (options: {
   const skipped = yield* source.notMutated(config);
   const selected = inDiff === undefined && diffText === undefined ? { mutants: generated, notMutated: skipped }
     : yield* selectDiffScope({ root, diffPath: inDiff ?? `git diff ${range}`, ...(diffText === undefined ? {} : { diffText }), mutants: generated, notMutated: skipped });
+  const scratch = yield* Scratch;
+  const roots = selected.mutants.length && scratch.inspect ? yield* scratch.inspect(root) : [];
+  const eligible = yield* excludeLinkedCandidates(root, selected.mutants, roots);
   const relative = (mutant: Mutant) => path.relative(gitRoot, path.resolve(root, mutant.file)).replaceAll("\\", "/");
   const compare = (a: string, b: string) => a < b ? -1 : a > b ? 1 : 0;
-  const ordered = [...selected.mutants].sort((a, b) => compare(relative(a), relative(b)) || a.span.start.line - b.span.start.line || a.span.start.column - b.span.start.column || compare(a.id, b.id));
+  const ordered = [...eligible.mutants].sort((a, b) => compare(relative(a), relative(b)) || a.span.start.line - b.span.start.line || a.span.start.column - b.span.start.column || compare(a.id, b.id));
   const mutants = ordered.slice(0, maxMutants);
-  const notMutated = selected.notMutated;
+  const notMutated = [...new Map([...selected.notMutated, ...eligible.notMutated].map(entry => [JSON.stringify(entry), entry])).values()];
   const counts = { selected: ordered.length, run: 0, budgetSkipped: ordered.length - mutants.length };
   if (mutants.length === 0) {
-    const cause = ordered.length > 0 ? "budget" : range !== undefined ? "range"
+    const cause = ordered.length > 0 ? "budget" : eligible.notMutated.length > 0 ? "linked ignored trees" : range !== undefined ? "range"
       : inDiff !== undefined || diffText !== undefined ? "diff"
       : config.functionFilter.length || config.exportedOnly ? "filter" : "file selection";
     yield* Console.error(`0 mutants selected (${counts.selected} before budget); cause: ${cause}. Baseline skipped.`);

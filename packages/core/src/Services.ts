@@ -38,6 +38,8 @@ export interface ScratchDir {
 export class Scratch extends Context.Service<
   Scratch,
   {
+    /** Discover package-relative links without creating a scratch tree. */
+    readonly inspect?: (root: string) => Effect.Effect<ReadonlyArray<string>, ScratchError>;
     readonly acquire: (root: string) => Effect.Effect<ScratchDir, ScratchError, Scope.Scope>;
   }
 >()("mutant.cafe/Scratch") {}

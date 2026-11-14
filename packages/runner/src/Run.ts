@@ -1,5 +1,5 @@
 import {
-  sanitizeReportTelemetry, MutantSource, MutantResult, NotMutated, ReachabilityProbe, Reporter, Scratch, TestRunner,
+  excludeLinkedCandidates, sanitizeReportTelemetry, MutantSource, MutantResult, NotMutated, ReachabilityProbe, Reporter, Scratch, TestRunner,
   Baseline, BaselineFailed, BaselineTimedOut, formatTestCommand, type Mutant,
   type ProgramLoadError, type ReportWriteError, type RunConfig, type RunReport,
   type ScratchDir, ScratchError, type TestSpawnError
@@ -88,17 +88,9 @@ export const runMutants = Effect.fn("Runner.runMutants")(function* (
     // Exclude original-path links before viability, calibration or poisoning.
     // Reuse the existing SKIP event: linked files are not failed mutations.
     const linkedRoots = yield* Effect.scoped(Pool.get(dirs).pipe(Effect.map(dir => dir.linkedRoots ?? [])));
-    const pending: Mutant[] = [];
-    for (const mutant of input.state.pending) {
-      const file = path.isAbsolute(mutant.file) ? path.relative(config.root, mutant.file) : mutant.file;
-      const linked = linkedRoots.some(root => {
-        const relative = path.relative(root, file);
-        return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
-      });
-      if (linked) yield* input.skip({ file: path.resolve(config.root, file), functionName: mutant.functionName, span: mutant.span,
-        reason: "Source is in a linked ignored tree; original files are not mutation targets" });
-      else pending.push(mutant);
-    }
+    const eligible = yield* excludeLinkedCandidates(config.root, input.state.pending, linkedRoots);
+    for (const entry of eligible.notMutated) yield* input.skip(entry);
+    const pending = eligible.mutants;
     let baseline = input.state.baseline;
     const viabilityById = new Map<string, Effect.Success<ReturnType<typeof source.checkViable>>>();
     // Auto needs a count before sampling; forced modes check inside the jobs
