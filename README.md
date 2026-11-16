@@ -56,6 +56,8 @@ Run it from the package whose tests you want to check. In a monorepo that resolv
 
 `excludeMutations` in `mutants.config.json` lists regular expressions. A mutant whose description matches one is never run or reported, such as `"with Effect\\.never$"` to skip hanging mutants, or `"catchTag\\(\"SqlError\""` to skip swallowing an error your tests can't raise.
 
+A `mutants.config.json` can extend another with `"extends": "../../mutants.config.json"`, resolved from the file that names it, so a monorepo keeps shared settings in one file. Lists, such as `excludeMutations`, add to the extended file's; other settings replace its values.
+
 ## CI
 
 Use a git range to check changed bodies and a mutant budget to cap the work. The budget applies after file, diff and function selection. Ordering uses repository-relative file path (lexical, not locale-dependent), start line, column, then id. `--max-mutants 0` keeps none. Budget-skipped mutants are not outcomes.
