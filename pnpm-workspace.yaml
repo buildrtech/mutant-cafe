@@ -18,13 +18,13 @@ minimumReleaseAgeExclude:
   - '@distilled.cloud/core@1.0.0-rc.18'
   - '@distilled.cloud/iceberg@1.0.0-rc.18'
   - alchemy@2.0.0-beta.85
-  - effect@4.1.2
-  - '@effect/platform-node-shared@4.1.2'
-  - '@effect/platform-node@4.1.2'
-  - '@effect/vitest@4.1.2'
+  - effect@4.1.4
+  - '@effect/platform-node-shared@4.1.4'
+  - '@effect/platform-node@4.1.4'
+  - '@effect/vitest@4.1.4'
   - '@vitest/mocker@5.1.0'
   - '@vitest/spy@5.1.0'
   - vitest@5.1.0
   - '@xstate/effect@1.0.0-alpha.12'
   - xstate@6.0.0-alpha.73
-  - '@effect/platform-browser@4.1.2'
+  - '@effect/platform-browser@4.1.4'
