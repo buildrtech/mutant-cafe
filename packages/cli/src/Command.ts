@@ -102,9 +102,14 @@ export const makeCommand = (options: {
   const skipped = yield* source.notMutated(config);
   const selected = inDiff === undefined && diffText === undefined ? { mutants: generated, notMutated: skipped }
     : yield* selectDiffScope({ root, diffPath: inDiff ?? `git diff ${range}`, ...(diffText === undefined ? {} : { diffText }), mutants: generated, notMutated: skipped });
+  const excluded = yield* Effect.try({
+    try: () => (fileConfig.excludeMutations ?? []).map(pattern => new RegExp(pattern, "u")),
+    catch: error => new UsageError({ message: `Invalid excludeMutations pattern in mutants.config.json: ${String(error)}` }),
+  });
+  const kept = selected.mutants.filter(mutant => !excluded.some(pattern => pattern.test(mutant.description)));
   const scratch = yield* Scratch;
-  const roots = selected.mutants.length && scratch.inspect ? yield* scratch.inspect(root) : [];
-  const eligible = yield* excludeLinkedCandidates(root, selected.mutants, roots);
+  const roots = kept.length && scratch.inspect ? yield* scratch.inspect(root) : [];
+  const eligible = yield* excludeLinkedCandidates(root, kept, roots);
   const relative = (mutant: Mutant) => path.relative(gitRoot, path.resolve(root, mutant.file)).replaceAll("\\", "/");
   const compare = (a: string, b: string) => a < b ? -1 : a > b ? 1 : 0;
   const ordered = [...eligible.mutants].sort((a, b) => compare(relative(a), relative(b)) || a.span.start.line - b.span.start.line || a.span.start.column - b.span.start.column || compare(a.id, b.id));
