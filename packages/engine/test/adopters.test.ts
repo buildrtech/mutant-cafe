@@ -36,6 +36,15 @@ for (const explicitBuildInfo of [false, true]) it.live(`loads incremental noEmit
   expect((yield* fs.readDirectory(root)).filter(file => /tsbuildinfo|\.js$/.test(file))).toEqual([]);
 }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)));
 
+// Monorepo packages are composite; forcing incremental off fails them with TS6379.
+it.live("loads composite projects without writing their declarations or build info", () => Effect.gen(function* () {
+  const fs = yield* FileSystem.FileSystem;
+  const { root, source, mutants } = yield* project('export const answer = (n: number): boolean => n > 0;', { noEmit: false, composite: true, emitDeclarationOnly: true, outDir: "out" });
+  expect(mutants.map(m => m.description)).toEqual(expect.arrayContaining(["replace answer -> boolean with false", "replace answer -> boolean with true"]));
+  for (const mutant of mutants) expect((yield* source.checkViable(mutant)).viable).toBe(true);
+  expect((yield* fs.readDirectory(root)).filter(file => /tsbuildinfo|^out$/.test(file))).toEqual([]);
+}).pipe(Effect.scoped, Effect.provide(NodeServices.layer)));
+
 it.live("omits direct pure literals through parentheses and type-only wrappers, not effectful expressions with literal return types", () => Effect.gen(function* () {
   const { mutants } = yield* project(`
     let calls = 0;
